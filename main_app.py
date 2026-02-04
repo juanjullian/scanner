@@ -132,47 +132,32 @@ class IntroSplash(QWidget):
         if self.main_window:
             self.main_window.showMaximized()
 
-# --- VISOR PERSONALIZADO (ZOOM + PANEO) ---
-class ScanViewer(QLabel):
+# --- VISOR PERSONALIZADO (ZOOM + PANEO + PAINT EVENT) ---
+class ScanViewer(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setMouseTracking(False)
-        self.zoom_active = False
-        self.pan_active = False
-        self.last_mouse_pos = None
-        self.off_x = 0
-        self.off_y = 0
-        self.max_w = 0
-        self.max_h = 0
-        self.crop_w = 1280
-        self.crop_h = 960
-        # Alineación y Política para centrar y expandir
-        self.setAlignment(Qt.AlignmentFlag.AlignCenter) 
-        self.setSizePolicy(self.sizePolicy().Policy.Expanding, self.sizePolicy().Policy.Expanding)
+        self._pixmap = None
+        self.max_w = 0; self.max_h = 0
+        self.off_x = 0; self.off_y = 0
 
-    def mousePressEvent(self, event):
-        if event.button() == Qt.MouseButton.LeftButton and self.zoom_active:
-            self.pan_active = True
-            self.last_mouse_pos = event.pos()
-            self.setCursor(Qt.CursorShape.ClosedHandCursor)
+    def setPixmap(self, pix):
+        self._pixmap = pix
+        self.update() # Trigger paintEvent
 
-    def mouseMoveEvent(self, event):
-        if self.pan_active and self.last_mouse_pos:
-            delta = event.pos() - self.last_mouse_pos
-            self.last_mouse_pos = event.pos()
-            # Invertimos delta para efecto "arrastrar imagen"
-            self.off_x -= delta.x() * 2
-            self.off_y -= delta.y() * 2
-            # Limites
-            max_x = max(0, self.max_w - self.crop_w)
-            max_y = max(0, self.max_h - self.crop_h)
-            self.off_x = max(0, min(self.off_x, max_x))
-            self.off_y = max(0, min(self.off_y, max_y))
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.fillRect(self.rect(), Qt.GlobalColor.black)
 
-    def mouseReleaseEvent(self, event):
-        if event.button() == Qt.MouseButton.LeftButton:
-            self.pan_active = False
-            self.setCursor(Qt.CursorShape.ArrowCursor)
+        if self._pixmap and not self._pixmap.isNull():
+            # Escalar manteniendo relación de aspecto dentro del widget
+            scaled_pix = self._pixmap.scaled(self.size(), Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.FastTransformation)
+            
+            # Centrar
+            x = (self.width() - scaled_pix.width()) // 2
+            y = (self.height() - scaled_pix.height()) // 2
+            
+            painter.drawPixmap(x, y, scaled_pix)
 
 # --- DIÁLOGO DE EXPORTACIÓN CON THUMBNAILS ---
 class BatchExportDialog(QDialog):
@@ -217,11 +202,12 @@ class BatchExportDialog(QDialog):
         self.combo_fmt = QComboBox()
         self.combo_fmt.addItems([
             "ProRes 4444 (Premiere - 12bit - Alta Calidad)", 
-            "HEVC 10-bit 4:4:4 (Premiere - MP4 - Eficiente)", # <--- NUEVO HEVC
-            "Secuencia JXL (Carpeta - Archivo Ultra Eficiente)", # <--- JXL COMO CARPETA
-            "FFV1 (MKV - Archivo Lossless)", 
+            "GoPro CineForm (Premiere - 12bit - Intermedio)", 
+            "ProRes 422 HQ (Premiere - 10bit - Estándar) [Default]",
+            "HEVC 10-bit 4:4:4 (MP4 - Eficiente)", 
             "H.264 (MP4 - Proxy)"
         ])
+        self.combo_fmt.setCurrentIndex(2) # Default ProRes 422 HQ
         sett_layout.addWidget(self.combo_fmt)
         
         sett_layout.addWidget(QLabel("Perfil de Revelado:"))
@@ -255,14 +241,14 @@ class BatchExportDialog(QDialog):
             w, h = 2840, 2200 
             is_rgb = False
 
-            for roi in scanner_core.FORMAT_ROIS.values():
-                 rw, rh = roi['w'], roi['h']
-                 # Chequeo RGB
-                 if fsize % int(rw * rh * 3) == 0:
-                     w, h = rw, rh; is_rgb = True; break
-                 # Chequeo Bayer
-                 if fsize % int(rw * rh * 1.5) == 0:
-                     w, h = rw, rh; is_rgb = False; break
+            # Detección simple RGB vs Bayer basada en tamaño
+            if fsize % int(w * h * 3) == 0: 
+                is_rgb = True
+            elif fsize % int(w * h * 1.5) == 0:
+                is_rgb = False
+            else:
+                 # Default a Bayer si no cuadra perfecto, o podría ser RGB incompleto
+                 pass
             
             # Leer Frame de muestra (Frame 100)
             frame_bytes = int(w * h * 3) if is_rgb else int(w * h * 1.5)
@@ -280,21 +266,31 @@ class BatchExportDialog(QDialog):
                 rgb = np.frombuffer(raw_data, dtype=np.uint8).reshape(h, w, 3)
                 small = rgb[::8, ::8, :].copy() # Downscale para icono
             else:
-                # BAYER RAW (Necesita proceso)
+                # BAYER RAW (Necesita proceso corrección color)
+                # Extracción manual RG similar al modo Fast para consistencia
                 data = np.frombuffer(raw_data, dtype=np.uint8).reshape(-1, 3)
                 b0, b1, b2 = data[:, 0], data[:, 1], data[:, 2]
-                p0 = ((b1 & 0x0F) << 4) | (b0 >> 4) # Aprox visual rápida 8-bit
+                
+                # Desempaquetado 8-bit rápido
+                p0 = ((b1 & 0x0F) << 4) | (b0 >> 4)
                 p1 = b2
                 img_flat = np.empty(w*h, dtype=np.uint8)
                 img_flat[0::2] = p0; img_flat[1::2] = p1
                 img_bayer = img_flat.reshape(h, w)
                 
-                # Debayer simple y rápido para thumbnail
-                rgb = cv2.cvtColor(img_bayer, cv2.COLOR_BayerRG2RGB)
-                small = rgb[::8, ::8, :].copy()
+                # Subsampling directo RG (R en 0,0 | B en 1,1)
+                r_ch = img_bayer[0::2, 0::2]
+                g_ch = img_bayer[0::2, 1::2]
+                b_ch = img_bayer[1::2, 1::2]
                 
-                # Opcional: Auto Brightness simple para el icono
-                # (Para que no se vea negro si está subexpuesto)
+                # Crear RGB pequeño
+                rows, cols = r_ch.shape
+                small = np.dstack((r_ch, g_ch, b_ch))
+                
+                # Reducir más para icono (aprox 160x120)
+                small = cv2.resize(small, (160, 120), interpolation=cv2.INTER_NEAREST)
+                
+                # Opcional: Auto Brightness simple
                 avg = np.mean(small)
                 if avg > 0: small = np.clip(small * (100/avg), 0, 255).astype(np.uint8)
             
@@ -315,7 +311,7 @@ class BatchExportDialog(QDialog):
             if item.checkState() == Qt.CheckState.Checked:
                 files.append(item.text())
         
-        fmt_map = {0: 'prores', 1: 'hevc', 2: 'jxl', 3: 'ffv1', 4: 'h264'}
+        fmt_map = {0: 'prores', 1: 'cineform', 2: 'prores_hq', 3: 'hevc', 4: 'h264'}
         sharp_map = {0: '0,0', 1: '0.8,1.5', 2: '1.3,1.5', 3: '2.0,2.5'}
         
         return files, fmt_map[self.combo_fmt.currentIndex()], sharp_map[self.combo_sharp.currentIndex()]
@@ -324,13 +320,15 @@ class BatchExportDialog(QDialog):
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Lucid Scanner Suite - Archivo La Unión")
+        self.setWindowTitle("Escáner de películas - Archivo La Unión")
         self.resize(1400, 900)
         self.root_folder = os.path.expanduser("~/Documents/Archivo_Scan_Data")
         self.manager = scanner_core.CollectionManager(self.root_folder)
         self.active_collection = None
         self.is_recording = False
-        self.frame_queue = queue.Queue(maxsize=500)
+        # OPTIMIZACIÓN RAM: Bajamos buffer de 500 (~4.5GB) a 180 (~1.6GB)
+        # Esto es suficiente para absorber hipo del disco duro sin colapsar la RAM.
+        self.frame_queue = queue.Queue(maxsize=180)
         self.camera_worker = None
         self.writer_worker = None
         
@@ -376,72 +374,110 @@ class MainWindow(QMainWindow):
         self.tabs.installEventFilter(self)
         
         # TAB 1: CAPTURA
+        # TAB 1: CAPTURA
         self.tab_scan = QWidget()
         scan_layout = QVBoxLayout()
-        self.lbl_status = QLabel("Selecciona una colección")
-        self.lbl_status.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.lbl_status.setStyleSheet("font-size: 14pt; color: #ff9800;")
+        scan_layout.setContentsMargins(5,5,5,5)
         
+        # [HEADER] Título + Stats alineadas
+        header_bar = QHBoxLayout()
+        self.lbl_status = QLabel("Selecciona una colección")
+        self.lbl_status.setStyleSheet("font-size: 14pt; color: #ff9800; font-weight: bold;")
+        self.lbl_status.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        
+        stats_layout = QHBoxLayout()
+        self.lbl_fps = QLabel("FPS: --")
+        self.lbl_temp = QLabel("Tmp: --")
+        self.lbl_saved = QLabel("Sav: 0")
+        self.lbl_buffer = QLabel("Buf: 0")
+        self.lbl_bw = QLabel("BW: 0 Mbps")
+        self.lbl_dropped = QLabel("Drp: 0")
+        self.lbl_dropped.setStyleSheet("color: red; font-weight: bold;")
+        
+        for lb in [self.lbl_fps, self.lbl_temp, self.lbl_saved, self.lbl_buffer, self.lbl_bw, self.lbl_dropped]:
+            lb.setStyleSheet(lb.styleSheet() + "; font-size: 10pt; margin-left: 10px; color: #888;")
+            stats_layout.addWidget(lb)
+            
+        header_bar.addWidget(self.lbl_status, 1) # Stretch
+        header_bar.addLayout(stats_layout)
+        scan_layout.addLayout(header_bar)
+        
+        # [VISOR]
         self.viewer_scan = ScanViewer()
-        self.viewer_scan.setStyleSheet("background-color: #000;")
-        self.viewer_scan.setMinimumSize(640, 480)
-
-        # Config Formato
-        cap_config = QGroupBox("Configuración de Escaneo")
-        cap_lay = QHBoxLayout()
-        cap_lay.addWidget(QLabel("Formato:"))
-        self.combo_format = QComboBox()
-        self.combo_format.addItems(["Super 8", "Regular 8mm", "16mm (Mudo)", "16mm (Sonido)", "Full Sensor"])
-        self.combo_format.setCurrentText("Full Sensor")
-        self.combo_format.currentTextChanged.connect(self.on_format_changed)
-        cap_lay.addWidget(self.combo_format)
-        cap_lay.addWidget(QLabel("Tipo:"))
+        self.viewer_scan.setStyleSheet("background-color: #111; border: 1px solid #444;")
+        # Fix: Usar QSizePolicy enums correctamente
+        from PyQt6.QtWidgets import QSizePolicy 
+        self.viewer_scan.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        scan_layout.addWidget(self.viewer_scan, 10)
+        
+        # [CONTROL BAR] Unificada
+        control_bar = QGroupBox()
+        control_bar.setMaximumHeight(80)
+        cb_layout = QHBoxLayout(control_bar)
+        cb_layout.setContentsMargins(8, 2, 8, 2)
+        cb_layout.setSpacing(15)
+        
+        # A. Tipo
         self.combo_type = QComboBox()
         self.combo_type.addItems(["Color (Pos/Neg)", "Blanco y Negro"])
-        cap_lay.addWidget(self.combo_type)
-        cap_config.setLayout(cap_lay)
-
-        # Imagen
-        img_grp = QGroupBox("Imagen (Vivo)")
-        img_lay = QHBoxLayout()
-        exp_lay = QVBoxLayout(); exp_lay.addWidget(QLabel("Exp (µs)"))
-        self.sl_exp = QSlider(Qt.Orientation.Horizontal); self.sl_exp.setRange(20,100000); self.sl_exp.setValue(116)
-        self.sb_exp = QSpinBox(); self.sb_exp.setRange(20,100000); self.sb_exp.setValue(116); self.sb_exp.setKeyboardTracking(False)
-        self.sl_exp.valueChanged.connect(self.sync_exposure_spin)
-        self.sb_exp.valueChanged.connect(self.sync_exposure_slider)
-        exp_lay.addWidget(self.sb_exp); exp_lay.addWidget(self.sl_exp)
+        self.combo_type.setFixedWidth(130)
+        cb_layout.addWidget(self.combo_type)
         
-        gam_lay = QVBoxLayout(); gam_lay.addWidget(QLabel("Gamma"))
-        self.sl_gam = QSlider(Qt.Orientation.Horizontal); self.sl_gam.setRange(10,400); self.sl_gam.setValue(40)
-        self.sb_gam = QDoubleSpinBox(); self.sb_gam.setRange(0.1,4.0); self.sb_gam.setValue(0.4); self.sb_gam.setSingleStep(0.1); self.sb_gam.setKeyboardTracking(False)
-        self.sl_gam.valueChanged.connect(self.sync_gamma_spin)
-        self.sb_gam.valueChanged.connect(self.sync_gamma_slider)
-        gam_lay.addWidget(self.sb_gam); gam_lay.addWidget(self.sl_gam)
-        img_lay.addLayout(exp_lay); img_lay.addLayout(gam_lay)
-        img_grp.setLayout(img_lay); img_grp.setMaximumHeight(120)
-
-        # Focus
-        foc_grp = QGroupBox("Foco")
-        foc_lay = QHBoxLayout()
-        self.btn_peaking = QPushButton("Peaking"); self.btn_peaking.setCheckable(True); self.btn_peaking.toggled.connect(self.toggle_peaking)
-        self.btn_zoom_1to1 = QPushButton("Zoom 1:1"); self.btn_zoom_1to1.setCheckable(True); self.btn_zoom_1to1.toggled.connect(self.toggle_zoom_state)
-        foc_lay.addWidget(self.btn_peaking); foc_lay.addWidget(self.btn_zoom_1to1)
-        foc_grp.setLayout(foc_lay)
-
+        # B. Foco
+        self.btn_peaking = QPushButton("Peak")
+        self.btn_peaking.setCheckable(True)
+        self.btn_peaking.clicked.connect(self.toggle_peaking)
+        self.btn_peaking.setFixedWidth(50)
+        
+        self.btn_zoom_1to1 = QPushButton("1:1")
+        self.btn_zoom_1to1.setCheckable(True)
+        self.btn_zoom_1to1.clicked.connect(self.toggle_zoom) # FIX: usaba toggle_zoom_state antes, unificar
+        self.btn_zoom_1to1.setFixedWidth(40)
+        
+        cb_layout.addWidget(self.btn_peaking)
+        cb_layout.addWidget(self.btn_zoom_1to1)
+        
+        # C. Exposición
+        exp_layout = QHBoxLayout()
+        exp_layout.setSpacing(5)
+        exp_layout.addWidget(QLabel("Exp:"))
+        self.sl_exp = QSlider(Qt.Orientation.Horizontal)
+        self.sl_exp.setRange(20, 100)
+        self.sl_exp.setValue(50)
+        self.sl_exp.setSingleStep(10) # 10 en 10
+        self.sl_exp.setPageStep(10)
+        self.sl_exp.setTickPosition(QSlider.TickPosition.TicksBelow)
+        self.sl_exp.setTickInterval(10)
+        self.sl_exp.valueChanged.connect(self.on_exposure_change)
+        
+        self.lbl_exp_val = QLabel("50")
+        self.lbl_exp_val.setFixedWidth(30)
+        self.lbl_exp_val.setStyleSheet("font-weight: bold; color: #0078d7;")
+        self.lbl_exp_val.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        
+        exp_layout.addWidget(self.sl_exp)
+        exp_layout.addWidget(self.lbl_exp_val)
+        
+        cb_layout.addLayout(exp_layout, 1) # Stretch para que slider crezca
+        
+        # D. GRABAR
         self.btn_record = QPushButton("GRABAR")
+        self.btn_record.setCheckable(True)
         self.btn_record.setEnabled(False)
-        self.btn_record.setMinimumHeight(50)
+        self.btn_record.setStyleSheet("""
+            QPushButton { background-color: #d32f2f; color: white; border-radius: 4px; font-weight: bold; }
+            QPushButton:checked { background-color: #b71c1c; border: 2px solid white; }
+            QPushButton:disabled { background-color: #555; }
+        """)
+        self.btn_record.setMinimumWidth(100)
+        self.btn_record.setMinimumHeight(35)
         self.btn_record.clicked.connect(self.toggle_recording)
         
-        self.lbl_fps = QLabel("FPS: 0.0"); self.lbl_buffer = QLabel("RAM: 0")
-        self.lbl_saved = QLabel("G: 0"); self.lbl_temp = QLabel("T: --")
-
-        scan_layout.addWidget(self.lbl_status)
-        scan_layout.addWidget(self.viewer_scan, 1)
-        scan_layout.addWidget(cap_config)
-        scan_layout.addWidget(img_grp)
-        scan_layout.addWidget(foc_grp)
-        scan_layout.addWidget(self.btn_record)
+        cb_layout.addWidget(self.btn_record)
+        
+        scan_layout.addWidget(control_bar)
+        
+        self.tab_scan.setLayout(scan_layout)
         scan_layout.addWidget(self.lbl_fps); scan_layout.addWidget(self.lbl_buffer)
         scan_layout.addWidget(self.lbl_temp); scan_layout.addWidget(self.lbl_saved)
         self.tab_scan.setLayout(scan_layout)
@@ -559,11 +595,8 @@ class MainWindow(QMainWindow):
         self.tabs.setCurrentIndex(1)
 
         # 3. DIMENSIONES
-        if roi_key in scanner_core.FORMAT_ROIS:
-            cfg = scanner_core.FORMAT_ROIS[roi_key]
-            self.raw_width, self.raw_height = cfg['w'], cfg['h']
-        else:
-            self.raw_width, self.raw_height = 2840, 2200
+        # 3. DIMENSIONES (Hardcoded)
+        self.raw_width, self.raw_height = 2840, 2200
 
         self.view_is_rgb = (pixel_fmt == "rgb")
         
@@ -636,41 +669,87 @@ class MainWindow(QMainWindow):
                     qimg = QImage(arr.data, w_out, h_out, w_out*3, QImage.Format.Format_RGB888)
 
                 else:
-                    # CASO BAYER (RAW)
-                    # 1. Desempaquetado rápido
-                    arr_packed = np.frombuffer(data, dtype=np.uint8).reshape(-1, 3)
-                    b0 = arr_packed[:, 0].astype(np.uint16)
-                    b1 = arr_packed[:, 1].astype(np.uint16)
-                    b2 = arr_packed[:, 2].astype(np.uint16)
-                    
-                    p0 = b0 | ((b1 & 0x0F) << 8)
-                    p1 = (b1 >> 4) | (b2 << 4)
-                    
-                    img_flat = np.empty(w*h, dtype=np.uint16)
-                    img_flat[0::2] = p0; img_flat[1::2] = p1
-                    img_bayer = img_flat.reshape(h, w)
-                    
-                    # 2. Debayering (Obtener color a Full Resolución primero para precisión)
-                    rgb16 = cv2.cvtColor(img_bayer, cv2.COLOR_BayerBG2RGB)
-                    
-                    # 3. OPTIMIZACIÓN CRÍTICA (Subsampling)
-                    # Reducimos la imagen ANTES de hacer la matemática pesada (Gamma)
                     if fast:
-                        # Bajamos a 33% de resolución. 
-                        # Usamos Nearest para que el CPU no gaste tiempo suavizando.
-                        rgb16 = cv2.resize(rgb16, None, fx=0.33, fy=0.33, interpolation=cv2.INTER_NEAREST)
+                        # --- MODIFICACIÓN ULTRA-RÁPIDA (Strided Packed Access) ---
+                        # Evitamos descomprimir toda la imagen. Accedemos directo a los bytes.
+                        # data es un array plano de H * (W/2) * 3 bytes
+                        
+                        # 1. Vista estructurada del buffer crudo (H, W/2, 3)
+                        # Nota: W/2 porque cada 3 bytes son 2 pixeles.
+                        # Stride vertical y horizontal de 2 (tomamos 1 de cada 4 píxeles reales)
+                        # Resultado: Imagen 1/4 (710x550)
+                        
+                        raw_view = np.frombuffer(data, dtype=np.uint8).reshape(h, w//2, 3)
+                        
+                        stride = 2
+                        
+                        # RG Rows (Filas Pares): Contienen R(p0) y G(p1)
+                        # GB Rows (Filas Impares): Contienen G(p0) y B(p1)
+                        
+                        # Slice [Filas, Columnas, Bytes]
+                        chunk_rg = raw_view[0::2*stride, 0::stride, :] 
+                        chunk_gb = raw_view[1::2*stride, 0::stride, :] # Offset fila 1 para GB
+                        
+                        # --- Unpack RG Chunk ---
+                        b0 = chunk_rg[:, :, 0].astype(np.uint16)
+                        b1 = chunk_rg[:, :, 1].astype(np.uint16)
+                        b2 = chunk_rg[:, :, 2].astype(np.uint16)
+                        
+                        # R está en p0, G está en p1
+                        r_ch = b0 | ((b1 & 0x0F) << 8)
+                        g_ch = (b1 >> 4) | (b2 << 4)
+                        
+                        # --- Unpack GB Chunk ---
+                        # Solo nos interesa B (p1)
+                        b1_g = chunk_gb[:, :, 1].astype(np.uint16)
+                        b2_g = chunk_gb[:, :, 2].astype(np.uint16)
+                        
+                        b_ch = (b1_g >> 4) | (b2_g << 4)
+                        
+                        # Asegurar tamaños iguales (por si el slice impar queda corto)
+                        min_h = min(r_ch.shape[0], b_ch.shape[0])
+                        r_ch = r_ch[:min_h, :]
+                        g_ch = g_ch[:min_h, :]
+                        b_ch = b_ch[:min_h, :]
+                        
+                        # --- Fake Gamma & 8-bit conversion (Muy rápido) ---
+                        # Usamos convertScaleAbs: (src * alpha + beta) -> uint8 saturado
+                        # Alpha: Gain. 255/4095 = 0.062 (Linear). 
+                        # Usamos 0.2 (~3.2x gain) para simular gamma/brillo sin math float.
+                        gain = 0.2 
+                        
+                        r_8 = cv2.convertScaleAbs(r_ch, alpha=gain)
+                        g_8 = cv2.convertScaleAbs(g_ch, alpha=gain)
+                        b_8 = cv2.convertScaleAbs(b_ch, alpha=gain)
+                        
+                        rgb8 = np.dstack((r_8, g_8, b_8))
+                        
+                    else:
+                        # --- MODO CALIDAD (PAUSA) ---
+                        # 1. Desempaquetado completo
+                        arr_packed = np.frombuffer(data, dtype=np.uint8).reshape(-1, 3)
+                        b0 = arr_packed[:, 0].astype(np.uint16)
+                        b1 = arr_packed[:, 1].astype(np.uint16)
+                        b2 = arr_packed[:, 2].astype(np.uint16)
+                        p0 = b0 | ((b1 & 0x0F) << 8)
+                        p1 = (b1 >> 4) | (b2 << 4)
+                        
+                        img_flat = np.empty(w*h, dtype=np.uint16)
+                        img_flat[0::2] = p0; img_flat[1::2] = p1
+                        img_bayer = img_flat.reshape(h, w)
 
-                    # 4. Aplicar Gamma Correcta (2.2) sobre la imagen (sea grande o chica)
-                    # Al ser 'fast', esta operación matemática se hace sobre 9 veces menos píxeles.
-                    rgb_f = rgb16.astype(np.float32) / 4095.0
-                    rgb_gamma = np.power(rgb_f, 1.0/2.2) 
-                    rgb8 = np.clip(rgb_gamma * 255, 0, 255).astype(np.uint8)
-                    
+                        # 2. Debayering y Pipeline Color Completo
+                        rgb16 = cv2.cvtColor(img_bayer, cv2.COLOR_BayerBG2RGB) # BG implica R en (0,0) con OpenCV
+                        
+                        # Gamma Precisa
+                        rgb_f = rgb16.astype(np.float32) / 4095.0
+                        rgb_gamma = np.power(rgb_f, 1.0/2.2) 
+                        rgb8 = np.clip(rgb_gamma * 255, 0, 255).astype(np.uint8)
+
+                    # QIMAGE (Común)
                     h_out, w_out, _ = rgb8.shape
-                    
                     if not rgb8.flags['C_CONTIGUOUS']: rgb8 = np.ascontiguousarray(rgb8)
                     self._temp_img_ref = rgb8 
-                    
                     qimg = QImage(rgb8.data, w_out, h_out, w_out*3, QImage.Format.Format_RGB888)
 
                 # --- VISUALIZACIÓN ---
@@ -679,7 +758,9 @@ class MainWindow(QMainWindow):
                 self.viewer_play.setPixmap(pix.scaled(self.viewer_play.size(), Qt.AspectRatioMode.KeepAspectRatio))
                 
                 if not fast:
-                    self.lbl_frame_info.setText(f"{idx}/{self.total_frames} [BG]")
+                    self.lbl_frame_info.setText(f"{idx}/{self.total_frames} [H.Q.]")
+                else:
+                    self.lbl_frame_info.setText(f"{idx}/{self.total_frames} [FAST]")
 
         except Exception as e:
             print(f"Error Viewer: {e}")
@@ -815,28 +896,41 @@ class MainWindow(QMainWindow):
             self.viewer_scan.setPixmap(pix)
         else: 
             self.viewer_scan.setPixmap(pix.scaled(self.viewer_scan.size(), Qt.AspectRatioMode.KeepAspectRatio))
-    def update_stats(self, fps, temp, qsize):
+    def update_stats(self, fps, temp, qsize, drops=0, bw=0.0, bw_src="C"):
+        # Filtro visual para FPS (que no salte tanto)
         self.lbl_fps.setText(f"FPS: {fps:.1f}")
-        self.lbl_buffer.setText(f"RAM: {qsize}")
-        col = "red" if temp > 50 else "#FFC107" if temp > 45 else "green"
-        self.lbl_temp.setText(f"T: {temp:.1f}°C"); self.lbl_temp.setStyleSheet(f"color:{col};font-weight:bold")
-        self.last_temp_value = temp
+        self.lbl_temp.setText(f"Tmp: {temp:.1f}°")
+        self.lbl_buffer.setText(f"Buf: {qsize}")
+        self.lbl_dropped.setText(f"Drp: {drops}")
+        self.lbl_bw.setText(f"BW({bw_src}): {int(bw)} Mbps")
+        
+        if drops > 0:
+             self.lbl_dropped.setStyleSheet("color: red; font-weight: bold; font-size: 10pt; margin-left: 10px;")
+        else:
+             self.lbl_dropped.setStyleSheet("color: #4caf50; font-size: 10pt; margin-left: 10px;")
+        
+        if self.writer_worker:
+            self.lbl_saved.setText(f"Sav: {self.writer_worker.frames_saved}")
 
     def on_camera_error(self, e): QMessageBox.critical(self, "Cam Error", e)
 
-    def on_format_changed(self, t): 
-        # SEGURIDAD: Si estamos grabando, IGNORAR cualquier intento de cambio
-        if self.is_recording:
-            print("Intento de cambio de formato bloqueado durante grabación.")
+    # on_format_changed eliminado
+
+    def toggle_zoom(self, c):
+         # Redirige a toggle_zoom_state para mantener compatibilidad
+         self.toggle_zoom_state(c)
+
+    def on_exposure_change(self, v):
+        # Forzar pasos de 10
+        step = 10
+        val = int(round(v / step) * step)
+        if val != v:
+            self.sl_exp.setValue(val)
             return
-
+            
+        self.lbl_exp_val.setText(str(val))
         if self.camera_worker: 
-            self.camera_worker.set_format_roi(t)
-
-    def sync_exposure_spin(self, v): self.sb_exp.setValue(v); self.camera_worker.update_exposure(v)
-    def sync_exposure_slider(self, v): self.sl_exp.setValue(v); self.camera_worker.update_exposure(v)
-    def sync_gamma_spin(self, v): self.sl_gam.setValue(int(v*100)); self.camera_worker.update_gamma(v)
-    def sync_gamma_slider(self, v): self.sb_gam.setValue(v/100); self.camera_worker.update_gamma(v/100)
+            self.camera_worker.update_exposure(val)
     
     def toggle_peaking(self, c): self.btn_peaking.setStyleSheet("background:red" if c else "")
     
@@ -845,16 +939,26 @@ class MainWindow(QMainWindow):
         self.viewer_scan.setCursor(Qt.CursorShape.OpenHandCursor if c else Qt.CursorShape.ArrowCursor)
 
     def toggle_recording(self):
-        if not self.active_collection: return
-        
         if not self.is_recording:
             # --- INICIAR GRABACIÓN ---
-            fmt = self.combo_format.currentText() # Ej: "Super 8"
+            if not self.active_collection:
+                QMessageBox.warning(self, "Error", "Selecciona una colección primero.")
+                # Assuming btn_record is a QPushButton, not a QCheckBox, so no setChecked(False)
+                return
+
+            if self.camera_worker:
+                 # FIX: Limpiar frames viejos del buffer antes de empezar
+                 self.camera_worker.clear_queue()
+                 self.camera_worker.reset_drop_count() 
+                 
+                 # Conectar la queue real solo ahora
+                 self.camera_worker.set_queue(self.frame_queue)
+            
+            # --- INICIAR GRABACIÓN ---
+            # fmt = "Standard" # Eliminado selector
             ftype = self.combo_type.currentText() # Ej: "Color (Pos/Neg)"
             
-            # 1. Aplicar ROI a la cámara
-            if self.camera_worker: 
-                self.camera_worker.set_format_roi(fmt)
+            # 1. (Ya no se aplica ROI formato porque es fijo)
             
             # 2. Obtener nombres y workers
             fn, fp = self.manager.get_next_filename(self.active_collection)
@@ -871,25 +975,32 @@ class MainWindow(QMainWindow):
                 self.active_collection, 
                 fn, 
                 fps=self.sb_fps.value(),
-                roi_key=fmt,           # Guardamos "Super 8"
-                film_type=ftype,       # Guardamos "Color..."
-                pixel_format=pixel_mode # Guardamos "rgb" o "bayer"
+                roi_key="Standard 2840x2200", # Valor fijo
+                film_type=ftype,
+                pixel_format=pixel_mode
             )
             # -----------------------------------------------
 
             self.is_recording = True
             self.btn_record.setText(f"DETENER ({fn})")
             self.btn_record.setStyleSheet("background:red;color:white;font-weight:bold")
-            self.combo_format.setEnabled(False)
+            # self.combo_format.setEnabled(False) # Eliminado
             self.combo_type.setEnabled(False)
             
         else:
             # --- DETENER GRABACIÓN ---
-            self.writer_worker.stop()
             self.is_recording = False
+            if self.camera_worker:  
+                 # Desconectar queue para que los nuevos frames se descarten (no se acumulen)
+                 self.camera_worker.set_queue(None)
+                 self.camera_worker.reset_drop_count()
+
+            if self.writer_worker:
+                self.writer_worker.stop()
+                self.writer_worker = None
             self.btn_record.setText("GRABAR")
             self.btn_record.setStyleSheet("")
-            self.combo_format.setEnabled(True)
+            # self.combo_format.setEnabled(True) # Eliminado
             self.combo_type.setEnabled(True)
             self.refresh_file_list(self.active_collection)
 
@@ -921,11 +1032,31 @@ class MainWindow(QMainWindow):
         self.tif_worker.progress_signal.connect(self.pd_tif.setValue)
         self.tif_worker.info_signal.connect(self.pd_tif.setLabelText)
         self.tif_worker.finished_signal.connect(self.on_tif_finished)
+        self.pd_tif.canceled.connect(self.on_tif_cancelled)
+        
+        # Guardar ruta de salida para posible borrado (Carpeta con el mismo nombre del archivo sin ext)
+        self.current_tif_output = target_input.parent / target_input.stem
         
         # 4. Iniciar
         self.tif_worker.start()
 
+    def on_tif_cancelled(self):
+        if self.tif_worker: self.tif_worker.kill()
+        
+        resp = QMessageBox.question(self, "Cancelado", "¿Desea eliminar la carpeta incompleta generada?", QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+        if resp == QMessageBox.StandardButton.Yes:
+            try:
+                if hasattr(self, 'current_tif_output') and self.current_tif_output.exists():
+                    shutil.rmtree(self.current_tif_output)
+                    QMessageBox.information(self, "Info", "Carpeta eliminada.")
+            except Exception as e:
+                QMessageBox.warning(self, "Error", f"No se pudo borrar: {e}")
+        self.pd_tif.close()
+
     def on_tif_finished(self, success, msg):
+        try: self.pd_tif.canceled.disconnect(self.on_tif_cancelled)
+        except: pass
+
         self.pd_tif.close()
         if success:
             # Mensaje menos intrusivo o confirmación simple
@@ -1011,16 +1142,41 @@ class MainWindow(QMainWindow):
             "--mode", mode
         ]
         
+        # Pre-calcular ruta de salida para posible borrado
+        ext_map = {'prores': '.mov', 'ffv1': '.mkv', 'h264': '.mp4', 'hevc': '.mp4', 'jxl': ''} # jxl usa carpeta
+        ext = ext_map.get(fmt, ".mp4")
+        self.current_video_output = nf.parent / f"{nf.stem}_{fmt}{ext}"
+        
         self.worker = UniversalExportWorker(cmd)
         self.worker.progress_signal.connect(self.pd.setValue)
         self.worker.info_signal.connect(self.pd.setLabelText)
         self.worker.finished_signal.connect(self.on_batch_item_finished)
+        self.pd.canceled.connect(self.on_batch_cancel)
         self.worker.start()
 
-    def on_batch_item_finished(self, s, m):
+    def on_batch_cancel(self):
+        self.export_queue = [] # Detener resto de la cola
+        self.is_exporting_batch = False
+        if self.worker: self.worker.kill()
+        
+        resp = QMessageBox.question(self, "Cancelado", "¿Desea eliminar el archivo incompleto generado?", QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+        if resp == QMessageBox.StandardButton.Yes:
+            try:
+                if hasattr(self, 'current_video_output') and self.current_video_output.exists():
+                    os.remove(self.current_video_output)
+                    QMessageBox.information(self, "Info", f"Archivo eliminado: {self.current_video_output.name}")
+            except Exception as e:
+                QMessageBox.warning(self, "Error", f"No se pudo borrar: {e}")
         self.pd.close()
-        if not s: print(f"Error export: {m}")
-        self.process_export_queue()
+
+    def on_batch_item_finished(self, s, m):
+        try: self.pd.canceled.disconnect(self.on_batch_cancel)
+        except: pass
+        
+        if not self.pd.wasCanceled(): # Evitar doble cierre/error
+             self.pd.close()
+             if not s: print(f"Error export: {m}")
+             self.process_export_queue() # Siguiente
 
     def open_file_context_menu(self, pos):
         if not self.file_list.itemAt(pos): return
@@ -1057,6 +1213,14 @@ class UniversalExportWorker(QThread):
     def __init__(self, cmd):
         super().__init__()
         self.cmd = cmd
+        self.process = None
+        self.killed = False
+
+    def kill(self):
+        self.killed = True
+        if self.process:
+            try: self.process.kill()
+            except: pass
 
     def run(self):
         try:
@@ -1064,7 +1228,7 @@ class UniversalExportWorker(QThread):
             cf = 0x08000000 if os.name == 'nt' else 0
             
             # Unimos stderr y stdout para capturar errores de FFmpeg
-            process = subprocess.Popen(
+            self.process = subprocess.Popen(
                 self.cmd, 
                 stdout=subprocess.PIPE, 
                 stderr=subprocess.STDOUT, 
@@ -1075,10 +1239,13 @@ class UniversalExportWorker(QThread):
                 errors='replace'
             )
             
+            process = self.process # Alias local
             total_items = 0
             last_lines = [] # Guardaremos las últimas líneas para el reporte de error
             
             while True:
+                if self.killed: break # Salir si fue matado
+                
                 line = process.stdout.readline()
                 if not line and process.poll() is not None: break
                 
@@ -1095,7 +1262,16 @@ class UniversalExportWorker(QThread):
                     
                     elif line.startswith("PROG|"):
                         try:
-                            current = int(line.split("|")[1])
+                            parts = line.split("|")
+                            current = int(parts[1])
+                            
+                            # Si raw2video manda PROG|current|total, aprovechamos para setear total
+                            if len(parts) > 2:
+                                try: 
+                                    t = int(parts[2])
+                                    if t > 0: total_items = t
+                                except: pass
+
                             if total_items > 0:
                                 percent = int((current / total_items) * 100)
                                 self.progress_signal.emit(percent)
@@ -1113,6 +1289,8 @@ class UniversalExportWorker(QThread):
                         # Lo imprimimos en la consola del IDE para debug
                         print(f"[FFMPEG/L2T]: {line}")
 
+            if self.killed: return
+
             rc = process.poll()
             if rc == 0:
                 self.finished_signal.emit(True, "Proceso completado correctamente.")
@@ -1122,7 +1300,8 @@ class UniversalExportWorker(QThread):
                 self.finished_signal.emit(False, f"El proceso terminó con código {rc}.\n\nÚltimos logs:\n{error_summary}")
 
         except Exception as e:
-            self.finished_signal.emit(False, str(e))
+            if not self.killed:
+                 self.finished_signal.emit(False, str(e))
 if __name__ == "__main__":
     app = QApplication(sys.argv)
     app.setStyle("Fusion")

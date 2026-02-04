@@ -10,18 +10,86 @@ from arena_api.buffer import BufferFactory
 from arena_api.enums import PixelFormat
 from pathlib import Path
 
-# --- CONFIGURACIÓN DE FORMATOS (ROI) ---
-FORMAT_ROIS = {
-    "Super 8":       {"w": 2840, "h": 2080}, 
-    "Regular 8mm":   {"w": 2840, "h": 2136}, 
-    "16mm (Mudo)":   {"w": 2840, "h": 2072}, 
-    "16mm (Sonido)": {"w": 2840, "h": 1700}, 
-    "Full Sensor":   {"w": 2840, "h": 2840} 
-}
+# Intentamos importar psutil para medir ancho de banda real del SO
+try:
+    import psutil
+    PSUTIL_AVAILABLE = True
+except ImportError:
+    PSUTIL_AVAILABLE = False
+    print("WARN: 'psutil' no instalado. La medición de ancho de banda será estimada.")
+
+# Se ha unificado a una única resolución.
+FIXED_WIDTH = 2840
+FIXED_HEIGHT = 2200
+
+class PreviewWorker(QThread):
+    """
+    Hilo dedicado a convertir el buffer RAW de la cámara a imagen visualizable (RGB/Mono).
+    Esto libera al hilo principal de la cámara (CameraWorker) para que nunca deje de vaciar el buffer del driver.
+    """
+    image_ready = pyqtSignal(np.ndarray)
+
+    def __init__(self, in_queue):
+        super().__init__()
+        self.in_queue = in_queue
+        self.running = True
+
+    def run(self):
+        while self.running:
+            try:
+                # Esperamos un buffer (objeto Arena)
+                # Timeout corto para revisar self.running seguido
+                buffer = self.in_queue.get(timeout=0.1)
+            except queue.Empty:
+                continue
+
+            try:
+                # --- CONVERSIÓN (Arena SDK) ---
+                # Esto es lo que consumía CPU en el hilo crítico
+                
+                # Intentamos convertir a BGR8
+                # Nota: Podríamos implementar lógica de "Quality vs Speed" aquí también si la cola crece.
+                try:
+                    image_converted = BufferFactory.convert(buffer, PixelFormat.BGR8)
+                    h, w = image_converted.height, image_converted.width
+                    
+                    # Subsampling 2x siempre para rendimiento GUI (1420x1100)
+                    # Es un buen compromiso fijo.
+                    full_arr = np.ctypeslib.as_array(image_converted.pdata, shape=(h, w, 3))
+                    image_final = full_arr[::2, ::2, :].copy()
+                    
+                    BufferFactory.destroy(image_converted)
+                    
+                    self.image_ready.emit(image_final)
+
+                except Exception as e:
+                    # Fallback Mono8
+                    try:
+                        image_converted = BufferFactory.convert(buffer, PixelFormat.Mono8)
+                        h, w = image_converted.height, image_converted.width
+                        full_arr = np.ctypeslib.as_array(image_converted.pdata, shape=(h, w))
+                        image_final = full_arr[::2, ::2].copy()
+                        BufferFactory.destroy(image_converted)
+                        self.image_ready.emit(image_final)
+                    except: pass
+            
+            except Exception as e:
+                print(f"Error PreviewWorker: {e}")
+            finally:
+                # IMPORTANTE: Destruir la copia del buffer que nos pasaron
+                if buffer:
+                    BufferFactory.destroy(buffer)
+                self.in_queue.task_done()
+
+    def stop(self):
+        self.running = False
+        self.wait()
+
 
 class CameraWorker(QThread):
     image_received = pyqtSignal(np.ndarray)
-    stats_updated = pyqtSignal(float, float, int) 
+    # fps, temp, qsize, dropped_frames, bandwidth_mbps, bw_source
+    stats_updated = pyqtSignal(float, float, int, int, float, str) 
     error_occurred = pyqtSignal(str)
 
     def __init__(self, settings_file="strobe2.txt"):
@@ -47,11 +115,36 @@ class CameraWorker(QThread):
         self.device = None
         self.write_queue = None
         self.frame_count = 0
+        self.instant_frame_count = 0
         self.start_time = 0
-        self.current_roi_key = "Full Sensor"
+        self.last_stats_time = 0
+        self.last_frame_id = -1
+        self.dropped_frames = 0
+        self.last_frame_id = -1
+        self.dropped_frames = 0
+        self.last_stream_bytes = 0
+        self.last_os_bytes = 0 # Para medición psutil
+        
+        # Cola y Worker para Preview (Desacoplado)
+        self.preview_queue = queue.Queue(maxsize=2) # Max 2 frames de lag visual, si se llena descartamos
+        self.preview_worker = PreviewWorker(self.preview_queue)
+        # Reenviamos la señal del worker interno hacia fuera para que main_app no se entere del cambio
+        self.preview_worker.image_ready.connect(self.image_received.emit)
+        self.preview_worker.start()
 
     def set_queue(self, q):
         self.write_queue = q
+
+    def clear_queue(self):
+        if self.write_queue:
+            with self.write_queue.mutex:
+                self.write_queue.queue.clear()
+            print("INFO: Cola de fotogramas limpiada antes de grabar.")
+
+    def reset_drop_count(self):
+        self.dropped_frames = 0
+        self.last_frame_id = -1 # Reiniciamos tracking de ID para evitar falsos positivos al reconectar
+        print("Contadores de Drop reseteados.")
 
     def setup_camera(self):
         print("Buscando dispositivos...")
@@ -92,7 +185,16 @@ class CameraWorker(QThread):
             except Exception as e:
                 print(f"No se pudo desactivar ChunkMode: {e}")
 
-            tl_stream['StreamBufferHandlingMode'].value = "OldestFirst"
+            try:
+                # Esto es CRÍTICO. Aumentamos el buffer del driver para evitar drops si el PC hipa.
+                # Valor por defecto suele ser bajo (10). Lo subimos a 200.
+                tl_stream['StreamDefaultBufferCount'].value = 200
+                # A veces se llama StreamInputBufferCount o similar dependiendo version
+            except: pass
+
+            # Optimización Latencia: NewestOnly descarta frames viejos si la UI se traba
+            # ¡OJO! Para evitar drops en grabación, necesitamos buffer grande.
+            tl_stream['StreamBufferHandlingMode'].value = "NewestOnly"
             tl_stream['StreamAutoNegotiatePacketSize'].value = True
             tl_stream['StreamPacketResendEnable'].value = True
             
@@ -101,6 +203,16 @@ class CameraWorker(QThread):
 
             if nodemap.get_node('GammaEnable'): 
                 nodemap.get_node('GammaEnable').value = True
+
+            # --- FORZAR RESOLUCIÓN FIJA ---
+            try:
+                nodemap.get_node('OffsetX').value = 0
+                nodemap.get_node('OffsetY').value = 0
+                nodemap.get_node('Width').value = FIXED_WIDTH
+                nodemap.get_node('Height').value = FIXED_HEIGHT
+                print(f"Resolución fijada a: {FIXED_WIDTH}x{FIXED_HEIGHT}")
+            except Exception as e:
+                print(f"Error fijando resolución: {e}")
 
         except Exception as e:
             print(f"Warning setup: {e}")
@@ -186,41 +298,7 @@ class CameraWorker(QThread):
                 print(f"  - {err}")
         else:
             print("EXITO: Configuración aplicada perfectamente.")
-    def set_format_roi(self, format_name):
-        if format_name not in FORMAT_ROIS: return
-        if self.current_roi_key == format_name: return
-
-        print(f"Cambiando ROI a: {format_name}...")
-        self.running = False
-        
-        # Detener stream para desbloquear
-        if self.device:
-            try: self.device.stop_stream()
-            except: pass 
-        
-        # Esperar a que el hilo termine (evita conflicto de hilos)
-        self.wait(2000) 
-        
-        if self.device:
-            try:
-                nodemap = self.device.nodemap
-                cfg = FORMAT_ROIS[format_name]
-                
-                nodemap.get_node('OffsetX').value = 0
-                nodemap.get_node('OffsetY').value = 0
-                nodemap.get_node('Width').value = cfg['w']
-                nodemap.get_node('Height').value = cfg['h']
-                
-                self.device.tl_stream_nodemap['StreamAutoNegotiatePacketSize'].value = True
-                self.current_roi_key = format_name
-                print(f"ROI Aplicado exitosamente: {cfg['w']}x{cfg['h']}")
-                
-            except Exception as e:
-                print(f"Error aplicando ROI: {e}")
-                self.error_occurred.emit(f"Error ROI: {e}")
-            
-            # Reiniciar
-            self.start()
+# Método set_format_roi eliminado por unificación de resolución.
 
     def update_exposure(self, value_us):
         if self.device:
@@ -239,8 +317,16 @@ class CameraWorker(QThread):
             
             self.running = True
             self.start_time = time.time()
+            self.last_stats_time = time.time()
             last_temp_check = 0
             current_temp = 0.0
+            
+            # Reset counters
+            self.frame_count = 0
+            self.instant_frame_count = 0
+            self.dropped_frames = 0
+            self.last_frame_id = -1
+            self.preview_skip_counter = 0 # Para "Best Effort Preview"
 
             try:
                 self.device.start_stream(100)
@@ -248,19 +334,66 @@ class CameraWorker(QThread):
                 print(f"Error start_stream: {e}")
                 self.running = False
                 return
+            
+            # Nodo de Bytes Totales (Medición Real desde Driver/OS)
+            stream_node = None
+            try:
+                stream_node = self.device.tl_stream_nodemap.get_node('StreamTotalBytes')
+            except:
+                try:
+                    stream_node = self.device.tl_stream_nodemap.get_node('StreamOctets')
+                except:
+                    print("WARN: No se encontraron nodos de estadísticas de flujo (StreamTotalBytes/StreamOctets). Usando cálculo manual.")
+                    stream_node = None
 
             while self.running:
-                # --- A. LECTURA DE TEMPERATURA (Independiente del video) ---
-                # Hacemos esto AL PRINCIPIO del bucle para que siempre se ejecute
+                # --- A. LECTURA DE TEMPERATURA Y ESTADÍSTICAS ---
                 now = time.time()
-                if now - last_temp_check > 1.0: # Actualizar cada 1 segundo
+                dt = now - self.last_stats_time
+                if dt > 1.0: # Actualizar cada 1 segundo aprox
                     try: 
                         current_temp = temp_node.value 
-                        # Emitimos stats aquí mismo
-                        elapsed = now - self.start_time
-                        fps = self.frame_count / elapsed if elapsed > 0 else 0
+                        
+                        # Cálculo FPS Instantáneo
+                        fps = self.instant_frame_count / dt
+                        
+                        # Cálculo Bandwidth
+                        mbps = 0.0
+                        bw_src = "C" # Default: Calculated via FPS * Size
+                        
+                        # ESTRATEGIA 1: OS Level (psutil) - La más precisa a nivel sistema
+                        if PSUTIL_AVAILABLE:
+                            try:
+                                net = psutil.net_io_counters()
+                                curr_os_bytes = net.bytes_recv # Tráfico total de bajada
+                                if self.last_os_bytes > 0:
+                                    delta = curr_os_bytes - self.last_os_bytes
+                                    mbps = (delta * 8) / (dt * 1_000_000.0)
+                                self.last_os_bytes = curr_os_bytes
+                                bw_src = "OS"
+                            except: pass
+
+                        # ESTRATEGIA 2: Driver Level (StreamTotalBytes) - Si OS falla
+                        if bw_src == "C" and stream_node:
+                            try:
+                                curr_bytes = stream_node.value
+                                if self.last_stream_bytes > 0:
+                                    delta = curr_bytes - self.last_stream_bytes
+                                    mbps = (delta * 8) / (dt * 1_000_000.0)
+                                self.last_stream_bytes = curr_bytes
+                                bw_src = "D"
+                            except: pass
+
+                        # ESTRATEGIA 3: Calculated (FPS * Payload) - Fallback final
+                        if bw_src == "C":
+                             frame_size_mb = (2840 * 2200 * 1.5) / (1024*1024)
+                             mbps = fps * frame_size_mb * 8
+
+                        self.instant_frame_count = 0 # Reset para el próximo segundo
+                        self.last_stats_time = now
+                        
                         q_size = self.write_queue.qsize() if self.write_queue else 0
-                        self.stats_updated.emit(fps, current_temp, q_size)
+                        self.stats_updated.emit(fps, current_temp, q_size, self.dropped_frames, mbps, bw_src)
                     except: pass
                     last_temp_check = now
 
@@ -279,7 +412,19 @@ class CameraWorker(QThread):
                     self.device.requeue_buffer(buffer)
                     continue
 
-                # 1. Copia Maestra
+                # 1. Copia Maestra Y Detección de Drops
+                # Verificamos si saltó el FrameID
+                curr_id = buffer.frame_id
+                if self.last_frame_id != -1:
+                    diff = curr_id - self.last_frame_id
+                    if diff > 1:
+                        # Se perdieron (diff - 1) frames
+                        drop_count = diff - 1
+                        self.dropped_frames += drop_count
+                        print(f"WARN: Drop detectado! Saltó de {self.last_frame_id} a {curr_id} (Perdidos: {drop_count})")
+                
+                self.last_frame_id = curr_id
+                
                 image_raw = BufferFactory.copy(buffer)
                 self.device.requeue_buffer(buffer)
                 
@@ -306,13 +451,22 @@ class CameraWorker(QThread):
                     raw_bytes = data_full.copy().tobytes()
                 # -----------------------------------------------
 
-                # A. Guardar
+                # A. Guardar (PRIORIDAD 1)
+                is_recording = False
                 if self.write_queue:
+                    is_recording = True
                     try: self.write_queue.put_nowait(raw_bytes)
                     except queue.Full: pass
-
-                # B. Previsualización
-                # B. Previsualización
+                
+                # B. Previsualización (PRIORIDAD 2 - Best Effort)
+                # Si estamos grabando, saltamos 1 de cada 2 cuadros de la vista previa
+                # para liberar CPU/RAM y asegurar que la grabación no pierda frames.
+                if is_recording:
+                    self.preview_skip_counter += 1
+                    if self.preview_skip_counter % 2 != 0:
+                        BufferFactory.destroy(image_raw)
+                        continue # Saltamos preview de este frame
+                
                 image_for_gui = None
                 try:
                     # SIEMPRE intentamos convertir a BGR8 para la vista previa.
@@ -326,7 +480,11 @@ class CameraWorker(QThread):
                     h, w = image_converted.height, image_converted.width
                     
                     # Extraemos el array numpy (H, W, 3)
-                    image_for_gui = np.ctypeslib.as_array(image_converted.pdata, shape=(h, w, 3)).copy()
+                    # OPTIMIZACIÓN VITAL: Subsampling inmediato [::2]
+                    # Reducimos de 2840x2200 a ~1420x1100 (50% resolución).
+                    # Equilibrio entre fluidez y detalle para Foco (Peaking).
+                    full_arr = np.ctypeslib.as_array(image_converted.pdata, shape=(h, w, 3))
+                    image_for_gui = full_arr[::1, ::1, :].copy()
                     
                     BufferFactory.destroy(image_converted)
 
@@ -347,6 +505,7 @@ class CameraWorker(QThread):
                 if image_for_gui is not None:
                     self.image_received.emit(image_for_gui)
                     self.frame_count += 1
+                    self.instant_frame_count += 1
                     
                     # (Ya no emitimos stats aquí abajo para no duplicar, 
                     #  se emiten arriba de forma constante)
@@ -362,6 +521,8 @@ class CameraWorker(QThread):
     def stop(self):
         self.running = False
         self.wait()
+        if self.preview_worker:
+            self.preview_worker.stop()
         if self.device:
             try: 
                 system.destroy_device(self.device)
@@ -379,15 +540,28 @@ class WriterWorker(QThread):
         self.frames_saved = 0
 
     def run(self):
-        with open(self.save_path, "wb") as f:
+        # Aumentar buffer de archivo a 64MB (64*1024*1024) para minimizar I/O ops
+        with open(self.save_path, "wb", buffering=67108864) as f:
             while self.running or not self.frame_queue.empty():
                 try:
                     data = self.frame_queue.get(timeout=0.1)
+                    
+                    t0 = time.perf_counter()
                     f.write(data)
+                    t1 = time.perf_counter()
+                    
+                    dt_ms = (t1 - t0) * 1000.0
+                    if dt_ms > 40.0:
+                        print(f"ALERTA DISCO: Escritura lenta detectada ({dt_ms:.1f} ms). Posible cuello de botella.")
+                    
                     self.frames_saved += 1
-                    self.frames_saved_signal.emit(self.frames_saved)
+                    # Optimización: No emitir señal CADA frame, sino cada 5 frames para liberar CPU del GUI
+                    if self.frames_saved % 5 == 0:
+                        self.frames_saved_signal.emit(self.frames_saved)
+                        
                     self.frame_queue.task_done()
                 except queue.Empty: continue
+    
     def stop(self):
         self.running = False
         self.wait()
