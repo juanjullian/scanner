@@ -1,9 +1,9 @@
-# Lucid Scanner Suite
+# Lucid Scanner
 ### Archivo de La Unión
 
 ## Resumen
 
-Lucid Scanner Suite es un software especializado en la digitalización de películas, diseñado para la preservación y el escaneo en alta resolución de material fílmico. Desarrollado para el **Archivo de La Unión**, este sistema une la tecnología moderna de visión artificial con hardware vintage modificado para crear un flujo de trabajo de archivo de grado profesional.
+Lucid Scanner es un software especializado en la digitalización de películas, diseñado para la preservación y el escaneo en alta resolución de material fílmico. Desarrollado para el **Archivo de La Unión**, este sistema une la tecnología moderna de visión artificial con hardware vintage modificado para crear un flujo de trabajo de archivo de grado profesional.
 
 El núcleo del sistema funciona como una interfaz de alta velocidad para la cámara de visión artificial **Lucid Vision Phoenix PHX081s**, integrada con un mecanismo de transporte **Retroscan Mk1** modificado. Está diseñado para priorizar la integridad absoluta del cuadro, asegurando que cada fotograma del medio físico sea capturado, almacenado en buffer y guardado sin pérdidas, incluso a altas tasas de transferencia.
 
