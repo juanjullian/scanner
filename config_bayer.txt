@@ -10,7 +10,7 @@ DeviceLinkThroughputReserve	10
 DeviceLinkSelector	0
 GevStreamChannelSelector	0
 DeviceStreamChannelSelector	0
-DeviceStreamChannelPacketSize	9000
+DeviceStreamChannelPacketSize	1500
 GevStreamChannelSelector	0
 DeviceStreamChannelSelector	0
 DeviceIndicatorMode	Active
@@ -79,7 +79,7 @@ TriggerSelector	FrameStart
 ExposureTimeMode	Common
 ExposureTimeSelector	Common
 ExposureTimeSelector	Common
-ExposureTime	50
+ExposureTime	94.064
 ExposureTimeSelector	Common
 ShortExposureEnable	0
 ExposureAuto	Off
@@ -207,7 +207,7 @@ CounterSelector	Counter1
 CounterResetActivation	RisingEdge
 CounterSelector	Counter0
 CounterSelector	Counter0
-CounterValue	1
+CounterValue	250
 CounterSelector	Counter1
 CounterValue	0
 CounterSelector	Counter0

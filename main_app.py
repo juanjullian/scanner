@@ -201,22 +201,23 @@ class BatchExportDialog(QDialog):
         sett_layout.addWidget(QLabel("Formato de Salida:"))
         self.combo_fmt = QComboBox()
         self.combo_fmt.addItems([
+            "DNG Raw Sequence (DaVinci Resolve - 16bit) [Recomendado]",
             "ProRes 4444 (Premiere - 12bit - Alta Calidad)", 
             "GoPro CineForm (Premiere - 12bit - Intermedio)", 
-            "ProRes 422 HQ (Premiere - 10bit - Estándar) [Default]",
+            "ProRes 422 HQ (Premiere - 10bit - Estándar)",
             "HEVC 10-bit 4:4:4 (MP4 - Eficiente)", 
             "H.264 (MP4 - Proxy)"
         ])
-        self.combo_fmt.setCurrentIndex(2) # Default ProRes 422 HQ
+        self.combo_fmt.setCurrentIndex(0) # Default DNG
         sett_layout.addWidget(self.combo_fmt)
         
-        sett_layout.addWidget(QLabel("Perfil de Revelado:"))
+        sett_layout.addWidget(QLabel("Perfil de Revelado (Solo Video - No afecta DNG):"))
         self.combo_sharp = QComboBox()
         self.combo_sharp.addItems([
             "DCB Puro",
             "Suave (S:0.8 / A:1.5)",
             "Medio (S:1.3 / A:1.5)",
-            "Grueso (S:2.0 / A:2.5) [Recomendado]"
+            "Grueso (S:2.0 / A:2.5) [Recomendado para Video]"
         ])
         self.combo_sharp.setCurrentIndex(3)
         sett_layout.addWidget(self.combo_sharp)
@@ -311,7 +312,15 @@ class BatchExportDialog(QDialog):
             if item.checkState() == Qt.CheckState.Checked:
                 files.append(item.text())
         
-        fmt_map = {0: 'prores', 1: 'cineform', 2: 'prores_hq', 3: 'hevc', 4: 'h264'}
+        # Mapeo actualizado con DNG en índice 0
+        fmt_map = {
+            0: 'dng',
+            1: 'prores', 
+            2: 'cineform', 
+            3: 'prores_hq', 
+            4: 'hevc', 
+            5: 'h264'
+        }
         sharp_map = {0: '0,0', 1: '0.8,1.5', 2: '1.3,1.5', 3: '2.0,2.5'}
         
         return files, fmt_map[self.combo_fmt.currentIndex()], sharp_map[self.combo_sharp.currentIndex()]
@@ -1143,9 +1152,14 @@ class MainWindow(QMainWindow):
         ]
         
         # Pre-calcular ruta de salida para posible borrado
-        ext_map = {'prores': '.mov', 'ffv1': '.mkv', 'h264': '.mp4', 'hevc': '.mp4', 'jxl': ''} # jxl usa carpeta
-        ext = ext_map.get(fmt, ".mp4")
-        self.current_video_output = nf.parent / f"{nf.stem}_{fmt}{ext}"
+        if fmt == 'dng':
+            # DNG crea una CARPETA
+            self.current_video_output = nf.parent / f"{nf.stem}_DNG_SEQ"
+        else:
+            # Video crea un ARCHIVO
+            ext_map = {'prores': '.mov', 'ffv1': '.mkv', 'h264': '.mp4', 'hevc': '.mp4', 'cineform': '.mov'}
+            ext = ext_map.get(fmt, ".mp4")
+            self.current_video_output = nf.parent / f"{nf.stem}_{fmt}{ext}"
         
         self.worker = UniversalExportWorker(cmd)
         self.worker.progress_signal.connect(self.pd.setValue)
@@ -1159,12 +1173,16 @@ class MainWindow(QMainWindow):
         self.is_exporting_batch = False
         if self.worker: self.worker.kill()
         
-        resp = QMessageBox.question(self, "Cancelado", "¿Desea eliminar el archivo incompleto generado?", QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+        resp = QMessageBox.question(self, "Cancelado", "¿Desea eliminar los archivos incompletos generados?", QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
         if resp == QMessageBox.StandardButton.Yes:
             try:
                 if hasattr(self, 'current_video_output') and self.current_video_output.exists():
-                    os.remove(self.current_video_output)
-                    QMessageBox.information(self, "Info", f"Archivo eliminado: {self.current_video_output.name}")
+                    if self.current_video_output.is_dir():
+                        shutil.rmtree(self.current_video_output)
+                        QMessageBox.information(self, "Info", f"Carpeta eliminada: {self.current_video_output.name}")
+                    else:
+                        os.remove(self.current_video_output)
+                        QMessageBox.information(self, "Info", f"Archivo eliminado: {self.current_video_output.name}")
             except Exception as e:
                 QMessageBox.warning(self, "Error", f"No se pudo borrar: {e}")
         self.pd.close()
