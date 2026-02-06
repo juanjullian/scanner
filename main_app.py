@@ -7,6 +7,7 @@ import subprocess
 import cv2
 from datetime import datetime
 from pathlib import Path
+import json
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, 
                              QPushButton, QLabel, QListWidget, QInputDialog, QMessageBox, 
                              QSplitter, QGroupBox, QProgressBar, QTabWidget, QSlider, QFileDialog,
@@ -322,7 +323,7 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.setWindowTitle("Escáner de películas - Archivo La Unión")
         self.resize(1400, 900)
-        self.root_folder = os.path.expanduser("~/Documents/Archivo_Scan_Data")
+        self.load_config() # Carga o pide la carpeta raíz
         self.manager = scanner_core.CollectionManager(self.root_folder)
         self.active_collection = None
         self.is_recording = False
@@ -345,6 +346,69 @@ class MainWindow(QMainWindow):
         self.disk_timer.start(10000)
         self.bayer_phase = 0
 
+    def load_config(self):
+        config_path = Path(__file__).parent / "persist.json"
+        default_root = os.path.expanduser("~/Documents/Archivo_Scan_Data")
+        self.root_folder = default_root
+        
+        try:
+            if config_path.exists():
+                with open(config_path, 'r') as f:
+                    data = json.load(f)
+                    saved_root = data.get("root_folder")
+                    if saved_root and os.path.isdir(saved_root):
+                        self.root_folder = saved_root
+                        return
+
+            # Si no existe o no es válida, pedimos al usuario
+            self.ask_root_folder_first_time()
+            
+        except Exception as e:
+            print(f"Error cargando config: {e}")
+            self.root_folder = default_root
+
+    def ask_root_folder_first_time(self):
+        # Usamos un QDialog temporal o QMessageBox porque self (MainWindow) aun no es visible
+        msg = QMessageBox()
+        msg.setWindowTitle("Configuración Inicial")
+        msg.setText("Bienvenido al Scanner Suite.\n\nPor favor selecciona la carpeta donde se guardarán los escaneos (Colecciones).")
+        msg.setIcon(QMessageBox.Icon.Information)
+        # Importante: Hack para que aparezca encima del splash si es necesario
+        msg.setWindowFlags(msg.windowFlags() | Qt.WindowType.WindowStaysOnTopHint)
+        msg.exec()
+        
+        folder = QFileDialog.getExistingDirectory(None, "Seleccionar Carpeta de Datos", os.path.expanduser("~/Documents"))
+        if folder:
+            self.root_folder = folder
+        else:
+            # Si cancela, usamos default y avisamos
+            if not os.path.exists(self.root_folder): 
+                try: os.makedirs(self.root_folder, exist_ok=True)
+                except: pass
+            QMessageBox.warning(None, "Atención", f"No se seleccionó carpeta. Se usará la carpeta por defecto:\n{self.root_folder}")
+        
+        self.save_config()
+
+    def save_config(self):
+        try:
+            config_path = Path(__file__).parent / "persist.json"
+            with open(config_path, 'w') as f:
+                json.dump({"root_folder": self.root_folder}, f, indent=4)
+        except Exception as e:
+            print(f"Error guardando config: {e}")
+
+    def change_root_folder(self):
+        folder = QFileDialog.getExistingDirectory(self, "Seleccionar Nueva Carpeta Raíz", self.root_folder)
+        if folder and folder != self.root_folder:
+            self.root_folder = folder
+            self.save_config()
+            # Reiniciar Manager y listas
+            self.manager = scanner_core.CollectionManager(self.root_folder)
+            self.refresh_collections()
+            self.file_list.clear() # Limpiar lista de archivos antigua
+            self.update_disk_space()
+            QMessageBox.information(self, "Cambio Exitoso", f"Carpeta de escaneo actualizada a:\n{folder}")
+
     def init_ui(self):
         main_widget = QWidget()
         self.setCentralWidget(main_widget)
@@ -366,7 +430,18 @@ class MainWindow(QMainWindow):
         
         left_layout.addWidget(btn_new_col); left_layout.addWidget(self.col_list)
         left_layout.addWidget(QLabel("Archivos:")); left_layout.addWidget(self.file_list)
-        left_layout.addWidget(btn_refresh); left_layout.addWidget(self.lbl_disk)
+        
+        # Botonera de gestión
+        btn_group = QGroupBox("Opciones")
+        bg_layout = QVBoxLayout()
+        btn_change_root = QPushButton("📂 Directorio Datos"); btn_change_root.clicked.connect(self.change_root_folder)
+        
+        bg_layout.addWidget(btn_refresh)
+        bg_layout.addWidget(btn_change_root)
+        btn_group.setLayout(bg_layout)
+        
+        left_layout.addWidget(btn_group)
+        left_layout.addWidget(self.lbl_disk)
         left_panel.setLayout(left_layout); left_panel.setMaximumWidth(300)
 
         # Tabs
@@ -1225,7 +1300,9 @@ class UniversalExportWorker(QThread):
     def run(self):
         try:
             # Flags para ocultar ventana cmd en Windows pero mantener pipes
-            cf = 0x08000000 if os.name == 'nt' else 0
+            kwargs = {}
+            if os.name == 'nt':
+                kwargs['creationflags'] = 0x08000000
             
             # Unimos stderr y stdout para capturar errores de FFmpeg
             self.process = subprocess.Popen(
@@ -1233,10 +1310,10 @@ class UniversalExportWorker(QThread):
                 stdout=subprocess.PIPE, 
                 stderr=subprocess.STDOUT, 
                 text=True, 
-                creationflags=cf, 
                 bufsize=1,
                 encoding='utf-8', 
-                errors='replace'
+                errors='replace',
+                **kwargs
             )
             
             process = self.process # Alias local

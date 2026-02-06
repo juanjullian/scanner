@@ -1,0 +1,203 @@
+End-User License Agreement for LUCID VISION(TM) SDK
+
+IMPORTANT, PLEASE READ CAREFULLY
+
+
+THIS IS A CONTRACT.  BY INSTALLING THIS SDK YOU ACCEPT ALL THE TERMS AND 
+CONDITIONS OF THIS AGREEMENT.
+
+
+This End-User License Agreement ("EULA") is a legal agreement between you 
+and Lucid Vision Labs, Inc. (�Lucid�), which governs your use of its SDK 
+Development Kit ("SDK") that will be installed on your system.  The term 
+"SDK" shall also include any upgrades, modified versions or updates of the 
+SDK licensed to you by Lucid.  By selecting "Agree", you agree to be 
+legally bound by the terms of this EULA.  If you do not agree to the terms 
+of this EULA, Lucid is unwilling to license the SDK to you.  In such case, 
+you may not use the SDK.
+
+Terms and Conditions
+
+1.	Ownership and Intellectual Property
+    The SDK, the materials associated therewith and any copies thereof are 
+    the intellectual property of and are owned by Lucid and are protected by 
+    law, including without limitation the copyright laws of Canada, the United 
+    States and other countries, and by international treaty provisions.  
+    Except as expressly stated herein, this Agreement does not grant you any 
+    intellectual property rights in the SDK, the materials associated 
+    therewith and any copies thereof and all rights not expressly granted are 
+    reserved by Lucid.  The structure, organization and source code of the SDK 
+    are the valuable trade secrets and confidential information of Lucid and 
+    may not be disclosed to others without the express written authorization 
+    of Lucid.  You may be held legally responsible for any intellectual 
+    property right infringement that is caused or encouraged by your failure 
+    to abide by the terms of this Agreement.  Nothing in this Agreement 
+    requires Lucid to provide you with the source code to the SDK.
+
+2.	Grant of License
+    Lucid grants you the following rights provided that you comply with all 
+    terms and conditions of this EULA.  Lucid hereby grants you a personal, 
+    nonexclusive, nontransferable, nonassignable, nonsublicenseable license 
+    to install and use one (1) copy of the SDK for implementation on one 
+    (1) computer subject to the terms and conditions of this Agreement.  
+    You shall use the SDK exclusively to support the Lucid hardware, 
+    including the right to 
+        (i) use, modify, and incorporate all or portions of the source 
+        code, runtime library files, and/or documentation files that may 
+        be included in the unmodified SDK into your own programs to 
+        support the Lucid hardware exclusively, provided that no license is 
+        granted herein under any patents that may be infringed by your 
+        modifications, derivative works or by other works in which any 
+        portion of the SDK may be incorporated; 
+        (ii) distribute the source code in object code format only as 
+        substantially modified or only as part of your user programs to 
+        support the Lucid hardware exclusively; and 
+        (iii) distribute the runtime library files in their original 
+        form to support the Lucid hardware exclusively.  Any use of the 
+        SDK outside of the conditions set forth herein is strictly 
+        prohibited and will be deemed a breach of this Agreement 
+        resulting in immediate termination of your License.  Lucid will 
+        be entitled to all available remedies at law or in equity, 
+        including immediate injunctive relief and repossession of all SDK.
+
+3.	Restrictions
+    YOU MAY NOT
+    (a)	make any copies of the SDK and materials associated therewith 
+        except as expressly permitted in accordance with Sections 2.1 
+        and 2.2 of this EULA;
+    (b)	distribute copies of the SDK and materials associated therewith 
+        to others;
+    (c)	remove any intellectual property right notices;
+    (d)	rent, lease or sublicence the SDK to others;
+    (e)	modify, adapt, translate or create derivative works of the SDK; or
+    (f)	reverse engineer, disassemble, decompile or otherwise attempt to
+        discover the source of code of the SDK, unless such activity is 
+        expressly permitted by applicable law notwithstanding this 
+        limitation, it is essential to do so in order to achieve 
+        operability of the SDK with another software program, and you 
+        have first requested Lucid to provide the information necessary 
+        to achieve such operability and Lucid has not made such 
+        information available.  Lucid has the right to impose reasonable 
+        conditions and to request a reasonable fee before providing such 
+        information.  Any such information supplied by Lucid and any 
+        information obtained by you may only be used by you for the 
+        purpose described herein and may not be disclosed to any third 
+        party or used to create any software which is substantially 
+        similar to the expression of the SDK.
+    (g)	assign this Agreement or any of your rights or obligations 
+        hereunder (by operation of law or otherwise) without the prior 
+        written consent of Lucid.  Lucid may assign this Agreement and its 
+        rights and obligations without your consent. Subject to the 
+        foregoing, this Agreement shall be binding upon and inure to the 
+        benefit of the parties to it and their respective legal 
+        representatives, successors and permitted assigns.
+
+4.	Transfer
+    As the Licensee, you may physically transfer the SDK from one computer 
+    to another provided the SDK is used on only one (1) computer at a time
+    and the computer is owned by you.  The SDK may not be shared, 
+    installed or used concurrently on different computers.
+
+5.	Warranty
+    The SDK is being delivered to you AS IS and LUCID makes no warranty as 
+    to its use or performance.  LUCID AND ITS DISTRIBUTORS DO NOT AND 
+    CANNOT WARRANT THE PERFORMANCE OR RESULTS YOU MAY OBTAIN BY USING THE 
+    SDK OR DOCUMENTATION.  LUCID AND ITS DISTRIBUTORS MAKE NO WARRANTIES, 
+    EXPRESS OR IMPLIED, AS TO NON-INFRINGEMENT OF THIRD PARTY RIGHTS, 
+    MERCHANTABILITY, OR FITNESS FOR ANY PARTICULAR PURPOSE.
+
+6.	Limitation of Liability
+    IN NO EVENT WILL LUCID OR ITS DISTRIBUTORS BE LIABLE TO YOU FOR ANY 
+    DAMAGES, CLAIMS OR COSTS WHATSOEVER OR ANY CONSEQUENTIAL, INDIRECT, 
+    INCIDENTAL DAMAGES, OR ANY LOST PROFITS OR LOST SAVINGS, WHETHER BASED 
+    ON BREACH OF CONTACT, NEGLIGENCE, PRODUCT LIABILITY OR OTHERWISE, EVEN 
+    IF A LUCID REPRESENTATIVE HAS BEEN ADVISED OF THE POSSIBILITY OF SUCH 
+    LOSS, DAMAGES, CLAIMS OR COSTS OR FOR ANY CLAIM BY ANY THIRD PARTY.  
+    LUCID� AGGREGATE LIABILITY AND THAT OF ITS DISTRIBUTORS UNDER OR IN 
+    CONNECTION WITH THIS AGREEMENT SHALL BE LIMITED TO THE AMOUNT PAID FOR 
+    THE SDK, IF ANY.  THE FOREGOING LIMITATIONS AND EXCLUSIONS APPLY TO 
+    THE MAXIMUM EXTENT PERMITTED BY APPLICABLE LAW IN YOUR JURISDICTION.
+
+7.	Term
+    This Agreement will become effective upon your acceptance and continues 
+    until you cease to use the SDK.  However, Lucid may terminate this 
+    Agreement without notice if you breach any of its provisions.
+
+8.	Third-Party Applications (consider)
+    Certain third party applications may be included with, or downloaded 
+    with this SDK.  Lucid makes no representations whatsoever about any of 
+    these applications. Since Lucid has no control over such applications, 
+    you acknowledge and agree that Lucid is not responsible for such 
+    applications. You expressly acknowledge and agree that use of third 
+    party applications is at your sole risk and that the entire risk of 
+    unsatisfactory quality, performance, accuracy and effort is with you. 
+    You agree that Lucid shall not be responsible or liable, directly or 
+    indirectly, for any damage or loss, including but not limited to any 
+    damage to or loss of data, caused or alleged to be caused by, or in 
+    connection with, use of or reliance on any such third party content, 
+    products, or services available on or through any such application. 
+    You acknowledge and agree that the use of any third-party application 
+    is governed by such third party application provider's Terms of Use, 
+    License Agreement, Privacy Policy, or other such agreement and that 
+    any information or personal data you provide, whether knowingly or 
+    unknowingly, to such third-party application provider, will be subject 
+    to such third party application provider's privacy policy, if such a 
+    policy exists. LUCID DISCLAIMS ANY RESPONSIBILITY FOR ANY DISCLOSURE 
+    OF INFORMATION OR ANY OTHER PRACTICES OF ANY THIRD PARTY APPLICATION 
+    PROVIDER. LUCID EXPRESSLY DISCLAIMS ANY WARRANTY REGARDING WHETHER 
+    YOUR PERSONAL INFORMATION IS CAPTURED BY ANY THIRD PARTY APPLICATION 
+    PROVIDER OR THE USE TO WHICH SUCH PERSONAL INFORMATION MAY BE PUT BY 
+    SUCH THIRD PARTY APPLICATION PROVIDER.
+
+9.	 Injunctive Relief
+    You acknowledge that, in the event you breach any provision of this 
+    Agreement, Lucid will not have an adequate remedy in money or damages.  
+    Lucid shall therefore be entitled to obtain an injunction against such 
+    breach from any court of competent jurisdiction immediately upon 
+    request without posting bond. Lucid�s right to obtain injunctive 
+    relief shall not limit its right to seek further remedies.
+
+10.	Modification
+    No modification of this Agreement shall be binding unless it is in 
+    writing and is signed by an authorized representative of the party 
+    against whom enforcement of the modification is sought.
+
+11.	U.S. Government End Users Restricted Rights
+    This provision only applies to U.S. Government end users.  The SDK is 
+    a �commercial item� as that term is defined at 48 C.F.R. Part 2.101, 
+    consisting of �commercial computer software� and �computer software 
+    documentation� as such terms are defined in 48 C.F.R. 
+    Part 252.227-7014(a)(1) and 48 C.F.R. Part 252.227-7014(a)(5), and 
+    used in 48 C.F.R. Part 12.212 and 48 C.F.R. Part 227.7202, as 
+    applicable.  Consistent with 48 C.F.R. Part 12.212, 48 C.F.R. Part 
+    252.227-7015, 48 C.F.R. Part 227.7202-1 through 227.7202-4, 48 C.F.R. 
+    Part 52.227-19, and other relevant sections of the Code of Federal 
+    Regulations, as applicable, the SDK is distributed and licensed to U.S. 
+    Government end users (a) only as a commercial item, and (b) with only 
+    those rights as are granted to all other end users pursuant to the 
+    terms and conditions contained herein.
+
+12.	Governing Law and General Provisions
+    This Agreement will be governed by and construed in accordance with 
+    the substantive laws in force in the Province of British Columbia, 
+    Canada and you irrevocably attorn to the exclusive jurisdiction of 
+    the courts of the Province of British Columbia, Canada in the event of 
+    any proceeding or dispute under this Agreement.  This Agreement will 
+    not be governed by the conflict of law rules of any jurisdiction or the
+    United Nations Convention on Contracts for the International Sale of 
+    Goods, the application of which is expressly excluded.  If any part of 
+    this Agreement is found void and unenforceable, it will not affect the 
+    validity of the balance of the Agreement, which shall remain valid and 
+    enforceable according to its terms. You may not export or re-export the
+    SDK or any copy or adaptation thereof in violation of any applicable 
+    laws or regulations. The provisions of Sections 1, 3, 5 and 6 shall 
+    survive the termination of this Agreement, howsoever caused, but this 
+    shall not imply or create any continued right to use the SDK after 
+    termination of this Agreement.  This License constitutes the entire 
+    agreement between the parties with respect to the SDK and supersedes 
+    all prior or contemporaneous understandings regarding such subject 
+    matter.  No amendment to or modification of this License will be 
+    binding unless in writing and signed by an authorized officer of Lucid.
+    Any translation of this License is done for local requirements and in 
+    the event of a dispute between the English and any non-English 
+    versions, the English version of this License shall govern.
