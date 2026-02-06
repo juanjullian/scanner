@@ -5,9 +5,42 @@ import numpy as np
 import json
 import shutil
 from PyQt6.QtCore import pyqtSignal, QThread
-from arena_api.system import system
-from arena_api.buffer import BufferFactory
-from arena_api.enums import PixelFormat
+try:
+    from arena_api.system import system
+    from arena_api.buffer import BufferFactory
+    from arena_api.enums import PixelFormat
+    ARENA_AVAILABLE = True
+except Exception as e:
+    # Fallback a Aravis (macOS / Open Source)
+    print(f"Arena SDK no encontrado ({e}). Intentando Aravis...")
+    try:
+        import aravis_adapter
+        if aravis_adapter.ARAVIS_AVAILABLE:
+            system = aravis_adapter.system
+            BufferFactory = aravis_adapter.BufferFactory
+            PixelFormat = aravis_adapter.PixelFormat
+            ARENA_AVAILABLE = True # Engañamos al sistema diciendo que "Arena" (el wrapper) está listo
+            print("ÉXITO: Backend Aravis cargado correctamente.")
+        else:
+            raise ImportError("Librería Aravis no detectada en el sistema.")
+    except Exception as e2:
+        print(f"WARN: Backend Aravis no disponible: {e2}")
+        ARENA_AVAILABLE = False
+        
+        # Mock classes para permitir carga de la App en modo "Solo Visor"
+        class MockSystem:
+            def create_device(self): return []
+            def destroy_device(self, d): pass
+        class MockFactory:
+            def convert(self, b, f): raise Exception("No Arena")
+            def destroy(self, b): pass
+            def copy(self, b): return b
+        class MockEnums:
+            BGR8 = 1; Mono8 = 2; RGB8 = 3
+            
+        system = MockSystem()
+        BufferFactory = MockFactory()
+        PixelFormat = MockEnums()
 from pathlib import Path
 
 # Intentamos importar psutil para medir ancho de banda real del SO
@@ -147,6 +180,8 @@ class CameraWorker(QThread):
         print("Contadores de Drop reseteados.")
 
     def setup_camera(self):
+        if not ARENA_AVAILABLE:
+            raise RuntimeError("Arena SDK (Cámara) no disponible en este sistema.")
         print("Buscando dispositivos...")
         tries = 0
         while tries < 3:
@@ -188,15 +223,17 @@ class CameraWorker(QThread):
             try:
                 # Esto es CRÍTICO. Aumentamos el buffer del driver para evitar drops si el PC hipa.
                 # Valor por defecto suele ser bajo (10). Lo subimos a 200.
-                tl_stream['StreamDefaultBufferCount'].value = 200
+                if tl_stream:
+                    tl_stream['StreamDefaultBufferCount'].value = 200
                 # A veces se llama StreamInputBufferCount o similar dependiendo version
             except: pass
 
             # Optimización Latencia: NewestOnly descarta frames viejos si la UI se traba
             # ¡OJO! Para evitar drops en grabación, necesitamos buffer grande.
-            tl_stream['StreamBufferHandlingMode'].value = "NewestOnly"
-            tl_stream['StreamAutoNegotiatePacketSize'].value = True
-            tl_stream['StreamPacketResendEnable'].value = True
+            if tl_stream:
+                tl_stream['StreamBufferHandlingMode'].value = "NewestOnly"
+                tl_stream['StreamAutoNegotiatePacketSize'].value = True
+                tl_stream['StreamPacketResendEnable'].value = True
             
             # Trigger Overlap: Dejar que el archivo txt lo controle o poner ReadOut
             # nodemap.get_node('TriggerOverlap').value = 'ReadOut' 
