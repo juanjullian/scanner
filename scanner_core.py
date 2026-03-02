@@ -66,6 +66,15 @@ class PreviewWorker(QThread):
         super().__init__()
         self.in_queue = in_queue
         self.running = True
+        self.bw_mode = False
+        self.skip_frames = True
+        self.preview_skip_counter = 0
+
+    def set_bw_mode(self, enabled):
+        self.bw_mode = enabled
+    
+    def set_skip_frames(self, enabled):
+        self.skip_frames = enabled
 
     def run(self):
         while self.running:
@@ -77,39 +86,47 @@ class PreviewWorker(QThread):
                 continue
 
             try:
-                # --- CONVERSIÓN (Arena SDK) ---
-                # Esto es lo que consumía CPU en el hilo crítico
+                # --- CONTROL DE FPS (SKIPPING) ---
+                # Solo si skip_frames está activo, aplicamos skipping.
+                # Si no, procesamos todos.
+                if self.skip_frames:
+                    self.preview_skip_counter += 1
+                    # Skip 1/2 frames (simple example, logic taken from CameraWorker previously)
+                    if self.preview_skip_counter % 2 != 0:
+                         continue
                 
-                # Intentamos convertir a BGR8
-                # Nota: Podríamos implementar lógica de "Quality vs Speed" aquí también si la cola crece.
+                # --- CONVERSIÓN (Arena SDK) ---
+                
+                # Intentamos convertir
                 try:
-                    image_converted = BufferFactory.convert(buffer, PixelFormat.BGR8)
+                    target_fmt = PixelFormat.Mono8 if self.bw_mode else PixelFormat.BGR8
+                    
+                    image_converted = BufferFactory.convert(buffer, target_fmt)
                     h, w = image_converted.height, image_converted.width
                     
-                    # Subsampling 2x siempre para rendimiento GUI (1420x1100)
-                    # Es un buen compromiso fijo.
-                    full_arr = np.ctypeslib.as_array(image_converted.pdata, shape=(h, w, 3))
-                    image_final = full_arr[::2, ::2, :].copy()
+                    if target_fmt == PixelFormat.BGR8:
+                        # Subsampling 2x para Color 
+                        full_arr = np.ctypeslib.as_array(image_converted.pdata, shape=(h, w, 3))
+                        image_final = full_arr[::2, ::2, :].copy()
+                    else:
+                        # Mono8: Puede ser full res o subsampled.
+                        # Para "FPS Reales" mejor subsamplear un poco si es 24MP, pero B&W es liviano.
+                        # Mantengamos subsample 2x para consistencia de zoom con color.
+                        full_arr = np.ctypeslib.as_array(image_converted.pdata, shape=(h, w))
+                        image_final = full_arr[::2, ::2].copy()
                     
                     BufferFactory.destroy(image_converted)
                     
                     self.image_ready.emit(image_final)
 
                 except Exception as e:
-                    # Fallback Mono8
-                    try:
-                        image_converted = BufferFactory.convert(buffer, PixelFormat.Mono8)
-                        h, w = image_converted.height, image_converted.width
-                        full_arr = np.ctypeslib.as_array(image_converted.pdata, shape=(h, w))
-                        image_final = full_arr[::2, ::2].copy()
-                        BufferFactory.destroy(image_converted)
-                        self.image_ready.emit(image_final)
-                    except: pass
+                    # Fallback
+                    print(f"Error conversión: {e}")
             
             except Exception as e:
                 print(f"Error PreviewWorker: {e}")
             finally:
-                # IMPORTANTE: Destruir la copia del buffer que nos pasaron
+                # IMPORTANTE: Destruir la copia del buffer
                 if buffer:
                     BufferFactory.destroy(buffer)
                 self.in_queue.task_done()
@@ -121,8 +138,8 @@ class PreviewWorker(QThread):
 
 class CameraWorker(QThread):
     image_received = pyqtSignal(np.ndarray)
-    # fps, temp, qsize, dropped_frames, bandwidth_mbps, bw_source
-    stats_updated = pyqtSignal(float, float, int, int, float, str) 
+    # fps, temp, qsize, cam_dropped, disk_dropped, TOTAL_FRAMES, bandwidth_mbps, bw_source
+    stats_updated = pyqtSignal(float, float, int, int, int, int, float, str) 
     error_occurred = pyqtSignal(str)
 
     def __init__(self, settings_file="strobe2.txt"):
@@ -152,9 +169,8 @@ class CameraWorker(QThread):
         self.start_time = 0
         self.last_stats_time = 0
         self.last_frame_id = -1
-        self.dropped_frames = 0
-        self.last_frame_id = -1
-        self.dropped_frames = 0
+        self.dropped_frames = 0 # Driver drops
+        self.disk_dropped_frames = 0 # App/Disk drops
         self.last_stream_bytes = 0
         self.last_os_bytes = 0 # Para medición psutil
         
@@ -164,6 +180,12 @@ class CameraWorker(QThread):
         # Reenviamos la señal del worker interno hacia fuera para que main_app no se entere del cambio
         self.preview_worker.image_ready.connect(self.image_received.emit)
         self.preview_worker.start()
+
+    def set_preview_bw(self, enabled):
+        self.preview_worker.set_bw_mode(enabled)
+    
+    def set_preview_skip_frames(self, enabled):
+        self.preview_worker.set_skip_frames(enabled)
 
     def set_queue(self, q):
         self.write_queue = q
@@ -176,6 +198,7 @@ class CameraWorker(QThread):
 
     def reset_drop_count(self):
         self.dropped_frames = 0
+        self.disk_dropped_frames = 0
         self.last_frame_id = -1 # Reiniciamos tracking de ID para evitar falsos positivos al reconectar
         print("Contadores de Drop reseteados.")
 
@@ -430,7 +453,8 @@ class CameraWorker(QThread):
                         self.last_stats_time = now
                         
                         q_size = self.write_queue.qsize() if self.write_queue else 0
-                        self.stats_updated.emit(fps, current_temp, q_size, self.dropped_frames, mbps, bw_src)
+                        # Emitimos stats completos: FPS, TEMP, Q, DropCAM, DropDISK, TOTAL_CAM, BW, SRC
+                        self.stats_updated.emit(fps, current_temp, q_size, self.dropped_frames, self.disk_dropped_frames, self.frame_count, mbps, bw_src)
                     except: pass
                     last_temp_check = now
 
@@ -492,57 +516,30 @@ class CameraWorker(QThread):
                 is_recording = False
                 if self.write_queue:
                     is_recording = True
-                    try: self.write_queue.put_nowait(raw_bytes)
-                    except queue.Full: pass
+                    try: 
+                        self.write_queue.put_nowait(raw_bytes)
+                    except queue.Full: 
+                        self.disk_dropped_frames += 1
+                        # Opcional: print debug para saber cuando pasa
+                        # print("WARN: Disk Drop (Cola llena)")
                 
                 # B. Previsualización (PRIORIDAD 2 - Best Effort)
-                # Si estamos grabando, saltamos 1 de cada 2 cuadros de la vista previa
-                # para liberar CPU/RAM y asegurar que la grabación no pierda frames.
-                if is_recording:
-                    self.preview_skip_counter += 1
-                    if self.preview_skip_counter % 2 != 0:
-                        BufferFactory.destroy(image_raw)
-                        continue # Saltamos preview de este frame
+                # La lógica de skipping ahora reside en PreviewWorker
+                # para soportar el toggle de "Real FPS".
                 
-                image_for_gui = None
+                # Simplemente enviamos a la cola, si cabe.
                 try:
-                    # SIEMPRE intentamos convertir a BGR8 para la vista previa.
-                    # El SDK de Arena es muy rápido haciendo esto.
-                    # Si la imagen viene en Bayer, el SDK la debayeriza automáticamente.
-                    # Si viene en RGB, simplemente la copia o reordena.
-                    
-                    # Usamos BGR8 porque es el estándar de Windows/OpenCV y suele ser más compatible
-                    image_converted = BufferFactory.convert(image_raw, PixelFormat.BGR8)
-                    
-                    h, w = image_converted.height, image_converted.width
-                    
-                    # Extraemos el array numpy (H, W, 3)
-                    # OPTIMIZACIÓN VITAL: Subsampling inmediato [::2]
-                    # Reducimos de 2840x2200 a ~1420x1100 (50% resolución).
-                    # Equilibrio entre fluidez y detalle para Foco (Peaking).
-                    full_arr = np.ctypeslib.as_array(image_converted.pdata, shape=(h, w, 3))
-                    image_for_gui = full_arr[::1, ::1, :].copy()
-                    
-                    BufferFactory.destroy(image_converted)
-
-                except Exception as e:
-                    # Fallback de seguridad: Si falla la conversión de color, intentamos Mono8
-                    try:
-                        print(f"Warn Preview Color: {e} - Intentando Mono8")
-                        image_converted = BufferFactory.convert(image_raw, PixelFormat.Mono8)
-                        h, w = image_converted.height, image_converted.width
-                        image_for_gui = np.ctypeslib.as_array(image_converted.pdata, shape=(h, w)).copy()
-                        BufferFactory.destroy(image_converted)
-                    except: pass
-                finally:
+                    self.preview_queue.put_nowait(image_raw)
+                except queue.Full:
+                    # Si la cola de preview está llena, descartamos (siempre es "Best Effort")
                     BufferFactory.destroy(image_raw)
+                    continue
 
-               
-               
-                if image_for_gui is not None:
-                    self.image_received.emit(image_for_gui)
-                    self.frame_count += 1
-                    self.instant_frame_count += 1
+                # La conversión y emisión ocurren en PreviewWorker
+                continue # Ya no hacemos nada más aquí
+
+                
+
                     
                     # (Ya no emitimos stats aquí abajo para no duplicar, 
                     #  se emiten arriba de forma constante)

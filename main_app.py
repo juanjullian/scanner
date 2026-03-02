@@ -134,31 +134,128 @@ class IntroSplash(QWidget):
             self.main_window.showMaximized()
 
 # --- VISOR PERSONALIZADO (ZOOM + PANEO + PAINT EVENT) ---
+# --- VISOR PERSONALIZADO (ZOOM + PANEO + PAINT EVENT) ---
+class ViewMode:
+    NORMAL = 0
+    ZOOM_1_1 = 1
+    CORNERS = 2
+
 class ScanViewer(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setMouseTracking(False)
         self._pixmap = None
-        self.max_w = 0; self.max_h = 0
-        self.off_x = 0; self.off_y = 0
+        self.mode = ViewMode.NORMAL
+        
+        # Offsets para Zoom 1:1 (Coordenada Top-Left del crop)
+        self.off_x = 0
+        self.off_y = 0
+        
+        # Variables de arrastre
+        self.dragging = False
+        self.last_pos = None
 
     def setPixmap(self, pix):
         self._pixmap = pix
-        self.update() # Trigger paintEvent
+        self.update() # Repintar
+
+    def mousePressEvent(self, event):
+        if self.mode == ViewMode.ZOOM_1_1 and event.button() == Qt.MouseButton.LeftButton:
+            self.dragging = True
+            self.last_pos = event.pos()
+            self.setCursor(Qt.CursorShape.ClosedHandCursor)
+
+    def mouseMoveEvent(self, event):
+        if self.dragging and self.last_pos:
+            delta = event.pos() - self.last_pos
+            self.last_pos = event.pos()
+            
+            # Arrastrar la imagen: Mover el offset en dirección opuesta al mouse
+            self.off_x -= delta.x()
+            self.off_y -= delta.y()
+            
+            self.update()
+
+    def mouseReleaseEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.dragging = False
+            self.setCursor(Qt.CursorShape.OpenHandCursor)
+            self.last_pos = None
 
     def paintEvent(self, event):
         painter = QPainter(self)
         painter.fillRect(self.rect(), Qt.GlobalColor.black)
 
-        if self._pixmap and not self._pixmap.isNull():
-            # Escalar manteniendo relación de aspecto dentro del widget
-            scaled_pix = self._pixmap.scaled(self.size(), Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.FastTransformation)
+        if not self._pixmap or self._pixmap.isNull():
+            return
+
+        w_widget = self.width()
+        h_widget = self.height()
+        w_img = self._pixmap.width()
+        h_img = self._pixmap.height()
+
+        if self.mode == ViewMode.NORMAL:
+            # Escalar manteniendo relación de aspecto (Fit)
+            scaled = self._pixmap.scaled(self.size(), Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.FastTransformation)
+            x = (w_widget - scaled.width()) // 2
+            y = (h_widget - scaled.height()) // 2
+            painter.drawPixmap(x, y, scaled)
+
+        elif self.mode == ViewMode.ZOOM_1_1:
+            # Clampear offsets para no salirnos de la imagen
+            # El "viewport" es del tamaño del widget (o menor si la imagen es chica)
             
-            # Centrar
-            x = (self.width() - scaled_pix.width()) // 2
-            y = (self.height() - scaled_pix.height()) // 2
+            max_off_x = max(0, w_img - w_widget)
+            max_off_y = max(0, h_img - h_widget)
             
-            painter.drawPixmap(x, y, scaled_pix)
+            self.off_x = max(0, min(self.off_x, max_off_x))
+            self.off_y = max(0, min(self.off_y, max_off_y))
+            
+            # Área a mostrar
+            # Si el wiget es más grande que la imagen, mostramos toda la imagen centrada
+            if w_widget >= w_img:
+                draw_x = (w_widget - w_img) // 2
+                src_rect = QRect(0, 0, w_img, min(h_img, h_widget)) # no crop en X
+                painter.drawPixmap(draw_x, 0, self._pixmap) # Simplificado
+                # (Mejor lógica genérica debajo)
+            
+            # Rectángulo fuente
+            src_x = int(self.off_x)
+            src_y = int(self.off_y)
+            src_w = min(w_widget, w_img)
+            src_h = min(h_widget, h_img)
+            
+            # Rectángulo destino (Centrado si sobra espacio)
+            dst_x = max(0, (w_widget - w_img) // 2)
+            dst_y = max(0, (h_widget - h_img) // 2)
+            
+            painter.drawPixmap(dst_x, dst_y, self._pixmap, src_x, src_y, src_w, src_h)
+            
+            # Indicador de posición (Mini-mapa opcional, o bordes)
+            
+        elif self.mode == ViewMode.CORNERS:
+            # Dividir pantalla en 4 cuadrantes
+            qw = w_widget // 2
+            qh = h_widget // 2
+            
+            # Definir Crops (asumiendo 1:1 pixel a pixel)
+            # Top-Left (TL)
+            painter.drawPixmap(0, 0, self._pixmap, 0, 0, qw, qh)
+            
+            # Top-Right (TR) -> Esquina superior derecha de la IMAGEN
+            painter.drawPixmap(qw, 0, self._pixmap, w_img - qw, 0, qw, qh)
+            
+            # Bottom-Left (BL)
+            painter.drawPixmap(0, qh, self._pixmap, 0, h_img - qh, qw, qh)
+            
+            # Bottom-Right (BR)
+            painter.drawPixmap(qw, qh, self._pixmap, w_img - qw, h_img - qh, qw, qh)
+            
+            # Dibujar líneas divisorias
+            painter.setPen(QColor(0, 255, 255, 128)) # Cian semi-transparente
+            painter.drawLine(qw, 0, qw, h_widget)
+            painter.drawLine(0, qh, w_widget, qh)
+
 
 # --- DIÁLOGO DE EXPORTACIÓN CON THUMBNAILS ---
 class BatchExportDialog(QDialog):
@@ -336,9 +433,9 @@ class MainWindow(QMainWindow):
         self.manager = scanner_core.CollectionManager(self.root_folder)
         self.active_collection = None
         self.is_recording = False
-        # OPTIMIZACIÓN RAM: Bajamos buffer de 500 (~4.5GB) a 180 (~1.6GB)
-        # Esto es suficiente para absorber hipo del disco duro sin colapsar la RAM.
-        self.frame_queue = queue.Queue(maxsize=180)
+        # OPTIMIZACIÓN RAM: Aumentamos buffer a 600 frames (~5.4GB)
+        # Esto permite absorber latencia de escritura en disco.
+        self.frame_queue = queue.Queue(maxsize=600)
         self.camera_worker = None
         self.writer_worker = None
         
@@ -508,18 +605,44 @@ class MainWindow(QMainWindow):
         cb_layout.addWidget(self.combo_type)
         
         # B. Foco
+        # B. Foco y Zoom
         self.btn_peaking = QPushButton("Peak")
         self.btn_peaking.setCheckable(True)
         self.btn_peaking.clicked.connect(self.toggle_peaking)
-        self.btn_peaking.setFixedWidth(50)
+        self.btn_peaking.setFixedWidth(40)
         
         self.btn_zoom_1to1 = QPushButton("1:1")
         self.btn_zoom_1to1.setCheckable(True)
-        self.btn_zoom_1to1.clicked.connect(self.toggle_zoom) # FIX: usaba toggle_zoom_state antes, unificar
+        self.btn_zoom_1to1.clicked.connect(self.toggle_zoom_1to1)
         self.btn_zoom_1to1.setFixedWidth(40)
         
+        self.btn_corners = QPushButton("⛶") # Icono de esquinas/cuadrado
+        self.btn_corners.setToolTip("Visor de Esquinas")
+        self.btn_corners.setCheckable(True)
+        self.btn_corners.clicked.connect(self.toggle_corners)
+        self.btn_corners.setFixedWidth(30)
+        
+        # Grupo de Modo de Vista (Exclusivo)
+        # Gestionaremos la exclusividad manualmente en los slots
+        
+        # B&W Preview y FPS Reales (Nuevos controles)
+        self.btn_bw_prev = QPushButton("B/W")
+        self.btn_bw_prev.setCheckable(True)
+        self.btn_bw_prev.setToolTip("Previsualización en B/W (Más rápido)")
+        self.btn_bw_prev.clicked.connect(self.toggle_bw_preview)
+        self.btn_bw_prev.setFixedWidth(40)
+        
+        self.btn_real_fps = QPushButton("Real")
+        self.btn_real_fps.setCheckable(True)
+        self.btn_real_fps.setToolTip("Forzar FPS Reales (No saltar cuadros)")
+        self.btn_real_fps.clicked.connect(self.toggle_real_fps)
+        self.btn_real_fps.setFixedWidth(40)
+
         cb_layout.addWidget(self.btn_peaking)
         cb_layout.addWidget(self.btn_zoom_1to1)
+        cb_layout.addWidget(self.btn_corners)
+        cb_layout.addWidget(self.btn_bw_prev)
+        cb_layout.addWidget(self.btn_real_fps)
         
         # C. Exposición
         exp_layout = QHBoxLayout()
@@ -881,13 +1004,55 @@ class MainWindow(QMainWindow):
     # --- CÁMARA Y GRABACIÓN ---
     def init_camera_thread(self):
         self.camera_worker = scanner_core.CameraWorker("1.0.txt")
-        self.camera_worker.set_queue(self.frame_queue)
+        # NO asignamos la cola todavía. Se asigna solo al grabar.
+        # self.camera_worker.set_queue(self.frame_queue) 
         self.camera_worker.image_received.connect(self.update_display) # FIX: nombre correcto
         self.camera_worker.stats_updated.connect(self.update_stats)
         self.camera_worker.error_occurred.connect(self.on_camera_error)
         self.camera_worker.start()
 
     def update_display(self, frame):
+        if self.tabs.currentIndex() != 0: return
+
+        # 1. DETECCIÓN Y CORRECCIÓN DE COLOR
+        is_color = (frame.ndim == 3)
+        
+        if is_color:
+            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            disp = frame_rgb
+        else:
+            disp = frame
+
+        h, w = disp.shape[:2]
+        
+        # PEAKING (Focus Assist)
+        if self.btn_peaking.isChecked():
+            if is_color: gray_peak = cv2.cvtColor(disp, cv2.COLOR_RGB2GRAY)
+            else: gray_peak = disp
+            
+            lap = cv2.Laplacian(gray_peak, cv2.CV_16S, ksize=3)
+            _, mask = cv2.threshold(cv2.convertScaleAbs(lap), 40, 255, cv2.THRESH_BINARY)
+            
+            m = (mask > 0)
+            if is_color:
+                if not disp.flags['WRITEABLE']: disp = disp.copy()
+                disp[m] = [0, 255, 0] 
+            else:
+                if not disp.flags['WRITEABLE']: disp = disp.copy()
+                disp[m] = 255 
+
+        # CREAR QIMAGE
+        if is_color:
+            qimg = QImage(disp.data, w, h, w*3, QImage.Format.Format_RGB888)
+        else:
+            if disp.dtype == np.uint16: disp = (disp >> 4).astype(np.uint8)
+            if not disp.flags['C_CONTIGUOUS']: disp = np.ascontiguousarray(disp)
+            qimg = QImage(disp.data, w, h, w, QImage.Format.Format_Grayscale8)
+
+        # ENVIAR AL VISOR
+        self.viewer_scan.setPixmap(QPixmap.fromImage(qimg))
+
+    def _old_update_display_renamed(self, frame):
         if self.tabs.currentIndex() != 0: return
 
         # 1. DETECCIÓN Y CORRECCIÓN DE COLOR
@@ -980,18 +1145,45 @@ class MainWindow(QMainWindow):
             self.viewer_scan.setPixmap(pix)
         else: 
             self.viewer_scan.setPixmap(pix.scaled(self.viewer_scan.size(), Qt.AspectRatioMode.KeepAspectRatio))
-    def update_stats(self, fps, temp, qsize, drops=0, bw=0.0, bw_src="C"):
+    def update_stats(self, fps, temp, qsize, cam_drops=0, disk_drops=0, total_cam=0, bw=0.0, bw_src="C"):
         # Filtro visual para FPS (que no salte tanto)
         self.lbl_fps.setText(f"FPS: {fps:.1f}")
         self.lbl_temp.setText(f"Tmp: {temp:.1f}°")
         self.lbl_buffer.setText(f"Buf: {qsize}")
-        self.lbl_dropped.setText(f"Drp: {drops}")
-        self.lbl_bw.setText(f"BW({bw_src}): {int(bw)} Mbps")
         
-        if drops > 0:
-             self.lbl_dropped.setStyleSheet("color: red; font-weight: bold; font-size: 10pt; margin-left: 10px;")
+        # --- CONTADORES ROBUSTOS ---
+        # 📷 Cam: Total recibido (R) | Perdido driver (D)
+        # 💾 Dsk: Total guardado (S) | Perdido cola llena (D) (Solo si graba)
+        
+        txt_cam = f"📷 R:{total_cam} D:{cam_drops}"
+        
+        if self.is_recording and self.writer_worker:
+            curr_saved = self.writer_worker.frames_saved
+            txt_dsk = f"💾 S:{curr_saved} D:{disk_drops}"
+            # Mostrar AMBOS
+            self.lbl_dropped.setText(f"{txt_cam}   {txt_dsk}")
+            
+            # Alerta drop disco
+            if cam_drops > 0 or disk_drops > 0:
+                 self.lbl_dropped.setStyleSheet("color: red; font-weight: bold; font-size: 10pt; margin-left: 10px;")
+            else:
+                 self.lbl_dropped.setStyleSheet("color: #4caf50; font-size: 10pt; margin-left: 10px;")
         else:
-             self.lbl_dropped.setStyleSheet("color: #4caf50; font-size: 10pt; margin-left: 10px;")
+            # SOLO CÁMARA (Preview)
+            # Ignoramos disk_drops espurios en preview (deberían ser 0, pero por si acaso)
+            self.lbl_dropped.setText(txt_cam)
+            
+            if cam_drops > 0:
+                 self.lbl_dropped.setStyleSheet("color: red; font-weight: bold; font-size: 10pt; margin-left: 10px;")
+            else:
+                 self.lbl_dropped.setStyleSheet("color: #0078d7; font-size: 10pt; margin-left: 10px;") # Azul para preview normal
+
+        self.lbl_bw.setText(f"BW({bw_src}): {int(bw)} Mbps")
+
+        # Limpieza de duplicados
+        if self.writer_worker:
+             self.lbl_saved.setText("")
+
         
         if self.writer_worker:
             self.lbl_saved.setText(f"Sav: {self.writer_worker.frames_saved}")
@@ -1000,9 +1192,47 @@ class MainWindow(QMainWindow):
 
     # on_format_changed eliminado
 
-    def toggle_zoom(self, c):
-         # Redirige a toggle_zoom_state para mantener compatibilidad
-         self.toggle_zoom_state(c)
+    # --- NUEVOS CONTROLADORES DE VISTA ---
+    
+    def toggle_zoom_1to1(self, checked):
+        # Mutual exclusion
+        if checked:
+            self.btn_corners.setChecked(False)
+            self.btn_corners.setStyleSheet("") # Clear style of other
+            self.viewer_scan.mode = ViewMode.ZOOM_1_1
+            self.viewer_scan.setCursor(Qt.CursorShape.OpenHandCursor)
+        else:
+            self.viewer_scan.mode = ViewMode.NORMAL
+            self.viewer_scan.setCursor(Qt.CursorShape.ArrowCursor)
+        
+        # Style self
+        self.btn_zoom_1to1.setStyleSheet("background:red" if checked else "")
+        self.viewer_scan.update()
+
+    def toggle_corners(self, checked):
+        # Mutual exclusion
+        if checked:
+            self.btn_zoom_1to1.setChecked(False)
+            self.btn_zoom_1to1.setStyleSheet("") # Clear style of other
+            self.viewer_scan.mode = ViewMode.CORNERS
+            self.viewer_scan.setCursor(Qt.CursorShape.ArrowCursor)
+        else:
+            self.viewer_scan.mode = ViewMode.NORMAL
+
+        # Style self
+        self.btn_corners.setStyleSheet("background:red" if checked else "")
+        self.viewer_scan.update()
+
+    def toggle_bw_preview(self, checked):
+        if self.camera_worker:
+            self.camera_worker.set_preview_bw(checked)
+        self.btn_bw_prev.setStyleSheet("background:red" if checked else "")
+    
+    def toggle_real_fps(self, checked):
+        if self.camera_worker:
+            #checked = TRUE -> Real FPS -> Skip Frames = FALSE
+            self.camera_worker.set_preview_skip_frames(not checked)
+        self.btn_real_fps.setStyleSheet("background:red" if checked else "")
 
     def on_exposure_change(self, v):
         # Forzar pasos de 10
@@ -1015,12 +1245,12 @@ class MainWindow(QMainWindow):
         self.lbl_exp_val.setText(str(val))
         if self.camera_worker: 
             self.camera_worker.update_exposure(val)
+
+    def toggle_peaking(self, c): 
+        self.btn_peaking.setStyleSheet("background:red" if c else "")
     
-    def toggle_peaking(self, c): self.btn_peaking.setStyleSheet("background:red" if c else "")
-    
-    def toggle_zoom_state(self, c):
-        self.viewer_scan.zoom_active = c
-        self.viewer_scan.setCursor(Qt.CursorShape.OpenHandCursor if c else Qt.CursorShape.ArrowCursor)
+    # toggle_zoom y toggle_zoom_state eliminados/reemplazados por toggle_zoom_1to1
+
 
     def toggle_recording(self):
         if not self.is_recording:
@@ -1035,7 +1265,7 @@ class MainWindow(QMainWindow):
                  self.camera_worker.clear_queue()
                  self.camera_worker.reset_drop_count() 
                  
-                 # Conectar la queue real solo ahora
+                 # Conectar la queue real SOLO AHORA (antes era None)
                  self.camera_worker.set_queue(self.frame_queue)
             
             # --- INICIAR GRABACIÓN ---

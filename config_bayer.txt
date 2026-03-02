@@ -227,6 +227,11 @@ TimerTriggerActivation	RisingEdge
 TimerSelector	Timer1
 TimerTriggerActivation	RisingEdge
 TimerSelector	Timer0
+TimerSelector	Timer0
+TimerDelay	200
+TimerSelector	Timer0
+TimerSelector	Timer0
+TimerDuration	50000
 LUTSelector	Luminance
 LUTSelector	Luminance
 LUTEnable	0
