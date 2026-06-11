@@ -1,6 +1,8 @@
 import sys
 import os
+import ctypes
 import queue
+import struct
 import shutil
 import numpy as np
 import subprocess
@@ -8,16 +10,38 @@ import cv2
 from datetime import datetime
 from pathlib import Path
 import json
-from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, 
+import qoi_utils
+import bayer_render
+from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
                              QPushButton, QLabel, QListWidget, QInputDialog, QMessageBox, 
                              QSplitter, QGroupBox, QProgressBar, QTabWidget, QSlider, QFileDialog,
                              QDoubleSpinBox, QSpinBox, QProgressDialog, QDialog, QCheckBox, 
-                             QComboBox, QMenu, QListWidgetItem)
+                             QComboBox, QMenu, QListWidgetItem, QLineEdit, QTextEdit, QScrollArea)
 from PyQt6.QtCore import Qt, QTimer, QSize, QThread, pyqtSignal, QRect, QEvent
-from PyQt6.QtGui import QImage, QPixmap, QAction, QPainter, QColor, QFont, QIcon
+from PyQt6.QtGui import QImage, QPixmap, QAction, QPainter, QColor, QFont, QIcon, QPen
 
 # Importamos el núcleo del scanner
 import scanner_core
+from export_grade import ExportConfirmDialog, default_settings_for_file
+
+
+def _windows_set_execution_state(display_required: bool, system_required: bool) -> None:
+    """SetThreadExecutionState: pantalla y/o suspensión por inactividad del sistema."""
+    if os.name != "nt":
+        return
+    ES_CONTINUOUS = 0x80000000
+    ES_DISPLAY_REQUIRED = 0x00000002
+    ES_SYSTEM_REQUIRED = 0x00000001
+    try:
+        flags = ES_CONTINUOUS
+        if display_required:
+            flags |= ES_DISPLAY_REQUIRED
+        if system_required:
+            flags |= ES_SYSTEM_REQUIRED
+        ctypes.windll.kernel32.SetThreadExecutionState(flags)
+    except Exception:
+        pass
+
 
 # --- PANTALLA DE CARGA (SPLASH SCREEN) ---
 class IntroSplash(QWidget):
@@ -93,45 +117,55 @@ class IntroSplash(QWidget):
 
     def initialize_app(self):
         self.lbl_status.setText("Cargando módulos...")
-        # Aquí creamos la ventana principal pero NO la mostramos todavía
-        # Esto dispara el init de MainWindow y la conexión a la cámara
         try:
-            self.main_window = MainWindow()
-            # Conectamos las señales del worker de la cámara para saber progreso real
-            if self.main_window.camera_worker:
-                 # Esperamos a que el worker diga que está "running" o haya pasado el setup
-                 pass
-            
-            self.timer.start(500) # Chequear estado cada 500ms
-            
+            self.main_window = MainWindow(defer_camera=True)
+            self._cam_found = scanner_core.probe_camera_available(max_wait_sec=0)
+            self.timer.start(500)
         except Exception as e:
             self.lbl_status.setText(f"Error fatal: {e}")
             self.lbl_status.setStyleSheet("color: red; border: none;")
 
     def check_initialization(self):
         self.steps += 1
-        
+
         if self.steps == 1:
             self.lbl_status.setText("Buscando cámara Lucid...")
-        elif self.steps == 2:
-            # Verificar si el worker de la cámara ya arrancó
-            if self.main_window and self.main_window.camera_worker.isRunning():
-                 self.lbl_status.setText("Cámara detectada. Aplicando configuración...")
+        elif self.steps <= 6:
+            if not self._cam_found:
+                self._cam_found = scanner_core.probe_camera_available(max_wait_sec=0)
+            if self._cam_found:
+                self.lbl_status.setText("Cámara detectada.")
+                self.progress.setRange(0, 100)
+                self.progress.setValue(100)
+                self.lbl_status.setStyleSheet("color: #4caf50; font-weight: bold; border: none;")
+                self.steps = 90
             else:
-                 self.lbl_status.setText("Esperando respuesta de la cámara...")
-                 self.steps -= 1 # Repetir paso hasta que conecte
-        elif self.steps == 3:
-             self.lbl_status.setText("Cámara conectada correctamente.")
-             self.progress.setRange(0, 100); self.progress.setValue(100)
-             self.lbl_status.setStyleSheet("color: #4caf50; font-weight: bold; border: none;")
-        elif self.steps == 7: # Esperamos unos ciclos (aprox 2 segs desde paso 3)
-             self.finish_loading()
+                dots = "." * ((self.steps % 3) + 1)
+                self.lbl_status.setText(f"Buscando cámara{dots}")
+        elif self.steps == 7:
+            if not self._cam_found:
+                self.lbl_status.setText("Cámara no detectada.")
+                self.lbl_status.setStyleSheet("color: #ff9800; font-weight: bold; border: none;")
+                self.progress.setRange(0, 100)
+                self.progress.setValue(100)
+                QMessageBox.warning(
+                    None,
+                    "Cámara no detectada",
+                    "No se encontró ninguna cámara Lucid conectada.\n\n"
+                    "La aplicación abrirá en modo visor (solo reproducción).\n"
+                    "Se reintentará la conexión automáticamente cada pocos segundos.",
+                )
+            else:
+                self.lbl_status.setText("Listo.")
+        elif self.steps >= 9:
+            self.finish_loading()
 
     def finish_loading(self):
         self.timer.stop()
         self.close()
         if self.main_window:
             self.main_window.showMaximized()
+            self.main_window.start_camera_thread()
 
 # --- VISOR PERSONALIZADO (ZOOM + PANEO + PAINT EVENT) ---
 # --- VISOR PERSONALIZADO (ZOOM + PANEO + PAINT EVENT) ---
@@ -155,9 +189,34 @@ class ScanViewer(QWidget):
         self.dragging = False
         self.last_pos = None
 
+        self._exp_text = ""
+        self._exp_color = "#888888"
+
     def setPixmap(self, pix):
         self._pixmap = pix
         self.update() # Repintar
+
+    def set_exposure_overlay(self, text, color="#888888"):
+        self._exp_text = text
+        self._exp_color = color
+        self.update()
+
+    def _paint_exposure_overlay(self, painter):
+        if not self._exp_text:
+            return
+        font = QFont("Consolas", 10)
+        font.setBold(True)
+        painter.setFont(font)
+        metrics = painter.fontMetrics()
+        pad_x, pad_y = 8, 6
+        tw = metrics.horizontalAdvance(self._exp_text)
+        th = metrics.height()
+        box_w = tw + pad_x * 2
+        box_h = th + pad_y * 2
+        box_x, box_y = 8, 8
+        painter.fillRect(box_x, box_y, box_w, box_h, QColor(0, 0, 0, 170))
+        painter.setPen(QColor(self._exp_color))
+        painter.drawText(box_x + pad_x, box_y + pad_y + metrics.ascent(), self._exp_text)
 
     def mousePressEvent(self, event):
         if self.mode == ViewMode.ZOOM_1_1 and event.button() == Qt.MouseButton.LeftButton:
@@ -187,6 +246,7 @@ class ScanViewer(QWidget):
         painter.fillRect(self.rect(), Qt.GlobalColor.black)
 
         if not self._pixmap or self._pixmap.isNull():
+            self._paint_exposure_overlay(painter)
             return
 
         w_widget = self.width()
@@ -256,17 +316,33 @@ class ScanViewer(QWidget):
             painter.drawLine(qw, 0, qw, h_widget)
             painter.drawLine(0, qh, w_widget, qh)
 
+        self._paint_exposure_overlay(painter)
+
 
 # --- DIÁLOGO DE EXPORTACIÓN CON THUMBNAILS ---
 class BatchExportDialog(QDialog):
-    def __init__(self, parent, file_list, root_folder, collection):
+    def __init__(self, parent, file_list, root_folder, collection, collection_meta=None):
         super().__init__(parent)
         self.setWindowTitle("Exportación por Lotes")
         self.resize(700, 600)
         self.root = root_folder
         self.coll = collection
+        self.collection_meta = collection_meta or {}
+        
+        # Detectar si la colección tiene archivos QOI/RGB (usar el primer archivo como referencia)
+        self.source_is_processed = False
+        if file_list and self.collection_meta:
+            first_info = self.collection_meta.get(file_list[0], {})
+            pf = first_info.get("pixel_format", "bayer")
+            self.source_is_processed = (pf in ("rgb", "qoi_rgb"))
         
         layout = QVBoxLayout(self)
+        
+        # Banner informativo si es QOI/RGB
+        if self.source_is_processed:
+            lbl_info = QLabel("Fuente: RGB procesado por ISP de cámara (ya tiene WB, Gamma, Sharpening)")
+            lbl_info.setStyleSheet("background: #1a237e; color: #90caf9; padding: 6px; border-radius: 4px; font-weight: bold;")
+            layout.addWidget(lbl_info)
         
         # 1. Lista Visual con Miniaturas
         layout.addWidget(QLabel("Archivos a procesar (Vista previa cuadro #100):"))
@@ -276,7 +352,6 @@ class BatchExportDialog(QDialog):
         for f_name in file_list:
             item = QListWidgetItem(f_name)
             item.setCheckState(Qt.CheckState.Checked)
-            # Generar miniatura
             icon = self.generate_thumbnail(f_name)
             if icon: item.setIcon(icon)
             self.list_widget.addItem(item)
@@ -292,32 +367,51 @@ class BatchExportDialog(QDialog):
         btn_box.addWidget(btn_all); btn_box.addWidget(btn_none)
         layout.addLayout(btn_box)
         
-        # 2. Configuración
+        # 2. Configuración (formato-aware)
         settings_group = QGroupBox("Configuración de Salida")
         sett_layout = QVBoxLayout()
         
         sett_layout.addWidget(QLabel("Formato de Salida:"))
         self.combo_fmt = QComboBox()
-        self.combo_fmt.addItems([
-            "DNG Raw Sequence (DaVinci Resolve - 16bit) [Recomendado]",
-            "ProRes 4444 (Premiere - 12bit - Alta Calidad)", 
-            "GoPro CineForm (Premiere - 12bit - Intermedio)", 
-            "ProRes 422 HQ (Premiere - 10bit - Estándar)",
-            "HEVC 10-bit 4:4:4 (MP4 - Eficiente)", 
-            "H.264 (MP4 - Proxy)"
-        ])
-        self.combo_fmt.setCurrentIndex(0) # Default DNG
+        
+        if self.source_is_processed:
+            # Fuente RGB/QOI: NO ofrecer DNG (no tiene sentido para datos ya debayerizados)
+            self.combo_fmt.addItems([
+                "TIFF 8-bit Sequence (Fiel al ISP - Sin procesamiento) [Recomendado]",
+                "ProRes 4444 (Alta Calidad - 12bit)",
+                "ProRes 422 HQ (Estándar - 10bit)",
+                "HEVC 10-bit 4:4:4 (MP4 - Eficiente)",
+                "H.264 (MP4 - Proxy)"
+            ])
+            self.combo_fmt.setCurrentIndex(0)
+        else:
+            # Fuente Bayer: Opciones completas con DNG
+            self.combo_fmt.addItems([
+                "DNG Raw Sequence (DaVinci Resolve - 16bit) [Recomendado]",
+                "ProRes 4444 (Premiere - 12bit - Alta Calidad)", 
+                "GoPro CineForm (Premiere - 12bit - Intermedio)", 
+                "ProRes 422 HQ (Premiere - 10bit - Estándar)",
+                "HEVC 10-bit 4:4:4 (MP4 - Eficiente)", 
+                "H.264 (MP4 - Proxy)"
+            ])
+            self.combo_fmt.setCurrentIndex(0)
         sett_layout.addWidget(self.combo_fmt)
         
-        sett_layout.addWidget(QLabel("Perfil de Revelado (Solo Video - No afecta DNG):"))
-        self.combo_sharp = QComboBox()
-        self.combo_sharp.addItems([
-            "DCB Puro",
-            "Suave (S:0.8 / A:1.5)",
-            "Medio (S:1.3 / A:1.5)",
-            "Grueso (S:2.0 / A:2.5) [Recomendado para Video]"
-        ])
-        self.combo_sharp.setCurrentIndex(3)
+        # Perfil de revelado (solo para Bayer, para RGB el ISP ya lo hizo)
+        if self.source_is_processed:
+            sett_layout.addWidget(QLabel("(Sin perfil de revelado - La cámara ya aplicó ISP)"))
+            self.combo_sharp = QComboBox()
+            self.combo_sharp.addItems(["N/A (ISP de cámara)"])
+        else:
+            sett_layout.addWidget(QLabel("Perfil de Revelado (Solo Video - No afecta DNG):"))
+            self.combo_sharp = QComboBox()
+            self.combo_sharp.addItems([
+                "DCB Puro",
+                "Suave (S:0.8 / A:1.5)",
+                "Medio (S:1.3 / A:1.5)",
+                "Grueso (S:2.0 / A:2.5) [Recomendado para Video]"
+            ])
+            self.combo_sharp.setCurrentIndex(3)
         sett_layout.addWidget(self.combo_sharp)
         
         settings_group.setLayout(sett_layout)
@@ -332,72 +426,69 @@ class BatchExportDialog(QDialog):
         try:
             full_path = Path(self.root) / self.coll / filename
             fsize = full_path.stat().st_size
-            
-            # --- DETECCIÓN USANDO METADATA (Ideal) O TAMAÑO ---
-            # Intentamos leer metadata del manager si es posible, si no, adivinamos
-            # (Aquí usamos la lógica rápida por tamaño para no cargar todo el json por cada item)
-            
             w, h = 2840, 2200 
-            is_rgb = False
-
-            # Detección simple RGB vs Bayer basada en tamaño
-            if fsize % int(w * h * 3) == 0: 
-                is_rgb = True
-            elif fsize % int(w * h * 1.5) == 0:
-                is_rgb = False
-            else:
-                 # Default a Bayer si no cuadra perfecto, o podría ser RGB incompleto
-                 pass
             
-            # Leer Frame de muestra (Frame 100)
-            frame_bytes = int(w * h * 3) if is_rgb else int(w * h * 1.5)
-            total_frames = fsize // frame_bytes
-            target_frame = 100 if total_frames > 100 else max(0, total_frames - 1)
+            # Detectar formato desde metadata si disponible
+            file_meta = self.collection_meta.get(filename, {})
+            pixel_fmt = file_meta.get("pixel_format", "")
+            is_qoi = (pixel_fmt == "qoi_rgb")
+            is_rgb = (pixel_fmt == "rgb")
             
-            with open(full_path, "rb") as f:
-                f.seek(target_frame * frame_bytes)
-                raw_data = f.read(frame_bytes)
-                
-            if len(raw_data) < frame_bytes: return None
-
-            if is_rgb:
-                # RGB DIRECTO
+            # Fallback por tamaño si no hay metadata
+            if not pixel_fmt:
+                if fsize % int(w * h * 3) == 0: is_rgb = True
+                elif fsize % int(w * h * 1.5) == 0: is_rgb = False
+            
+            if is_qoi:
+                # QOI: Leer frame usando el índice del contenedor
+                frame_index = qoi_utils.build_frame_index(str(full_path))
+                target = min(100, len(frame_index) - 1) if frame_index else 0
+                if not frame_index: return None
+                offset, fsz = frame_index[target]
+                qoi_data = qoi_utils.read_frame_at(str(full_path), offset, fsz)
+                rgb = qoi_utils.decode_qoi(qoi_data, w, h)
+                small = cv2.resize(rgb, (160, 120), interpolation=cv2.INTER_NEAREST)
+            elif is_rgb:
+                frame_bytes = int(w * h * 3)
+                total_frames = fsize // frame_bytes
+                target_frame = 100 if total_frames > 100 else max(0, total_frames - 1)
+                with open(full_path, "rb") as f:
+                    f.seek(target_frame * frame_bytes)
+                    raw_data = f.read(frame_bytes)
+                if len(raw_data) < frame_bytes: return None
                 rgb = np.frombuffer(raw_data, dtype=np.uint8).reshape(h, w, 3)
-                small = rgb[::8, ::8, :].copy() # Downscale para icono
+                small = rgb[::8, ::8, :].copy()
             else:
-                # BAYER RAW (Necesita proceso corrección color)
-                # Extracción manual RG similar al modo Fast para consistencia
+                # BAYER RAW
+                frame_bytes = int(w * h * 1.5)
+                total_frames = fsize // frame_bytes
+                target_frame = 100 if total_frames > 100 else max(0, total_frames - 1)
+                with open(full_path, "rb") as f:
+                    f.seek(target_frame * frame_bytes)
+                    raw_data = f.read(frame_bytes)
+                if len(raw_data) < frame_bytes: return None
                 data = np.frombuffer(raw_data, dtype=np.uint8).reshape(-1, 3)
                 b0, b1, b2 = data[:, 0], data[:, 1], data[:, 2]
-                
-                # Desempaquetado 8-bit rápido
                 p0 = ((b1 & 0x0F) << 4) | (b0 >> 4)
                 p1 = b2
                 img_flat = np.empty(w*h, dtype=np.uint8)
                 img_flat[0::2] = p0; img_flat[1::2] = p1
                 img_bayer = img_flat.reshape(h, w)
-                
-                # Subsampling directo RG (R en 0,0 | B en 1,1)
                 r_ch = img_bayer[0::2, 0::2]
                 g_ch = img_bayer[0::2, 1::2]
                 b_ch = img_bayer[1::2, 1::2]
-                
-                # Crear RGB pequeño
-                rows, cols = r_ch.shape
                 small = np.dstack((r_ch, g_ch, b_ch))
-                
-                # Reducir más para icono (aprox 160x120)
                 small = cv2.resize(small, (160, 120), interpolation=cv2.INTER_NEAREST)
-                
-                # Opcional: Auto Brightness simple
                 avg = np.mean(small)
                 if avg > 0: small = np.clip(small * (100/avg), 0, 255).astype(np.uint8)
             
-            ih, iw, _ = small.shape
+            ih, iw = small.shape[:2]
+            if small.ndim == 2: small = cv2.cvtColor(small, cv2.COLOR_GRAY2RGB)
             if not small.flags['C_CONTIGUOUS']: small = np.ascontiguousarray(small)
             qimg = QImage(small.data, iw, ih, iw*3, QImage.Format.Format_RGB888)
             return QIcon(QPixmap.fromImage(qimg))
-        except:
+        except Exception as e:
+            print(f"Thumbnail error ({filename}): {e}")
             return None
     def set_all(self, state):
         for i in range(self.list_widget.count()):
@@ -410,25 +501,348 @@ class BatchExportDialog(QDialog):
             if item.checkState() == Qt.CheckState.Checked:
                 files.append(item.text())
         
-        # Mapeo actualizado con DNG en índice 0
-        fmt_map = {
-            0: 'dng',
-            1: 'prores', 
-            2: 'cineform', 
-            3: 'prores_hq', 
-            4: 'hevc', 
-            5: 'h264'
-        }
-        sharp_map = {0: '0,0', 1: '0.8,1.5', 2: '1.3,1.5', 3: '2.0,2.5'}
+        if self.source_is_processed:
+            fmt_map = {0: 'tiff_seq', 1: 'prores', 2: 'prores_hq', 3: 'hevc', 4: 'h264'}
+            sharp = '0,0'
+        else:
+            fmt_map = {0: 'dng', 1: 'prores', 2: 'cineform', 3: 'prores_hq', 4: 'hevc', 5: 'h264'}
+            sharp_map = {0: '0,0', 1: '0.8,1.5', 2: '1.3,1.5', 3: '2.0,2.5'}
+            sharp = sharp_map.get(self.combo_sharp.currentIndex(), '0,0')
         
-        return files, fmt_map[self.combo_fmt.currentIndex()], sharp_map[self.combo_sharp.currentIndex()]
+        return files, fmt_map.get(self.combo_fmt.currentIndex(), 'dng'), sharp
+
+
+class CalibrationLiveViewer(QWidget):
+    """Vista previa a pantalla completa con retícula (cruz + diagonales) en naranja 1px."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._pixmap = None
+        self.setStyleSheet("background-color: #111;")
+        self.setMinimumSize(480, 360)
+
+    def set_frame(self, frame: np.ndarray):
+        is_color = frame.ndim == 3
+        if is_color:
+            disp = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        else:
+            disp = frame
+        h, w = disp.shape[:2]
+        if is_color:
+            qimg = QImage(disp.data, w, h, w * 3, QImage.Format.Format_RGB888)
+        else:
+            if disp.dtype == np.uint16:
+                disp = (disp >> 4).astype(np.uint8)
+            if not disp.flags["C_CONTIGUOUS"]:
+                disp = np.ascontiguousarray(disp)
+            qimg = QImage(disp.data, w, h, w, QImage.Format.Format_Grayscale8)
+        self._pixmap = QPixmap.fromImage(qimg)
+        self.update()
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.fillRect(self.rect(), Qt.GlobalColor.black)
+        if not self._pixmap or self._pixmap.isNull():
+            return
+        scaled = self._pixmap.scaled(
+            self.size(),
+            Qt.AspectRatioMode.KeepAspectRatio,
+            Qt.TransformationMode.FastTransformation,
+        )
+        x0 = (self.width() - scaled.width()) // 2
+        y0 = (self.height() - scaled.height()) // 2
+        painter.drawPixmap(x0, y0, scaled)
+        pen = QPen(QColor("#ff6600"))
+        pen.setWidth(1)
+        pen.setCosmetic(True)
+        painter.setPen(pen)
+        iw, ih = scaled.width(), scaled.height()
+        cx = x0 + iw // 2
+        cy = y0 + ih // 2
+        painter.drawLine(cx, y0, cx, y0 + ih)
+        painter.drawLine(x0, cy, x0 + iw, cy)
+        painter.drawLine(x0, y0, x0 + iw, y0 + ih)
+        painter.drawLine(x0 + iw - 1, y0, x0, y0 + ih - 1)
+
+
+class CameraCalibrationDialog(QDialog):
+    def __init__(self, main_window: "MainWindow"):
+        super().__init__(main_window)
+        self.main_window = main_window
+        self._restored = False
+        self._exp_range = None
+        self._gain_range = None
+        self._calib_steps = 20
+        self.setWindowTitle("Calibrar posición de cámara")
+        self.resize(960, 750)
+        layout = QVBoxLayout(self)
+        self.viewer = CalibrationLiveViewer(self)
+        layout.addWidget(self.viewer, 10)
+        help_lbl = QLabel(
+            "Vista en vivo continua, autoexposición, autoganancia y sin disparo externo. "
+            "Usa la retícula para centrar la cámara."
+        )
+        help_lbl.setStyleSheet("color: #888; font-size: 9pt;")
+        help_lbl.setWordWrap(True)
+        layout.addWidget(help_lbl)
+
+        # Controles manuales de exposición y gain (modo calibración)
+        ctrl_box = QGroupBox("Exposición y ganancia (modo calibración)")
+        ctrl_layout = QHBoxLayout(ctrl_box)
+
+        # Exposición
+        exp_col = QVBoxLayout()
+        lbl_exp = QLabel("Exposición (µs)")
+        lbl_exp.setStyleSheet("font-size: 9pt; color: #ccc;")
+        self.sld_exp_calib = QSlider(Qt.Orientation.Horizontal)
+        self.sld_exp_calib.setRange(0, self._calib_steps - 1)
+        self.sld_exp_calib.setEnabled(False)
+        self.lbl_exp_calib_val = QLabel("--")
+        self.lbl_exp_calib_val.setStyleSheet("font-size: 9pt; color: #aaa;")
+        exp_col.addWidget(lbl_exp)
+        exp_col.addWidget(self.sld_exp_calib)
+        exp_col.addWidget(self.lbl_exp_calib_val)
+        ctrl_layout.addLayout(exp_col)
+
+        # Gain
+        gain_col = QVBoxLayout()
+        lbl_gain = QLabel("Gain")
+        lbl_gain.setStyleSheet("font-size: 9pt; color: #ccc;")
+        self.sld_gain_calib = QSlider(Qt.Orientation.Horizontal)
+        self.sld_gain_calib.setRange(0, self._calib_steps - 1)
+        self.sld_gain_calib.setEnabled(False)
+        self.lbl_gain_calib_val = QLabel("--")
+        self.lbl_gain_calib_val.setStyleSheet("font-size: 9pt; color: #aaa;")
+        gain_col.addWidget(lbl_gain)
+        gain_col.addWidget(self.sld_gain_calib)
+        gain_col.addWidget(self.lbl_gain_calib_val)
+        ctrl_layout.addLayout(gain_col)
+
+        layout.addWidget(ctrl_box)
+
+        btn_row = QHBoxLayout()
+        btn_back = QPushButton("Volver")
+        btn_back.setMinimumHeight(32)
+        btn_back.clicked.connect(self.accept)
+        btn_row.addStretch()
+        btn_row.addWidget(btn_back)
+        layout.addLayout(btn_row)
+
+        w = main_window.camera_worker
+        if w:
+            w.request_calibration_live_mode(True)
+            w.image_received.connect(self._on_frame)
+
+            # Intentar leer rangos de exposición y gain para los sliders
+            try:
+                ranges = w.get_exposure_gain_ranges()
+            except Exception as e:
+                print(f"WARN get_exposure_gain_ranges (dialog): {e}")
+                ranges = None
+            if ranges:
+                self._exp_range = ranges.get("exp")
+                self._gain_range = ranges.get("gain")
+
+            if self._exp_range and self._exp_range[0] is not None and self._exp_range[1] is not None:
+                self.sld_exp_calib.setEnabled(True)
+                self.sld_exp_calib.valueChanged.connect(self._on_exp_calib_slider_changed)
+                # Punto medio inicial
+                self.sld_exp_calib.setValue(self._calib_steps // 2)
+
+            if self._gain_range and self._gain_range[0] is not None and self._gain_range[1] is not None:
+                self.sld_gain_calib.setEnabled(True)
+                self.sld_gain_calib.valueChanged.connect(self._on_gain_calib_slider_changed)
+                # Arrancar en mínimo
+                self.sld_gain_calib.setValue(0)
+
+    def _on_frame(self, frame: np.ndarray):
+        self.viewer.set_frame(frame)
+
+    def _map_slider_to_range(self, idx: int, lo: float, hi: float) -> float:
+        if self._calib_steps <= 1 or hi <= lo:
+            return lo
+        t = max(0.0, min(1.0, idx / float(self._calib_steps - 1)))
+        return lo + (hi - lo) * t
+
+    def _on_exp_calib_slider_changed(self, idx: int):
+        if not self._exp_range or self._exp_range[0] is None or self._exp_range[1] is None:
+            return
+        lo, hi = self._exp_range
+        target = self._map_slider_to_range(idx, lo, hi)
+        w = self.main_window.camera_worker
+        if not w or not hasattr(w, "set_exposure_time_calibration"):
+            return
+        try:
+            applied = w.set_exposure_time_calibration(target)
+        except Exception as e:
+            print(f"WARN set_exposure_time_calibration (dialog): {e}")
+            return
+        self.lbl_exp_calib_val.setText(f"{applied:.0f} µs")
+
+    def _on_gain_calib_slider_changed(self, idx: int):
+        if not self._gain_range or self._gain_range[0] is None or self._gain_range[1] is None:
+            return
+        lo, hi = self._gain_range
+        target = self._map_slider_to_range(idx, lo, hi)
+        w = self.main_window.camera_worker
+        if not w or not hasattr(w, "set_gain_calibration"):
+            return
+        try:
+            applied = w.set_gain_calibration(target)
+        except Exception as e:
+            print(f"WARN set_gain_calibration (dialog): {e}")
+            return
+        self.lbl_gain_calib_val.setText(f"{applied:.2f}")
+
+    def _restore_camera(self):
+        if self._restored:
+            return
+        self._restored = True
+        w = self.main_window.camera_worker
+        if w:
+            try:
+                w.image_received.disconnect(self._on_frame)
+            except (TypeError, RuntimeError):
+                pass
+            mw = self.main_window
+            idx = mw.sld_exposure.value()
+            short = idx == mw.SHORT_EXP_IDX
+            val = mw.EXP_STEPS[idx]
+            w.set_restore_exposure_after_calibration(short, val)
+            w.request_calibration_live_mode(False)
+
+    def accept(self):
+        self._restore_camera()
+        super().accept()
+
+    def reject(self):
+        self._restore_camera()
+        super().reject()
+
+    def closeEvent(self, event):
+        self._restore_camera()
+        super().closeEvent(event)
+
+
+class CameraTimerDialog(QDialog):
+    def __init__(self, main_window: "MainWindow"):
+        super().__init__(main_window)
+        self.main_window = main_window
+        self.setWindowTitle("Ajuste Timer0")
+        self.setMinimumSize(470, 360)
+        self.resize(520, 420)
+        layout = QVBoxLayout(self)
+
+        info = QLabel("Ajusta solo Timer0: TimerDuration y TimerDelay.")
+        info.setStyleSheet("color: #999;")
+        layout.addWidget(info)
+
+        row_duration = QHBoxLayout()
+        row_duration.addWidget(QLabel("TimerDuration"))
+        self.spn_duration = QSpinBox()
+        self.spn_duration.setRange(1, 10_000_000)
+        self.spn_duration.setValue(90000)
+        self.spn_duration.setSuffix(" us")
+        row_duration.addWidget(self.spn_duration, 1)
+        layout.addLayout(row_duration)
+
+        row_delay = QHBoxLayout()
+        row_delay.addWidget(QLabel("TimerDelay"))
+        self.spn_delay = QSpinBox()
+        self.spn_delay.setRange(0, 10_000_000)
+        self.spn_delay.setValue(50)
+        self.spn_delay.setSuffix(" us")
+        row_delay.addWidget(self.spn_delay, 1)
+        layout.addLayout(row_delay)
+
+        row_actions = QHBoxLayout()
+        self.btn_read = QPushButton("Leer actual")
+        self.btn_apply = QPushButton("Aplicar y verificar")
+        self.btn_close = QPushButton("Cerrar")
+        self.btn_read.clicked.connect(self.read_current_values)
+        self.btn_apply.clicked.connect(self.apply_values)
+        self.btn_close.clicked.connect(self.accept)
+        row_actions.addWidget(self.btn_read)
+        row_actions.addWidget(self.btn_apply)
+        row_actions.addStretch()
+        row_actions.addWidget(self.btn_close)
+        layout.addLayout(row_actions)
+
+        self.lbl_result = QLabel("Estado: pendiente")
+        self.lbl_result.setStyleSheet("font-weight: bold; color: #ff9800;")
+        layout.addWidget(self.lbl_result)
+
+        self.logs = QTextEdit()
+        self.logs.setReadOnly(True)
+        self.logs.setPlaceholderText("Logs de aplicación y verificación...")
+        layout.addWidget(self.logs, 1)
+
+        self.read_current_values()
+
+    def _log(self, message: str):
+        stamp = datetime.now().strftime("%H:%M:%S")
+        self.logs.append(f"[{stamp}] {message}")
+
+    def read_current_values(self):
+        w = self.main_window.camera_worker
+        if not w or not self.main_window._camera_connected:
+            self.lbl_result.setText("Estado: sin cámara")
+            self.lbl_result.setStyleSheet("font-weight: bold; color: #f44336;")
+            self._log("No hay cámara conectada para leer Timer0.")
+            return
+        data = w.get_timer0_config()
+        if not data:
+            self.lbl_result.setText("Estado: lectura fallida")
+            self.lbl_result.setStyleSheet("font-weight: bold; color: #f44336;")
+            self._log("No se pudieron leer los valores actuales de Timer0.")
+            return
+        self.spn_duration.setValue(int(round(data["duration"])))
+        self.spn_delay.setValue(int(round(data["delay"])))
+        self.lbl_result.setText("Estado: valores cargados")
+        self.lbl_result.setStyleSheet("font-weight: bold; color: #4caf50;")
+        self._log(
+            f"Leído Timer0 actual -> Duration={data['duration']:.0f} us, Delay={data['delay']:.0f} us."
+        )
+
+    def apply_values(self):
+        w = self.main_window.camera_worker
+        if not w or not self.main_window._camera_connected:
+            self.lbl_result.setText("Estado: sin cámara")
+            self.lbl_result.setStyleSheet("font-weight: bold; color: #f44336;")
+            self._log("No hay cámara conectada para aplicar cambios.")
+            return
+        duration = float(self.spn_duration.value())
+        delay = float(self.spn_delay.value())
+        self._log(f"Aplicando Timer0 -> Duration={duration:.0f} us, Delay={delay:.0f} us.")
+        result = w.set_timer0_config(duration, delay)
+        applied_dur = result.get("applied_duration")
+        applied_del = result.get("applied_delay")
+        if result.get("ok"):
+            self.lbl_result.setText("Estado: aplicado correctamente")
+            self.lbl_result.setStyleSheet("font-weight: bold; color: #4caf50;")
+            self._log(
+                f"OK verificado -> Duration={applied_dur:.0f} us, Delay={applied_del:.0f} us."
+            )
+        else:
+            self.lbl_result.setText("Estado: no se aplicó exactamente")
+            self.lbl_result.setStyleSheet("font-weight: bold; color: #ff9800;")
+            err = result.get("error", "Sin detalle.")
+            if applied_dur is not None and applied_del is not None:
+                self._log(
+                    "DIFERENCIA: solicitado "
+                    f"({duration:.0f}, {delay:.0f}) vs aplicado "
+                    f"({applied_dur:.0f}, {applied_del:.0f})."
+                )
+            self._log(f"Detalle: {err}")
+
 
 # --- VENTANA PRINCIPAL ---
 class MainWindow(QMainWindow):
-    def __init__(self):
+    def __init__(self, defer_camera=False):
         super().__init__()
         self.setWindowTitle("Escáner de películas - Archivo La Unión")
         self.resize(1400, 900)
+        self._defer_camera = defer_camera
         self.load_config() # Carga o pide la carpeta raíz
         self.manager = scanner_core.CollectionManager(self.root_folder)
         self.active_collection = None
@@ -438,7 +852,14 @@ class MainWindow(QMainWindow):
         self.frame_queue = queue.Queue(maxsize=600)
         self.camera_worker = None
         self.writer_worker = None
-        
+        self._stats_cache = {
+            "fps": 0.0, "temp": 0.0, "qsize": 0, "cam_drops": 0, "disk_drops": 0,
+            "total_cam": 0, "bw": 0.0, "bw_src": "C",
+        }
+        self._calibration_dialog = None
+        self._timer_dialog = None
+        self._execution_state_key = None  # None | (display, system) último estado aplicado
+
         # Variables visor
         self.raw_width = 2840
         self.raw_height = 2200
@@ -452,26 +873,87 @@ class MainWindow(QMainWindow):
         self.disk_timer.start(10000)
         self.bayer_phase = 0
 
+        self._toast = QLabel(self)
+        self._toast.setStyleSheet(
+            "QLabel { background-color: rgba(28,28,28,230); color: #eee; "
+            "padding: 10px 18px; border-radius: 8px; border: 1px solid #555; font-size: 11pt; }"
+        )
+        self._toast.hide()
+        self._toast.raise_()
+        self._toast_timer = QTimer(self)
+        self._toast_timer.setSingleShot(True)
+        self._toast_timer.timeout.connect(self._toast.hide)
+        self._pending_config_toast = False
+        self._applying_persist = False
+        self._persist_save_timer = QTimer(self)
+        self._persist_save_timer.setSingleShot(True)
+        self._persist_save_timer.setInterval(400)
+        self._persist_save_timer.timeout.connect(self.save_config)
+
+        self._applying_persist = True
+        try:
+            self.apply_persist_ui()
+        finally:
+            self._applying_persist = False
+
+        if not defer_camera:
+            self.start_camera_thread()
+
+    def _persist_defaults(self):
+        return {
+            "root_folder": os.path.expanduser("~/Documents/Archivo_Scan_Data"),
+            "ui": {
+                "preview_mode": "ISP",
+                "film_type": "Color (Pos/Neg)",
+                "pixel_mode": "bayer",
+                "exposure_index": 11,
+                "real_fps": False,
+                "peaking": False,
+                "zoom_1to1": False,
+                "corners": False,
+                "playback_fps": 18,
+                "bayer_phase": 0,
+                "active_collection": None,
+                "tab_index": 0,
+                "window": None,
+            },
+            "isp": {
+                "tone": [2.0, 0.0, 1.0],
+            },
+        }
+
+    @staticmethod
+    def _deep_update(base: dict, extra: dict):
+        for key, val in extra.items():
+            if isinstance(val, dict) and isinstance(base.get(key), dict):
+                MainWindow._deep_update(base[key], val)
+            else:
+                base[key] = val
+
     def load_config(self):
         config_path = Path(__file__).parent / "persist.json"
-        default_root = os.path.expanduser("~/Documents/Archivo_Scan_Data")
-        self.root_folder = default_root
-        
-        try:
-            if config_path.exists():
-                with open(config_path, 'r') as f:
-                    data = json.load(f)
-                    saved_root = data.get("root_folder")
-                    if saved_root and os.path.isdir(saved_root):
-                        self.root_folder = saved_root
-                        return
+        self._persist = self._persist_defaults()
 
-            # Si no existe o no es válida, pedimos al usuario
+        if config_path.exists():
+            try:
+                with open(config_path, "r", encoding="utf-8") as f:
+                    self._deep_update(self._persist, json.load(f))
+            except Exception as e:
+                print(f"Error cargando persist.json: {e}")
+
+        legacy_path = Path(__file__).parent / "config.json"
+        if legacy_path.exists():
+            try:
+                with open(legacy_path, "r", encoding="utf-8") as f:
+                    leg = json.load(f)
+                if "pixel_mode" in leg:
+                    self._persist["ui"]["pixel_mode"] = leg["pixel_mode"]
+            except Exception:
+                pass
+
+        self.root_folder = self._persist.get("root_folder") or self._persist_defaults()["root_folder"]
+        if not self.root_folder or not os.path.isdir(self.root_folder):
             self.ask_root_folder_first_time()
-            
-        except Exception as e:
-            print(f"Error cargando config: {e}")
-            self.root_folder = default_root
 
     def ask_root_folder_first_time(self):
         # Usamos un QDialog temporal o QMessageBox porque self (MainWindow) aun no es visible
@@ -495,13 +977,142 @@ class MainWindow(QMainWindow):
         
         self.save_config()
 
+    def _collect_ui_persist(self) -> dict:
+        ui = dict(self._persist.get("ui", {}))
+        ui["preview_mode"] = self.combo_preview.currentText()
+        ui["film_type"] = self.combo_type.currentText()
+        ui["pixel_mode"] = "qoi_rgb" if self.combo_pixel_mode.currentIndex() == 1 else "bayer"
+        ui["exposure_index"] = int(self.sld_exposure.value())
+        ui["real_fps"] = self.btn_real_fps.isChecked()
+        ui["peaking"] = self.btn_peaking.isChecked()
+        ui["zoom_1to1"] = self.btn_zoom_1to1.isChecked()
+        ui["corners"] = self.btn_corners.isChecked()
+        ui["playback_fps"] = int(self.sb_fps.value())
+        ui["bayer_phase"] = int(getattr(self, "bayer_phase", 0))
+        ui["active_collection"] = self.active_collection
+        ui["tab_index"] = int(self.tabs.currentIndex())
+        geo = self.geometry()
+        ui["window"] = [geo.x(), geo.y(), geo.width(), geo.height()]
+        return ui
+
+    def _collect_isp_persist(self) -> dict:
+        w = self.camera_worker
+        isp = {"tone": [2.0, 0.0, 1.0]}
+        if w:
+            g, lift, contrast = w.get_isp_preview_tone()
+            isp["tone"] = [g, lift, contrast]
+        else:
+            isp = dict(self._persist.get("isp", isp))
+        return isp
+
+    def schedule_save_config(self):
+        if getattr(self, "_applying_persist", False):
+            return
+        self._persist_save_timer.start()
+
     def save_config(self):
         try:
+            self._persist["root_folder"] = self.root_folder
+            self._persist["ui"] = self._collect_ui_persist()
+            self._persist["isp"] = self._collect_isp_persist()
             config_path = Path(__file__).parent / "persist.json"
-            with open(config_path, 'w') as f:
-                json.dump({"root_folder": self.root_folder}, f, indent=4)
+            with open(config_path, "w", encoding="utf-8") as f:
+                json.dump(self._persist, f, indent=4, ensure_ascii=False)
         except Exception as e:
-            print(f"Error guardando config: {e}")
+            print(f"Error guardando persist.json: {e}")
+
+    def apply_persist_ui(self):
+        ui = self._persist.get("ui", self._persist_defaults()["ui"])
+
+        win = ui.get("window")
+        if isinstance(win, list) and len(win) == 4:
+            try:
+                self.setGeometry(int(win[0]), int(win[1]), int(win[2]), int(win[3]))
+            except Exception:
+                pass
+
+        tab_idx = int(ui.get("tab_index", 0))
+        if 0 <= tab_idx < self.tabs.count():
+            self.tabs.setCurrentIndex(tab_idx)
+
+        self.bayer_phase = int(ui.get("bayer_phase", 0))
+
+        film = ui.get("film_type", "Color (Pos/Neg)")
+        fi = self.combo_type.findText(film)
+        if fi >= 0:
+            self.combo_type.setCurrentIndex(fi)
+
+        preview = ui.get("preview_mode", "ISP")
+        pi = self.combo_preview.findText(preview)
+        if pi >= 0:
+            self.combo_preview.setCurrentIndex(pi)
+
+        pixel_mode = ui.get("pixel_mode", "bayer")
+        self.combo_pixel_mode.setCurrentIndex(1 if pixel_mode == "qoi_rgb" else 0)
+
+        exp_idx = int(ui.get("exposure_index", self.sld_exposure.value()))
+        exp_idx = max(0, min(len(self.EXP_STEPS) - 1, exp_idx))
+        self.sld_exposure.setValue(exp_idx)
+        self.on_exposure_slider_changed(exp_idx)
+
+        self.btn_real_fps.setChecked(bool(ui.get("real_fps", False)))
+        self.toggle_real_fps(self.btn_real_fps.isChecked())
+
+        self.btn_peaking.setChecked(bool(ui.get("peaking", False)))
+        self.toggle_peaking(self.btn_peaking.isChecked())
+
+        zoom = bool(ui.get("zoom_1to1", False))
+        corners = bool(ui.get("corners", False))
+        self.btn_zoom_1to1.setChecked(zoom)
+        self.btn_corners.setChecked(corners)
+        if zoom:
+            self.toggle_zoom_1to1(True)
+        elif corners:
+            self.toggle_corners(True)
+        else:
+            self.viewer_scan.mode = ViewMode.NORMAL
+            self.viewer_scan.update()
+
+        self.sb_fps.setValue(int(ui.get("playback_fps", 18)))
+
+        coll = ui.get("active_collection")
+        if coll and coll in self.manager.get_collections():
+            self.active_collection = coll
+            self.lbl_status.setText(f"Colección Activa: {coll}")
+            self.lbl_status.setStyleSheet("font-size: 14pt; color: #4caf50;")
+            items = self.col_list.findItems(coll, Qt.MatchFlag.MatchExactly)
+            if items:
+                self.col_list.setCurrentItem(items[0])
+            self.refresh_file_list(coll)
+
+    def _apply_persist_to_camera(self):
+        if not self.camera_worker or not self._camera_connected:
+            return
+        ui = self._persist.get("ui", {})
+        label = ui.get("preview_mode", self.combo_preview.currentText())
+        self.on_preview_mode_changed(label)
+
+        real_fps = bool(ui.get("real_fps", self.btn_real_fps.isChecked()))
+        self.camera_worker.set_preview_skip_frames(not real_fps)
+
+        self._apply_exposure_to_camera()
+
+        isp = self._persist.get("isp", self._persist_defaults()["isp"])
+        tone = isp.get("tone", [2.0, 0.0, 1.0])
+        if not (isinstance(tone, (list, tuple)) and len(tone) == 3):
+            tone = [2.0, 0.0, 1.0]
+        if self.btn_peaking.isChecked():
+            tone = [1.0, tone[1], tone[2]]
+        self.camera_worker.set_isp_preview_tone(float(tone[0]), float(tone[1]), float(tone[2]))
+
+    def _preview_gamma_normal(self) -> float:
+        return 2.0
+
+    def _apply_preview_gamma_for_peaking(self):
+        if not self.camera_worker:
+            return
+        g = 1.0 if self.btn_peaking.isChecked() else self._preview_gamma_normal()
+        self.camera_worker.set_isp_preview_tone(g, 0.0, 1.0)
 
     def change_root_folder(self):
         folder = QFileDialog.getExistingDirectory(self, "Seleccionar Nueva Carpeta Raíz", self.root_folder)
@@ -526,6 +1137,8 @@ class MainWindow(QMainWindow):
         self.col_list = QListWidget()
         self.col_list.itemClicked.connect(self.on_collection_select)
         self.col_list.itemDoubleClicked.connect(self.activate_collection)
+        self.col_list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.col_list.customContextMenuRequested.connect(self.open_collection_context_menu)
         btn_new_col = QPushButton("Nueva Colección"); btn_new_col.clicked.connect(self.create_collection)
         btn_refresh = QPushButton("Refrescar"); btn_refresh.clicked.connect(self.refresh_collections)
         self.lbl_disk = QLabel("Espacio Libre: ...")
@@ -560,32 +1173,54 @@ class MainWindow(QMainWindow):
         scan_layout = QVBoxLayout()
         scan_layout.setContentsMargins(5,5,5,5)
         
-        # [HEADER] Título + Stats alineadas
+        # [HEADER] Título + estadísticas en una sola línea compacta + calibración debajo
         header_bar = QHBoxLayout()
         self.lbl_status = QLabel("Selecciona una colección")
         self.lbl_status.setStyleSheet("font-size: 14pt; color: #ff9800; font-weight: bold;")
         self.lbl_status.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
         
-        stats_layout = QHBoxLayout()
-        self.lbl_fps = QLabel("FPS: --")
-        self.lbl_temp = QLabel("Tmp: --")
-        self.lbl_saved = QLabel("Sav: 0")
-        self.lbl_buffer = QLabel("Buf: 0")
-        self.lbl_bw = QLabel("BW: 0 Mbps")
-        self.lbl_dropped = QLabel("Drp: 0")
-        self.lbl_dropped.setStyleSheet("color: red; font-weight: bold;")
-        
-        for lb in [self.lbl_fps, self.lbl_temp, self.lbl_saved, self.lbl_buffer, self.lbl_bw, self.lbl_dropped]:
-            lb.setStyleSheet(lb.styleSheet() + "; font-size: 10pt; margin-left: 10px; color: #888;")
-            stats_layout.addWidget(lb)
-            
-        header_bar.addWidget(self.lbl_status, 1) # Stretch
-        header_bar.addLayout(stats_layout)
+        self.lbl_cam_status = QLabel("●")
+        self.lbl_cam_status.setToolTip("Estado de cámara: Buscando...")
+        self.lbl_cam_status.setStyleSheet("color: #ff9800; font-size: 14pt; margin-right: 4px;")
+        self._camera_connected = False
+        self.lbl_stats_inline = QLabel("FPS: —  ·  Tmp: —  ·  Buf: —  ·  BW: —  ·  📷 —")
+        self.lbl_stats_inline.setStyleSheet("font-size: 9pt; color: #888;")
+        self.lbl_stats_inline.setAlignment(
+            Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        stats_row = QHBoxLayout()
+        stats_row.setSpacing(6)
+        stats_row.addWidget(self.lbl_cam_status)
+        stats_row.addWidget(self.lbl_stats_inline, 1)
+        header_right_col = QVBoxLayout()
+        header_right_col.setSpacing(4)
+        header_right_col.addLayout(stats_row)
+        self.btn_isp_tone = QPushButton("Ajuste ISP")
+        self.btn_isp_tone.setVisible(False)
+        self.btn_calibrate_camera = QPushButton("Calibrar posición de cámara")
+        self.btn_calibrate_camera.setEnabled(False)
+        self.btn_calibrate_camera.setToolTip(
+            "Vista en vivo sin disparo y con autoexposición, para alinear la cámara.")
+        self.btn_calibrate_camera.clicked.connect(self.open_camera_calibration_dialog)
+        self.btn_calibrate_camera.setStyleSheet("font-size: 9pt;")
+        btn_row_calib_timer = QHBoxLayout()
+        btn_row_calib_timer.setSpacing(6)
+        btn_row_calib_timer.addWidget(self.btn_isp_tone)
+        btn_row_calib_timer.addWidget(self.btn_calibrate_camera)
+        self.btn_timer0 = QPushButton("Timer0")
+        self.btn_timer0.setEnabled(False)
+        self.btn_timer0.setToolTip("Ajustar TimerDuration y TimerDelay de Timer0")
+        self.btn_timer0.setStyleSheet("font-size: 9pt;")
+        self.btn_timer0.clicked.connect(self.open_timer_dialog)
+        btn_row_calib_timer.addWidget(self.btn_timer0)
+        header_right_col.addLayout(btn_row_calib_timer)
+        header_bar.addWidget(self.lbl_status, 1)
+        header_bar.addLayout(header_right_col, 1)
         scan_layout.addLayout(header_bar)
         
-        # [VISOR]
+        # [VISOR] con overlay de exposición integrado en ScanViewer
         self.viewer_scan = ScanViewer()
         self.viewer_scan.setStyleSheet("background-color: #111; border: 1px solid #444;")
+        self.viewer_scan.set_exposure_overlay("Hi —", "#666666")
         # Fix: Usar QSizePolicy enums correctamente
         from PyQt6.QtWidgets import QSizePolicy 
         self.viewer_scan.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
@@ -602,6 +1237,7 @@ class MainWindow(QMainWindow):
         self.combo_type = QComboBox()
         self.combo_type.addItems(["Color (Pos/Neg)", "Blanco y Negro"])
         self.combo_type.setFixedWidth(130)
+        self.combo_type.currentTextChanged.connect(lambda _: self.schedule_save_config())
         cb_layout.addWidget(self.combo_type)
         
         # B. Foco
@@ -625,12 +1261,15 @@ class MainWindow(QMainWindow):
         # Grupo de Modo de Vista (Exclusivo)
         # Gestionaremos la exclusividad manualmente en los slots
         
-        # B&W Preview y FPS Reales (Nuevos controles)
-        self.btn_bw_prev = QPushButton("B/W")
-        self.btn_bw_prev.setCheckable(True)
-        self.btn_bw_prev.setToolTip("Previsualización en B/W (Más rápido)")
-        self.btn_bw_prev.clicked.connect(self.toggle_bw_preview)
-        self.btn_bw_prev.setFixedWidth(40)
+        # Modo de previsualización (ISP / RAW / B-W)
+        self.combo_preview = QComboBox()
+        self.combo_preview.addItems(["ISP", "ISP Full", "HQ", "HQ½", "RAW", "B/W"])
+        self.combo_preview.setCurrentIndex(0)
+        self.combo_preview.setToolTip(
+            "ISP: SDK mitad res · ISP Full: SDK 2840×2200 · HQ/HQ½: debayer software · RAW/B/W: rápido"
+        )
+        self.combo_preview.setFixedWidth(78)
+        self.combo_preview.currentTextChanged.connect(self.on_preview_mode_changed)
         
         self.btn_real_fps = QPushButton("Real")
         self.btn_real_fps.setCheckable(True)
@@ -641,33 +1280,85 @@ class MainWindow(QMainWindow):
         cb_layout.addWidget(self.btn_peaking)
         cb_layout.addWidget(self.btn_zoom_1to1)
         cb_layout.addWidget(self.btn_corners)
-        cb_layout.addWidget(self.btn_bw_prev)
+        cb_layout.addWidget(self.combo_preview)
         cb_layout.addWidget(self.btn_real_fps)
         
-        # C. Exposición
-        exp_layout = QHBoxLayout()
-        exp_layout.setSpacing(5)
-        exp_layout.addWidget(QLabel("Exp:"))
-        self.sl_exp = QSlider(Qt.Orientation.Horizontal)
-        self.sl_exp.setRange(20, 100)
-        self.sl_exp.setValue(50)
-        self.sl_exp.setSingleStep(10) # 10 en 10
-        self.sl_exp.setPageStep(10)
-        self.sl_exp.setTickPosition(QSlider.TickPosition.TicksBelow)
-        self.sl_exp.setTickInterval(10)
-        self.sl_exp.valueChanged.connect(self.on_exposure_change)
+        # C. Velocidad de obturador
+        # Índice 0: Short Exposure Mode (~2.3µs, ShortExposureEnable=True)
+        # Índices 1–31: modo normal 25–100µs en pasos de 2.5µs (4 pasos/decena)
+        # EXP_STEPS[0] = 2.5 es solo el valor indicativo; la cámara usa ~2.3µs en Short Mode
+        self.EXP_STEPS = [2.5] + [round(25 + i * 2.5, 1) for i in range(31)]  # 32 valores
+        self.SHORT_EXP_IDX = 0   # único índice que activa ShortExposureEnable
+
+        exp_layout = QVBoxLayout()
+        exp_layout.setSpacing(0)
+        exp_layout.setContentsMargins(0, 0, 0, 0)
+
+        lbl_exp_title = QLabel("Vel (µs)")
+        lbl_exp_title.setStyleSheet("font-size: 8pt; color: #aaa;")
+        lbl_exp_title.setAlignment(Qt.AlignmentFlag.AlignCenter)
+
+        exp_row = QHBoxLayout()
+        exp_row.setSpacing(2)
+
+        self.btn_exp_down = QPushButton("◀")
+        self.btn_exp_down.setFixedSize(20, 20)
+        self.btn_exp_down.setToolTip("Bajar velocidad (un paso)")
+        self.btn_exp_down.clicked.connect(lambda: self.step_exposure(-1))
+
+        self.sld_exposure = QSlider(Qt.Orientation.Horizontal)
+        self.sld_exposure.setRange(0, len(self.EXP_STEPS) - 1)
+        default_idx = self.EXP_STEPS.index(50.0)
+        self.sld_exposure.setValue(default_idx)
+        self.sld_exposure.setFixedWidth(100)
+        self.sld_exposure.setToolTip("Velocidad de obturador — paso 0: Short Mode (~2.3µs), pasos 1–31: 25–100µs")
+        self.sld_exposure.valueChanged.connect(self.on_exposure_slider_changed)
+
+        self.btn_exp_up = QPushButton("▶")
+        self.btn_exp_up.setFixedSize(20, 20)
+        self.btn_exp_up.setToolTip("Subir velocidad (un paso)")
+        self.btn_exp_up.clicked.connect(lambda: self.step_exposure(1))
+
+        self.lbl_exp_val = QLabel("50.0")
+        self.lbl_exp_val.setFixedWidth(38)
+        self.lbl_exp_val.setStyleSheet("font-weight: bold; color: #0078d7; font-size: 10pt;")
+        self.lbl_exp_val.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+
+        exp_row.addWidget(self.btn_exp_down)
+        exp_row.addWidget(self.sld_exposure)
+        exp_row.addWidget(self.btn_exp_up)
+        exp_row.addWidget(self.lbl_exp_val)
+
+        exp_layout.addWidget(lbl_exp_title)
+        exp_layout.addLayout(exp_row)
+
+        self.exposure_value = 50.0
+        self._pending_exp_short = False
+        self._pending_exp_val = 50.0
+
+        # Debounce: sólo envía el comando a la cámara 120ms después del último cambio
+        # Evita bombardear la cámara con comandos GigE al arrastrar el slider
+        self._exp_debounce = QTimer()
+        self._exp_debounce.setSingleShot(True)
+        self._exp_debounce.setInterval(120)
+        self._exp_debounce.timeout.connect(self._apply_exposure_to_camera)
+
+        cb_layout.addLayout(exp_layout)
         
-        self.lbl_exp_val = QLabel("50")
-        self.lbl_exp_val.setFixedWidth(30)
-        self.lbl_exp_val.setStyleSheet("font-weight: bold; color: #0078d7;")
-        self.lbl_exp_val.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        cb_layout.addSpacing(10)
         
-        exp_layout.addWidget(self.sl_exp)
-        exp_layout.addWidget(self.lbl_exp_val)
+        # D. Selector de formato de captura
+        self.combo_pixel_mode = QComboBox()
+        self.combo_pixel_mode.addItems(["RAW Bayer 12-bit", "QOI RGB8 (ISP)"])
+        self.combo_pixel_mode.setToolTip("Formato de captura: Bayer crudo o RGB procesado por la cámara")
+        self.combo_pixel_mode.setFixedWidth(145)
+        current_mode = self._read_pixel_mode()
+        if current_mode == "qoi_rgb":
+            self.combo_pixel_mode.setCurrentIndex(1)
+        self.combo_pixel_mode.currentIndexChanged.connect(self.on_pixel_mode_change)
+        cb_layout.addWidget(self.combo_pixel_mode)
         
-        cb_layout.addLayout(exp_layout, 1) # Stretch para que slider crezca
-        
-        # D. GRABAR
+        # E. GRABAR
         self.btn_record = QPushButton("GRABAR")
         self.btn_record.setCheckable(True)
         self.btn_record.setEnabled(False)
@@ -684,9 +1375,6 @@ class MainWindow(QMainWindow):
         
         scan_layout.addWidget(control_bar)
         
-        self.tab_scan.setLayout(scan_layout)
-        scan_layout.addWidget(self.lbl_fps); scan_layout.addWidget(self.lbl_buffer)
-        scan_layout.addWidget(self.lbl_temp); scan_layout.addWidget(self.lbl_saved)
         self.tab_scan.setLayout(scan_layout)
 
         # TAB 2: VISOR
@@ -706,7 +1394,9 @@ class MainWindow(QMainWindow):
 
         play_lay = QHBoxLayout()
         self.btn_play = QPushButton("▶"); self.btn_play.setCheckable(True); self.btn_play.clicked.connect(self.toggle_playback)
-        self.sb_fps = QSpinBox(); self.sb_fps.setRange(1,60); self.sb_fps.setValue(18); self.sb_fps.valueChanged.connect(self.update_fps_metadata)
+        self.sb_fps = QSpinBox(); self.sb_fps.setRange(1,60); self.sb_fps.setValue(18)
+        self.sb_fps.valueChanged.connect(self.update_fps_metadata)
+        self.sb_fps.valueChanged.connect(lambda _: self.schedule_save_config())
         play_lay.addWidget(self.btn_play); play_lay.addWidget(QLabel("FPS:")); play_lay.addWidget(self.sb_fps)
 
         exp_grp = QGroupBox("Exportación")
@@ -721,13 +1411,61 @@ class MainWindow(QMainWindow):
         self.tab_view.setLayout(view_layout)
 
         self.tabs.addTab(self.tab_scan, "Captura"); self.tabs.addTab(self.tab_view, "Visor")
+        self.tabs.currentChanged.connect(self._sync_execution_state)
+        self.tabs.currentChanged.connect(lambda _: self.schedule_save_config())
+        self._sync_execution_state()
         splitter = QSplitter(); splitter.addWidget(left_panel); splitter.addWidget(self.tabs); splitter.setSizes([300,900])
         main_layout.addWidget(splitter)
 
         self.play_timer = QTimer(); self.play_timer.timeout.connect(self.next_frame_playback)
         self.export_queue = []; self.is_exporting_batch = False
-        
+
+    def show_toast(self, text, duration_ms=3000):
+        self._toast.setText(text)
+        self._toast.adjustSize()
+        margin = 16
+        x = max(margin, self.width() - self._toast.width() - margin)
+        y = margin
+        self._toast.move(x, y)
+        self._toast.show()
+        self._toast.raise_()
+        self._toast_timer.start(duration_ms)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        if self._toast.isVisible():
+            margin = 16
+            x = max(margin, self.width() - self._toast.width() - margin)
+            self._toast.move(x, margin)
+
+    def start_camera_thread(self):
+        if self.camera_worker and self.camera_worker.isRunning():
+            return
+        if self.camera_worker:
+            self.camera_worker.stop()
+            self.camera_worker.wait()
         self.init_camera_thread()
+
+    def _export_blocks_system_sleep(self) -> bool:
+        """Cola por lotes o worker TIF activo."""
+        if getattr(self, "is_exporting_batch", False):
+            return True
+        tw = getattr(self, "tif_worker", None)
+        if tw is not None and tw.isRunning():
+            return True
+        return False
+
+    def _sync_execution_state(self, index: int | None = None) -> None:
+        """Pantalla: encendida fuera del Visor (índice 1). Suspensión del sistema: evitada fuera del Visor y mientras exporta."""
+        if index is None:
+            index = self.tabs.currentIndex()
+        want_display = index != 1
+        want_system = (index != 1) or self._export_blocks_system_sleep()
+        key = (want_display, want_system)
+        if self._execution_state_key == key:
+            return
+        self._execution_state_key = key
+        _windows_set_execution_state(want_display, want_system)
 
     # --- LISTENER DE EVENTOS (Event Filter) ---
     def eventFilter(self, source, event):
@@ -745,8 +1483,8 @@ class MainWindow(QMainWindow):
                 elif event.key() == Qt.Key.Key_C:
                     self.bayer_phase = (self.bayer_phase + 1) % 4
                     print(f"Cambiando Patrón Bayer a índice: {self.bayer_phase}")
-                    # Refrescar el frame actual
                     self.seek_viewer(self.slider_frame.value())
+                    self.schedule_save_config()
                     return True
                 # --------------------------------------------------
         
@@ -759,7 +1497,17 @@ class MainWindow(QMainWindow):
 
     def create_collection(self):
         name, ok = QInputDialog.getText(self, "Nueva", "Nombre:")
-        if ok and name: self.manager.create_collection(name); self.refresh_collections()
+        if not ok:
+            return
+        name = name.strip()
+        if not name or "/" in name or "\\" in name or ":" in name:
+            if name:
+                QMessageBox.warning(self, "Nombre inválido", "Use un nombre simple, sin rutas.")
+            return
+        if not self.manager.create_collection(name):
+            QMessageBox.warning(self, "Error", "Ya existe una colección con ese nombre.")
+            return
+        self.refresh_collections()
 
     def on_collection_select(self, item):
         coll_name = item.text()
@@ -776,10 +1524,115 @@ class MainWindow(QMainWindow):
         self.active_collection = item.text()
         self.lbl_status.setText(f"Colección Activa: {self.active_collection}")
         self.lbl_status.setStyleSheet("font-size: 14pt; color: #4caf50;")
-        self.btn_record.setEnabled(True)
-        self.btn_record.setText("INICIAR CAPTURA")
-        self.btn_record.setStyleSheet("background-color: #0078d7; font-size: 14pt; color: white;")
+        can_record = self._camera_connected
+        self.btn_record.setEnabled(can_record)
+        if can_record:
+            self.btn_record.setText("INICIAR CAPTURA")
+            self.btn_record.setStyleSheet("background-color: #0078d7; font-size: 14pt; color: white;")
+        else:
+            self.btn_record.setText("SIN CÁMARA")
+            self.btn_record.setStyleSheet("background-color: #555; font-size: 14pt; color: #aaa;")
         self.tabs.setCurrentIndex(0)
+        self.schedule_save_config()
+
+    def _collection_for_file_panel(self):
+        it = self.col_list.currentItem()
+        return it.text() if it else None
+
+    def open_collection_context_menu(self, pos):
+        it = self.col_list.itemAt(pos)
+        if not it:
+            return
+        self.col_list.setCurrentItem(it)
+        menu = QMenu(self)
+        a_rn = QAction("Renombrar colección…", self)
+        a_rn.triggered.connect(self.rename_selected_collection)
+        menu.addAction(a_rn)
+        a_pat = QAction("Patrón de archivos al grabar…", self)
+        a_pat.triggered.connect(self.edit_collection_filename_pattern)
+        menu.addAction(a_pat)
+        menu.exec(self.col_list.mapToGlobal(pos))
+
+    def rename_selected_collection(self):
+        it = self.col_list.currentItem()
+        if not it:
+            return
+        old = it.text()
+        new_name, ok = QInputDialog.getText(
+            self, "Renombrar colección", "Nuevo nombre de carpeta:", text=old)
+        if not ok or not new_name.strip() or new_name.strip() == old:
+            return
+        new_name = new_name.strip()
+        if "/" in new_name or "\\" in new_name or ":" in new_name:
+            QMessageBox.warning(self, "Nombre inválido", "Use un nombre simple, sin rutas.")
+            return
+        if not self.manager.rename_collection(old, new_name):
+            QMessageBox.warning(
+                self, "Error",
+                "No se pudo renombrar la colección (¿ya existe o nombre inválido?).")
+            return
+        if self.active_collection == old:
+            self.active_collection = new_name
+            self.lbl_status.setText(f"Colección Activa: {self.active_collection}")
+            self.schedule_save_config()
+        self.refresh_collections()
+        for i in range(self.col_list.count()):
+            if self.col_list.item(i).text() == new_name:
+                self.col_list.setCurrentRow(i)
+                break
+        self.refresh_file_list(new_name)
+
+    def edit_collection_filename_pattern(self):
+        it = self.col_list.currentItem()
+        if not it:
+            return
+        coll = it.text()
+        cfg = self.manager.get_collection_config(coll)
+        dlg = QDialog(self)
+        dlg.setWindowTitle(f"Patrón de archivos — {coll}")
+        dlg.setMinimumWidth(500)
+        lay = QVBoxLayout(dlg)
+        help_txt = QLabel(
+            "Plantilla para el próximo archivo al grabar (formato str.format).\n"
+            "· {coleccion} — nombre de la carpeta de esta colección\n"
+            "· {n} — contador; use {n:04d} para 4 dígitos con ceros, {n:03d} para 3, etc.\n"
+            "Debe terminar en .raw. Ejemplo: {coleccion}_{n:04d}.raw"
+        )
+        help_txt.setWordWrap(True)
+        lay.addWidget(help_txt)
+        edit = QLineEdit(cfg.get("filename_pattern", "{coleccion}_{n:03d}.raw"))
+        lay.addWidget(edit)
+        preview = QLabel("")
+        preview.setWordWrap(True)
+        preview.setStyleSheet("color: #888;")
+        lay.addWidget(preview)
+
+        def upd_preview():
+            try:
+                ex = self.manager.peek_next_filename(coll, edit.text().strip())
+                preview.setText(f"Siguiente archivo (ejemplo): {ex}")
+            except Exception as e:
+                preview.setText(f"Vista previa no disponible: {e}")
+
+        edit.textChanged.connect(lambda _t: upd_preview())
+        upd_preview()
+        row = QHBoxLayout()
+        btn_ok = QPushButton("Guardar")
+        btn_cancel = QPushButton("Cancelar")
+        btn_ok.clicked.connect(dlg.accept)
+        btn_cancel.clicked.connect(dlg.reject)
+        row.addWidget(btn_ok)
+        row.addWidget(btn_cancel)
+        lay.addLayout(row)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        pat = edit.text().strip()
+        try:
+            self.manager.validate_filename_pattern(coll, pat)
+        except ValueError as e:
+            QMessageBox.warning(self, "Patrón inválido", str(e))
+            return
+        self.manager.save_collection_config(coll, {"filename_pattern": pat})
 
     # --- VISOR Y PLAYBACK ---
     def load_file_in_viewer(self, item):
@@ -806,32 +1659,36 @@ class MainWindow(QMainWindow):
         self.raw_width, self.raw_height = 2840, 2200
 
         self.view_is_rgb = (pixel_fmt == "rgb")
-        
-        # 4. CALCULAR TAMAÑO REAL DEL FRAME (Stride Detection)
-        # Esto arregla el "efecto corrido"
-        bytes_per_pixel = 3 if self.view_is_rgb else 1.5
-        math_size = int(self.raw_width * self.raw_height * bytes_per_pixel)
+        self.view_is_qoi = (pixel_fmt == "qoi_rgb")
+        self.qoi_frame_index = None
         
         fsize = os.path.getsize(filepath)
-        
-        # Asumimos el tamaño matemático por defecto
-        self.bytes_per_frame = math_size
-        
-        # Pero si el archivo no cuadra perfecto, calculamos el real
-        if math_size > 0:
-            approx_frames = round(fsize / math_size)
-            if approx_frames > 0:
-                real_stride = fsize // approx_frames
-                
-                # Si hay una diferencia (padding), usamos el real
-                if real_stride != math_size:
-                    self.bytes_per_frame = real_stride
-                    print(f"INFO: Padding detectado. Math: {math_size} -> Real en disco: {self.bytes_per_frame}")
 
-        self.total_frames = fsize // self.bytes_per_frame if self.bytes_per_frame > 0 else 0
+        if self.view_is_qoi:
+            # QOI: Frames de tamaño variable, necesitamos indexar
+            print(f"LOG QOI VIEWER: Indexando frames QOI en {filename}...")
+            self.qoi_frame_index = qoi_utils.build_frame_index(filepath)
+            self.total_frames = len(self.qoi_frame_index)
+            self.bytes_per_frame = 0  # No aplica (variable)
+            print(f"LOG QOI VIEWER: {self.total_frames} frames indexados.")
+        else:
+            # Bayer o RGB: Tamaño fijo por frame
+            bytes_per_pixel = 3 if self.view_is_rgb else 1.5
+            math_size = int(self.raw_width * self.raw_height * bytes_per_pixel)
+            self.bytes_per_frame = math_size
+            
+            if math_size > 0:
+                approx_frames = round(fsize / math_size)
+                if approx_frames > 0:
+                    real_stride = fsize // approx_frames
+                    if real_stride != math_size:
+                        self.bytes_per_frame = real_stride
+                        print(f"INFO: Padding detectado. Math: {math_size} -> Real en disco: {self.bytes_per_frame}")
+
+            self.total_frames = fsize // self.bytes_per_frame if self.bytes_per_frame > 0 else 0
         
         # Info UI
-        mode_str = "RGB" if self.view_is_rgb else "RAW"
+        mode_str = "QOI_RGB" if self.view_is_qoi else ("RGB" if self.view_is_rgb else "RAW")
         self.lbl_frame_info.setText(f"{filename} | {self.total_frames}f | {roi_key} | {mode_str}")
         self.slider_frame.setRange(0, max(0, self.total_frames-1))
         
@@ -843,12 +1700,35 @@ class MainWindow(QMainWindow):
         # 1. Preparar lectura
         w, h = self.raw_width, self.raw_height
         is_rgb_view = getattr(self, 'view_is_rgb', False)
-        
-        # Cálculo de bytes seguro
-        frame_size = int(w * h * 3) if is_rgb_view else int(w * h * 1.5)
-        offset = idx * frame_size
+        is_qoi_view = getattr(self, 'view_is_qoi', False)
         
         try:
+            # --- LECTURA QOI (contenedor con headers de tamaño) ---
+            if is_qoi_view and self.qoi_frame_index:
+                if idx >= len(self.qoi_frame_index):
+                    return
+                offset, frame_size = self.qoi_frame_index[idx]
+                qoi_data = qoi_utils.read_frame_at(self.current_view_file, offset, frame_size)
+                arr = qoi_utils.decode_qoi(qoi_data, w, h)
+                
+                if fast:
+                    arr = cv2.resize(arr, None, fx=0.33, fy=0.33, interpolation=cv2.INTER_NEAREST)
+                
+                if not arr.flags['C_CONTIGUOUS']: arr = np.ascontiguousarray(arr)
+                h_out, w_out, _ = arr.shape
+                self._temp_img_ref = arr
+                qimg = QImage(arr.data, w_out, h_out, w_out*3, QImage.Format.Format_RGB888)
+                
+                pix = QPixmap.fromImage(qimg)
+                self.viewer_play.setPixmap(pix.scaled(self.viewer_play.size(), Qt.AspectRatioMode.KeepAspectRatio))
+                tag = "[FAST]" if fast else "[QOI]"
+                self.lbl_frame_info.setText(f"{idx}/{self.total_frames} {tag}")
+                return
+
+            # --- LECTURA ESTÁNDAR (Bayer / RGB) ---
+            frame_size = int(w * h * 3) if is_rgb_view else int(w * h * 1.5)
+            offset = idx * frame_size
+        
             with open(self.current_view_file, "rb") as f:
                 f.seek(offset)
                 data = f.read(frame_size)
@@ -932,26 +1812,7 @@ class MainWindow(QMainWindow):
                         rgb8 = np.dstack((r_8, g_8, b_8))
                         
                     else:
-                        # --- MODO CALIDAD (PAUSA) ---
-                        # 1. Desempaquetado completo
-                        arr_packed = np.frombuffer(data, dtype=np.uint8).reshape(-1, 3)
-                        b0 = arr_packed[:, 0].astype(np.uint16)
-                        b1 = arr_packed[:, 1].astype(np.uint16)
-                        b2 = arr_packed[:, 2].astype(np.uint16)
-                        p0 = b0 | ((b1 & 0x0F) << 8)
-                        p1 = (b1 >> 4) | (b2 << 4)
-                        
-                        img_flat = np.empty(w*h, dtype=np.uint16)
-                        img_flat[0::2] = p0; img_flat[1::2] = p1
-                        img_bayer = img_flat.reshape(h, w)
-
-                        # 2. Debayering y Pipeline Color Completo
-                        rgb16 = cv2.cvtColor(img_bayer, cv2.COLOR_BayerBG2RGB) # BG implica R en (0,0) con OpenCV
-                        
-                        # Gamma Precisa
-                        rgb_f = rgb16.astype(np.float32) / 4095.0
-                        rgb_gamma = np.power(rgb_f, 1.0/2.2) 
-                        rgb8 = np.clip(rgb_gamma * 255, 0, 255).astype(np.uint8)
+                        rgb8 = bayer_render.render_capture_view(data, w, h, downscale=1, to_bgr=False)
 
                     # QIMAGE (Común)
                     h_out, w_out, _ = rgb8.shape
@@ -1003,12 +1864,14 @@ class MainWindow(QMainWindow):
 
     # --- CÁMARA Y GRABACIÓN ---
     def init_camera_thread(self):
-        self.camera_worker = scanner_core.CameraWorker("1.0.txt")
-        # NO asignamos la cola todavía. Se asigna solo al grabar.
-        # self.camera_worker.set_queue(self.frame_queue) 
-        self.camera_worker.image_received.connect(self.update_display) # FIX: nombre correcto
+        mode = self._read_pixel_mode()
+        self.camera_worker = scanner_core.CameraWorker("1.0.txt", pixel_mode=mode)
+        self.camera_worker.image_received.connect(self.update_display)
+        self.camera_worker.exposure_stats_updated.connect(self.update_exposure_overlay)
         self.camera_worker.stats_updated.connect(self.update_stats)
         self.camera_worker.error_occurred.connect(self.on_camera_error)
+        self.camera_worker.camera_status_changed.connect(self.on_camera_status)
+        self.camera_worker.config_applied.connect(self.on_config_applied)
         self.camera_worker.start()
 
     def update_display(self, frame):
@@ -1052,147 +1915,201 @@ class MainWindow(QMainWindow):
         # ENVIAR AL VISOR
         self.viewer_scan.setPixmap(QPixmap.fromImage(qimg))
 
-    def _old_update_display_renamed(self, frame):
-        if self.tabs.currentIndex() != 0: return
-
-        # 1. DETECCIÓN Y CORRECCIÓN DE COLOR
-        is_color = (frame.ndim == 3)
-        
-        if is_color:
-            h, w, c = frame.shape
-            # El SDK de Lucid suele entregar BGR. Qt espera RGB.
-            # Hacemos el swap aquí para que los colores sean correctos (Rojo es Rojo, no Azul)
-            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            
-            # --- CORRECCIÓN VISUAL SIMPLE PARA BAYER ---
-            # Las imágenes Bayer RAW suelen verse verdosas si la cámara no hace WB interno.
-            # Si notas que se ve MUY verde, descomenta estas líneas para un WB automático simple:
-            # ---------------------------------------------------------
-            # avg_a = np.average(frame_rgb, axis=(0,1))
-            # max_avg = np.max(avg_a)
-            # if max_avg > 0:
-            #     gains = max_avg / avg_a
-            #     frame_rgb = np.clip(frame_rgb * gains, 0, 255).astype(np.uint8)
-            # ---------------------------------------------------------
-            
-            disp = frame_rgb
-            bytes_per_line = w * 3
+    def update_exposure_overlay(self, hi_pct, _lo_pct=None):
+        if hi_pct >= 95.0:
+            color = "#ff4444"
+        elif hi_pct >= 85.0:
+            color = "#ff8800"
         else:
-            h, w = frame.shape
-            disp = frame
-            bytes_per_line = w
+            color = "#66cc66"
+        self.viewer_scan.set_exposure_overlay(f"Hi {hi_pct:.0f}%", color)
 
-        self.viewer_scan.max_w = w
-        self.viewer_scan.max_h = h
-
-        # 2. LOGICA DE ZOOM (Sin cambios mayores, solo adaptada a color)
-        if self.btn_zoom_1to1.isChecked():
-            vw = self.viewer_scan.width(); vh = self.viewer_scan.height()
-            cw = min(vw, w); ch = min(vh, h)
-            self.viewer_scan.off_x = max(0, min(self.viewer_scan.off_x, w-cw))
-            self.viewer_scan.off_y = max(0, min(self.viewer_scan.off_y, h-ch))
-            sx, sy = int(self.viewer_scan.off_x), int(self.viewer_scan.off_y)
-            
-            if is_color:
-                disp_crop = disp[sy:sy+ch, sx:sx+cw, :].copy()
-            else:
-                disp_crop = disp[sy:sy+ch, sx:sx+cw].copy()
-            
-            h, w = ch, cw
-            if is_color: bytes_per_line = w * 3
-            else: bytes_per_line = w
-            
-            final_disp = disp_crop
-        else:
-            # Downscale para rendimiento si es muy grande
-            if w > 2000:
-                if is_color: final_disp = disp[::2, ::2, :].copy()
-                else: final_disp = disp[::2, ::2].copy()
-            else:
-                final_disp = disp.copy()
-            
-            h, w = final_disp.shape[:2]
-            if is_color: bytes_per_line = w * 3
-            else: bytes_per_line = w
-
-        # 3. CREAR QIMAGE
-        if is_color:
-            qimg = QImage(final_disp.data, w, h, bytes_per_line, QImage.Format.Format_RGB888)
-        else:
-            if final_disp.dtype == np.uint16: 
-                 final_disp = (final_disp >> 4).astype(np.uint8)
-            qimg = QImage(final_disp.data, w, h, bytes_per_line, QImage.Format.Format_Grayscale8)
-
-        # 4. PEAKING (Focus Assist)
-        pix = QPixmap.fromImage(qimg)
-        if self.btn_peaking.isChecked():
-            if is_color: gray_peak = cv2.cvtColor(final_disp, cv2.COLOR_RGB2GRAY)
-            else: gray_peak = final_disp
-            
-            lap = cv2.Laplacian(gray_peak, cv2.CV_16S, ksize=3)
-            _, mask = cv2.threshold(cv2.convertScaleAbs(lap), 40, 255, cv2.THRESH_BINARY)
-            
-            ov = QImage(w, h, QImage.Format.Format_ARGB32)
-            ov.fill(QColor(0,255,0,180))
-            ov.setAlphaChannel(QImage(mask.tobytes(), w, h, w, QImage.Format.Format_Alpha8))
-            
-            p = QPainter(pix)
-            p.drawImage(0,0,ov)
-            p.end()
-
-        # 5. ASIGNAR
-        if self.btn_zoom_1to1.isChecked(): 
-            self.viewer_scan.setPixmap(pix)
-        else: 
-            self.viewer_scan.setPixmap(pix.scaled(self.viewer_scan.size(), Qt.AspectRatioMode.KeepAspectRatio))
     def update_stats(self, fps, temp, qsize, cam_drops=0, disk_drops=0, total_cam=0, bw=0.0, bw_src="C"):
-        # Filtro visual para FPS (que no salte tanto)
-        self.lbl_fps.setText(f"FPS: {fps:.1f}")
-        self.lbl_temp.setText(f"Tmp: {temp:.1f}°")
-        self.lbl_buffer.setText(f"Buf: {qsize}")
-        
-        # --- CONTADORES ROBUSTOS ---
-        # 📷 Cam: Total recibido (R) | Perdido driver (D)
-        # 💾 Dsk: Total guardado (S) | Perdido cola llena (D) (Solo si graba)
-        
+        self._stats_cache = {
+            "fps": fps,
+            "temp": temp,
+            "qsize": qsize,
+            "cam_drops": cam_drops,
+            "disk_drops": disk_drops,
+            "total_cam": total_cam,
+            "bw": bw,
+            "bw_src": bw_src,
+        }
+        self._apply_stats_inline()
+
+    def _apply_stats_inline(self):
+        c = self._stats_cache
+        fps = c.get("fps", 0.0)
+        temp = c.get("temp", 0.0)
+        qsize = c.get("qsize", 0)
+        cam_drops = c.get("cam_drops", 0)
+        disk_drops = c.get("disk_drops", 0)
+        total_cam = c.get("total_cam", 0)
+        bw = c.get("bw", 0.0)
+        bw_src = c.get("bw_src", "C")
         txt_cam = f"📷 R:{total_cam} D:{cam_drops}"
-        
+        parts = [f"FPS: {fps:.1f}", f"Tmp: {temp:.1f}°", f"Buf: {qsize}"]
         if self.is_recording and self.writer_worker:
             curr_saved = self.writer_worker.frames_saved
-            txt_dsk = f"💾 S:{curr_saved} D:{disk_drops}"
-            # Mostrar AMBOS
-            self.lbl_dropped.setText(f"{txt_cam}   {txt_dsk}")
-            
-            # Alerta drop disco
+            parts.append(f"💾 S:{curr_saved} D:{disk_drops}")
+        parts.append(f"BW({bw_src}): {int(bw)} Mbps")
+        parts.append(txt_cam)
+        self.lbl_stats_inline.setText("  ·  ".join(parts))
+        base = "font-size: 9pt; margin-left: 4px;"
+        if self.is_recording and self.writer_worker:
             if cam_drops > 0 or disk_drops > 0:
-                 self.lbl_dropped.setStyleSheet("color: red; font-weight: bold; font-size: 10pt; margin-left: 10px;")
+                self.lbl_stats_inline.setStyleSheet(base + " color: red; font-weight: bold;")
             else:
-                 self.lbl_dropped.setStyleSheet("color: #4caf50; font-size: 10pt; margin-left: 10px;")
+                self.lbl_stats_inline.setStyleSheet(base + " color: #4caf50;")
         else:
-            # SOLO CÁMARA (Preview)
-            # Ignoramos disk_drops espurios en preview (deberían ser 0, pero por si acaso)
-            self.lbl_dropped.setText(txt_cam)
-            
             if cam_drops > 0:
-                 self.lbl_dropped.setStyleSheet("color: red; font-weight: bold; font-size: 10pt; margin-left: 10px;")
+                self.lbl_stats_inline.setStyleSheet(base + " color: red; font-weight: bold;")
             else:
-                 self.lbl_dropped.setStyleSheet("color: #0078d7; font-size: 10pt; margin-left: 10px;") # Azul para preview normal
+                self.lbl_stats_inline.setStyleSheet(base + " color: #888;")
 
-        self.lbl_bw.setText(f"BW({bw_src}): {int(bw)} Mbps")
+    def open_camera_calibration_dialog(self):
+        if self.is_recording:
+            QMessageBox.information(
+                self, "Grabando",
+                "Detén la grabación antes de abrir la calibración de cámara.")
+            return
+        if not self.camera_worker or not self._camera_connected:
+            QMessageBox.warning(self, "Sin cámara", "No hay cámara conectada.")
+            return
+        if self._calibration_dialog is not None:
+            self._calibration_dialog.raise_()
+            self._calibration_dialog.activateWindow()
+            return
+        dlg = CameraCalibrationDialog(self)
+        self._calibration_dialog = dlg
+        dlg.finished.connect(self._on_calibration_dialog_closed)
+        self._update_calibrate_camera_btn()
+        dlg.show()
 
-        # Limpieza de duplicados
-        if self.writer_worker:
-             self.lbl_saved.setText("")
+    def _on_calibration_dialog_closed(self, _result):
+        self._calibration_dialog = None
+        self._update_calibrate_camera_btn()
 
-        
-        if self.writer_worker:
-            self.lbl_saved.setText(f"Sav: {self.writer_worker.frames_saved}")
+    def _update_calibrate_camera_btn(self):
+        if not hasattr(self, "btn_calibrate_camera"):
+            return
+        self.btn_calibrate_camera.setEnabled(
+            self._camera_connected and not self.is_recording and self._calibration_dialog is None)
+        if hasattr(self, "btn_timer0"):
+            self.btn_timer0.setEnabled(
+                self._camera_connected and not self.is_recording and self._timer_dialog is None
+            )
+
+    def open_timer_dialog(self):
+        if self.is_recording:
+            QMessageBox.information(
+                self, "Grabando",
+                "Detén la grabación antes de ajustar Timer0.")
+            return
+        if not self.camera_worker or not self._camera_connected:
+            QMessageBox.warning(self, "Sin cámara", "No hay cámara conectada.")
+            return
+        if self._timer_dialog is not None:
+            self._timer_dialog.raise_()
+            self._timer_dialog.activateWindow()
+            return
+        dlg = CameraTimerDialog(self)
+        self._timer_dialog = dlg
+        dlg.finished.connect(self._on_timer_dialog_closed)
+        self._update_calibrate_camera_btn()
+        dlg.show()
+
+    def _on_timer_dialog_closed(self, _result):
+        self._timer_dialog = None
+        self._update_calibrate_camera_btn()
 
     def on_camera_error(self, e): QMessageBox.critical(self, "Cam Error", e)
 
-    # on_format_changed eliminado
+    def on_camera_status(self, connected):
+        was_connected = self._camera_connected
+        self._camera_connected = connected
+        if connected:
+            self.lbl_cam_status.setText("●")
+            self.lbl_cam_status.setStyleSheet("color: #4caf50; font-size: 14pt; margin-right: 4px;")
+            self.lbl_cam_status.setToolTip("Cámara conectada")
+            if not was_connected:
+                self._pending_config_toast = True
+                self.show_toast("Cámara conectada", 2500)
+            if self.active_collection and not self.is_recording:
+                self.btn_record.setEnabled(True)
+                self.btn_record.setText("INICIAR CAPTURA")
+                self.btn_record.setStyleSheet("background-color: #0078d7; font-size: 14pt; color: white;")
+        else:
+            self.lbl_cam_status.setText("●")
+            self.lbl_cam_status.setStyleSheet("color: #f44336; font-size: 14pt; margin-right: 4px;")
+            self.lbl_cam_status.setToolTip("Cámara no detectada — reintentando…")
+            self._pending_config_toast = False
+            if was_connected:
+                self.show_toast("Cámara desconectada — reintentando…", 3500)
+            if not self.is_recording:
+                self.btn_record.setEnabled(False)
+                self.btn_record.setText("SIN CÁMARA")
+        self._update_calibrate_camera_btn()
 
-    # --- NUEVOS CONTROLADORES DE VISTA ---
+    def on_config_applied(self):
+        if self._pending_config_toast:
+            self._pending_config_toast = False
+            QTimer.singleShot(600, lambda: self.show_toast("Configuración de cámara aplicada", 3000))
+        self._apply_persist_to_camera()
+
+    def on_exposure_slider_changed(self, idx):
+        val = self.EXP_STEPS[idx]
+        self.exposure_value = val
+        short_mode = (idx == self.SHORT_EXP_IDX)
+
+        # --- Actualizar UI de inmediato (sin esperar a la cámara) ---
+        if short_mode:
+            self.lbl_exp_val.setText("SHORT")
+            self.lbl_exp_val.setStyleSheet("font-weight: bold; color: #ff9800; font-size: 9pt;")
+            self.sld_exposure.setToolTip("⚠ SHORT EXPOSURE (~2.3 µs) — ShortExposureEnable activo")
+        else:
+            self.lbl_exp_val.setText(f"{val}")
+            self.lbl_exp_val.setStyleSheet("font-weight: bold; color: #0078d7; font-size: 10pt;")
+            self.sld_exposure.setToolTip(f"{val} µs — paso 2.5 µs (modo normal)")
+
+        # --- Encolar comando a la cámara con debounce ---
+        # Solo se envía el comando 120ms después del último cambio,
+        # evitando saturar la cámara al arrastrar el slider rápido
+        self._pending_exp_short = short_mode
+        self._pending_exp_val = val
+        self._exp_debounce.start()
+        self.schedule_save_config()
+
+    def _apply_exposure_to_camera(self):
+        """Llamado por el debounce timer; envía el último valor a la cámara."""
+        if self.camera_worker:
+            self.camera_worker.set_exposure_config(
+                self._pending_exp_short, self._pending_exp_val)
+
+    def step_exposure(self, delta):
+        """Mueve el slider un paso (botones ◀/▶)."""
+        cur = self.sld_exposure.value()
+        self.sld_exposure.setValue(max(0, min(len(self.EXP_STEPS) - 1, cur + delta)))
+
+    def _read_pixel_mode(self):
+        ui = getattr(self, "_persist", {}).get("ui", {})
+        return ui.get("pixel_mode", "bayer")
+
+    def on_pixel_mode_change(self, index):
+        mode = "qoi_rgb" if index == 1 else "bayer"
+        self._persist.setdefault("ui", {})["pixel_mode"] = mode
+        self.schedule_save_config()
+        if getattr(self, "_applying_persist", False):
+            return
+        if self.camera_worker:
+            self.camera_worker.stop()
+            self.camera_worker.wait()
+        self._camera_connected = False
+        self.lbl_cam_status.setStyleSheet("color: #ff9800; font-size: 14pt; margin-right: 4px;")
+        self.lbl_cam_status.setToolTip("Reconectando cámara...")
+        self.start_camera_thread()
+
+    # --- CONTROLADORES DE VISTA ---
     
     def toggle_zoom_1to1(self, checked):
         # Mutual exclusion
@@ -1208,6 +2125,7 @@ class MainWindow(QMainWindow):
         # Style self
         self.btn_zoom_1to1.setStyleSheet("background:red" if checked else "")
         self.viewer_scan.update()
+        self.schedule_save_config()
 
     def toggle_corners(self, checked):
         # Mutual exclusion
@@ -1222,50 +2140,46 @@ class MainWindow(QMainWindow):
         # Style self
         self.btn_corners.setStyleSheet("background:red" if checked else "")
         self.viewer_scan.update()
+        self.schedule_save_config()
 
-    def toggle_bw_preview(self, checked):
+    def on_preview_mode_changed(self, label):
+        mode_map = {
+            "ISP": "isp", "ISP Full": "isp_full", "HQ": "hq",
+            "HQ½": "hq_half", "RAW": "raw", "B/W": "bw",
+        }
+        mode = mode_map.get(label, "isp")
         if self.camera_worker:
-            self.camera_worker.set_preview_bw(checked)
-        self.btn_bw_prev.setStyleSheet("background:red" if checked else "")
-    
+            self.camera_worker.set_preview_mode(mode)
+        self.schedule_save_config()
+
     def toggle_real_fps(self, checked):
         if self.camera_worker:
             #checked = TRUE -> Real FPS -> Skip Frames = FALSE
             self.camera_worker.set_preview_skip_frames(not checked)
         self.btn_real_fps.setStyleSheet("background:red" if checked else "")
+        self.schedule_save_config()
 
-    def on_exposure_change(self, v):
-        # Forzar pasos de 10
-        step = 10
-        val = int(round(v / step) * step)
-        if val != v:
-            self.sl_exp.setValue(val)
-            return
-            
-        self.lbl_exp_val.setText(str(val))
-        if self.camera_worker: 
-            self.camera_worker.update_exposure(val)
 
-    def toggle_peaking(self, c): 
-        self.btn_peaking.setStyleSheet("background:red" if c else "")
+    def toggle_peaking(self, checked):
+        self.btn_peaking.setStyleSheet("background:red" if checked else "")
+        self._apply_preview_gamma_for_peaking()
+        self.schedule_save_config()
     
     # toggle_zoom y toggle_zoom_state eliminados/reemplazados por toggle_zoom_1to1
 
 
     def toggle_recording(self):
         if not self.is_recording:
-            # --- INICIAR GRABACIÓN ---
             if not self.active_collection:
                 QMessageBox.warning(self, "Error", "Selecciona una colección primero.")
-                # Assuming btn_record is a QPushButton, not a QCheckBox, so no setChecked(False)
+                return
+            if not self._camera_connected:
+                QMessageBox.warning(self, "Sin cámara", "No hay cámara conectada. Espera a que se detecte.")
                 return
 
             if self.camera_worker:
-                 # FIX: Limpiar frames viejos del buffer antes de empezar
                  self.camera_worker.clear_queue()
-                 self.camera_worker.reset_drop_count() 
-                 
-                 # Conectar la queue real SOLO AHORA (antes era None)
+                 self.camera_worker.reset_drop_count()
                  self.camera_worker.set_queue(self.frame_queue)
             
             # --- INICIAR GRABACIÓN ---
@@ -1275,14 +2189,28 @@ class MainWindow(QMainWindow):
             # 1. (Ya no se aplica ROI formato porque es fijo)
             
             # 2. Obtener nombres y workers
-            fn, fp = self.manager.get_next_filename(self.active_collection)
+            try:
+                fn, fp = self.manager.get_next_filename(self.active_collection)
+            except ValueError as e:
+                if self.camera_worker:
+                    self.camera_worker.set_queue(None)
+                QMessageBox.warning(self, "Nombre de archivo", str(e))
+                return
             self.writer_worker = scanner_core.WriterWorker(self.frame_queue, fp)
-            self.writer_worker.frames_saved_signal.connect(lambda x: self.lbl_saved.setText(f"G: {x}"))
+            self.writer_worker.frames_saved_signal.connect(lambda _: self._apply_stats_inline())
             self.writer_worker.start()
             
             # 3. --- GUARDADO DE METADATA (LO IMPORTANTE) ---
             # Obtenemos el modo de pixel actual del worker (o 'bayer' por defecto)
             pixel_mode = getattr(self.camera_worker, "pixel_mode", "bayer")
+
+            # Mapeamos a un descriptor de formato de archivo:
+            # - "bayer"   -> guardamos RAW Bayer 12-bit empaquetado  -> pixel_format = "bayer"
+            # - "qoi_rgb" -> guardamos RGB8 procesado por Arena SDK  -> pixel_format = "rgb"
+            if pixel_mode == "qoi_rgb":
+                pixel_format = "rgb"
+            else:
+                pixel_format = pixel_mode
             
             # Guardamos todo explícitamente usando argumentos con nombre (kwargs)
             self.manager.set_file_info(
@@ -1291,21 +2219,29 @@ class MainWindow(QMainWindow):
                 fps=self.sb_fps.value(),
                 roi_key="Standard 2840x2200", # Valor fijo
                 film_type=ftype,
-                pixel_format=pixel_mode
+                pixel_format=pixel_format
             )
             # -----------------------------------------------
 
             self.is_recording = True
             self.btn_record.setText(f"DETENER ({fn})")
             self.btn_record.setStyleSheet("background:red;color:white;font-weight:bold")
-            # self.combo_format.setEnabled(False) # Eliminado
             self.combo_type.setEnabled(False)
-            
+            self.combo_pixel_mode.setEnabled(False)
+
         else:
+            reply = QMessageBox.question(
+                self,
+                "Detener grabación",
+                "¿Detener la grabación en curso?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if reply != QMessageBox.StandardButton.Yes:
+                return
             # --- DETENER GRABACIÓN ---
             self.is_recording = False
-            if self.camera_worker:  
-                 # Desconectar queue para que los nuevos frames se descarten (no se acumulen)
+            if self.camera_worker:
                  self.camera_worker.set_queue(None)
                  self.camera_worker.reset_drop_count()
 
@@ -1314,9 +2250,12 @@ class MainWindow(QMainWindow):
                 self.writer_worker = None
             self.btn_record.setText("GRABAR")
             self.btn_record.setStyleSheet("")
-            # self.combo_format.setEnabled(True) # Eliminado
             self.combo_type.setEnabled(True)
+            self.combo_pixel_mode.setEnabled(True)
             self.refresh_file_list(self.active_collection)
+
+        self._apply_stats_inline()
+        self._update_calibrate_camera_btn()
 
     # --- EXPORTACIÓN ---
     def export_tif(self):
@@ -1324,12 +2263,18 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Error", "Carga un archivo en el visor primero.")
             return
 
-        # --- CORRECCIÓN ---
-        # Enviamos la ruta del ARCHIVO exacta, no la carpeta padre.
-        # Así l2t.py solo procesará este archivo.
         target_input = Path(self.current_view_file)
-        
-        # 1. Configurar Diálogo de Progreso (MODAL)
+        coll = target_input.parent.name
+        coll_meta = self.manager.load_metadata(coll)
+        confirm_dlg = ExportConfirmDialog(
+            self, [target_input.name], self.root_folder, coll, coll_meta, "tif",
+        )
+        if not confirm_dlg.exec():
+            return
+        settings = confirm_dlg.get_all_settings().get(
+            target_input.name, default_settings_for_file(target_input.name, coll_meta, "tif"),
+        )
+
         self.pd_tif = QProgressDialog(f"Procesando {target_input.name}...", "Cancelar", 0, 100, self)
         self.pd_tif.setWindowTitle("Exportando Secuencia TIF")
         self.pd_tif.setWindowModality(Qt.WindowModality.ApplicationModal) 
@@ -1338,7 +2283,10 @@ class MainWindow(QMainWindow):
         self.pd_tif.show()
 
         # 2. Configurar Worker
-        cmd = [sys.executable, "l2t.py", str(target_input)]
+        cmd = [
+            sys.executable, "l2t.py", str(target_input),
+            "--output-dir", settings["output_name"],
+        ]
         
         self.tif_worker = UniversalExportWorker(cmd)
         
@@ -1348,11 +2296,11 @@ class MainWindow(QMainWindow):
         self.tif_worker.finished_signal.connect(self.on_tif_finished)
         self.pd_tif.canceled.connect(self.on_tif_cancelled)
         
-        # Guardar ruta de salida para posible borrado (Carpeta con el mismo nombre del archivo sin ext)
-        self.current_tif_output = target_input.parent / target_input.stem
+        self.current_tif_output = target_input.parent / settings["output_name"]
         
         # 4. Iniciar
         self.tif_worker.start()
+        self._sync_execution_state()
 
     def on_tif_cancelled(self):
         if self.tif_worker: self.tif_worker.kill()
@@ -1366,6 +2314,7 @@ class MainWindow(QMainWindow):
             except Exception as e:
                 QMessageBox.warning(self, "Error", f"No se pudo borrar: {e}")
         self.pd_tif.close()
+        self._sync_execution_state()
 
     def on_tif_finished(self, success, msg):
         try: self.pd_tif.canceled.disconnect(self.on_tif_cancelled)
@@ -1377,6 +2326,8 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "Listo", f"Exportación finalizada.\n{msg}")
         else:
             QMessageBox.critical(self, "Error", f"Fallo en l2t:\n{msg}")
+        self._sync_execution_state()
+
     def open_batch_export_window(self):
         # 1. Determinar qué colección usar
         # Prioridad: Colección Activa (Grabación) -> Colección Seleccionada (Visual)
@@ -1399,32 +2350,43 @@ class MainWindow(QMainWindow):
 
         files = [self.file_list.item(x).text() for x in range(self.file_list.count())]
         
-        # 3. Abrir Diálogo
-        # Pasamos target_collection en vez de self.active_collection
-        dlg = BatchExportDialog(self, files, self.root_folder, target_collection)
+        # 3. Abrir Diálogo (con metadata para detectar formato de captura)
+        coll_meta = self.manager.load_metadata(target_collection)
+        dlg = BatchExportDialog(self, files, self.root_folder, target_collection, coll_meta)
         
         if dlg.exec():
             sel, fmt, sharp = dlg.get_selection()
-            if not sel: return
-            
+            if not sel:
+                return
+
+            export_settings = {}
+            if fmt != "dng":
+                confirm_dlg = ExportConfirmDialog(
+                    self, sel, self.root_folder, target_collection, coll_meta, fmt,
+                )
+                if not confirm_dlg.exec():
+                    return
+                export_settings = confirm_dlg.get_all_settings()
+
             for f in sel:
-                # Usamos target_collection aquí también para construir la ruta correcta
                 path = Path(self.root_folder) / target_collection / f
-                self.export_queue.append((path, fmt, sharp))
-            
-            QMessageBox.information(self, "Cola", f"{len(sel)} archivos añadidos a la cola.")
-            
-            if not self.is_exporting_batch: 
+                settings = export_settings.get(
+                    f, default_settings_for_file(f, coll_meta, fmt),
+                ) if fmt != "dng" else None
+                self.export_queue.append((path, fmt, sharp, settings))
+
+            if not self.is_exporting_batch:
                 self.process_export_queue()
 
     def process_export_queue(self):
         if not self.export_queue:
             self.is_exporting_batch = False
+            self._sync_execution_state()
             QMessageBox.information(self, "Fin", "Cola terminada.")
             return
 
         self.is_exporting_batch = True
-        nf, fmt, sharp = self.export_queue.pop(0)
+        nf, fmt, sharp, settings = self.export_queue.pop(0)
         
         # --- CORRECCIÓN CRÍTICA ---
         # No usamos self.active_collection porque puede ser None.
@@ -1438,9 +2400,23 @@ class MainWindow(QMainWindow):
         
         # Determinar modo BW/COLOR
         mode = "BW" if "Blanco" in info.get("type", "Color") else "COLOR"
-        fps = info.get("fps", 18)
+        fps = int((settings or {}).get("fps", info.get("fps", 18)))
+        output_name = (settings or {}).get("output_name")
+        pixel_fmt = info.get("pixel_format", "bayer")
+
+        # Si el usuario pidió DNG pero el archivo es RGB procesado (no Bayer),
+        # cambiamos silenciosamente a TIFF sequence (fiel al ISP) y avisamos una vez.
+        effective_fmt = fmt
+        if fmt == "dng" and pixel_fmt in ("rgb", "qoi_rgb"):
+            effective_fmt = "tiff_seq"
+            QMessageBox.information(
+                self,
+                "Aviso de formato",
+                f"\"{nf.name}\" fue capturado en RGB procesado por la cámara.\n"
+                f"No es posible exportarlo como DNG RAW, se usará TIFF 8-bit Sequence en su lugar."
+            )
         
-        print(f"Procesando: {nf.name} | Colección: {collection_name} | Modo: {mode}")
+        print(f"Procesando: {nf.name} | Colección: {collection_name} | Modo: {mode} | pixel_fmt={pixel_fmt} | codec={effective_fmt}")
         
         self.pd = QProgressDialog(f"Exportando {nf.name}...", "Cancelar", 0, 100, self)
         self.pd.setWindowModality(Qt.WindowModality.ApplicationModal)
@@ -1449,22 +2425,25 @@ class MainWindow(QMainWindow):
         self.pd.show()
         
         cmd = [
-            sys.executable, "raw2video.py", str(nf), 
-            "--codec", fmt, 
-            "--fps", str(fps), 
-            "--sharp", sharp, 
-            "--mode", mode
+            sys.executable, "raw2video.py", str(nf),
+            "--codec", effective_fmt,
+            "--fps", str(fps),
+            "--sharp", sharp,
+            "--mode", mode,
         ]
-        
-        # Pre-calcular ruta de salida para posible borrado
-        if fmt == 'dng':
-            # DNG crea una CARPETA
+        if output_name:
+            cmd.extend(["--output", output_name])
+
+        if output_name:
+            self.current_video_output = nf.parent / output_name
+        elif effective_fmt == 'dng':
             self.current_video_output = nf.parent / f"{nf.stem}_DNG_SEQ"
+        elif effective_fmt == 'tiff_seq':
+            self.current_video_output = nf.parent / f"{nf.stem}_TIFF_SEQ"
         else:
-            # Video crea un ARCHIVO
-            ext_map = {'prores': '.mov', 'ffv1': '.mkv', 'h264': '.mp4', 'hevc': '.mp4', 'cineform': '.mov'}
-            ext = ext_map.get(fmt, ".mp4")
-            self.current_video_output = nf.parent / f"{nf.stem}_{fmt}{ext}"
+            ext_map = {'prores': '.mov', 'prores_hq': '.mov', 'ffv1': '.mkv', 'h264': '.mp4', 'hevc': '.mp4', 'cineform': '.mov'}
+            ext = ext_map.get(effective_fmt, ".mp4")
+            self.current_video_output = nf.parent / f"{nf.stem}_{effective_fmt}{ext}"
         
         self.worker = UniversalExportWorker(cmd)
         self.worker.progress_signal.connect(self.pd.setValue)
@@ -1472,6 +2451,7 @@ class MainWindow(QMainWindow):
         self.worker.finished_signal.connect(self.on_batch_item_finished)
         self.pd.canceled.connect(self.on_batch_cancel)
         self.worker.start()
+        self._sync_execution_state()
 
     def on_batch_cancel(self):
         self.export_queue = [] # Detener resto de la cola
@@ -1491,6 +2471,7 @@ class MainWindow(QMainWindow):
             except Exception as e:
                 QMessageBox.warning(self, "Error", f"No se pudo borrar: {e}")
         self.pd.close()
+        self._sync_execution_state()
 
     def on_batch_item_finished(self, s, m):
         try: self.pd.canceled.disconnect(self.on_batch_cancel)
@@ -1502,25 +2483,117 @@ class MainWindow(QMainWindow):
              self.process_export_queue() # Siguiente
 
     def open_file_context_menu(self, pos):
-        if not self.file_list.itemAt(pos): return
-        menu = QMenu()
-        act = QAction("Borrar", self); act.triggered.connect(self.delete_selected_file)
-        menu.addAction(act); menu.exec(self.file_list.mapToGlobal(pos))
+        it = self.file_list.itemAt(pos)
+        if not it:
+            return
+        self.file_list.setCurrentItem(it)
+        menu = QMenu(self)
+        act_rn = QAction("Cambiar nombre…", self)
+        act_rn.triggered.connect(self.rename_selected_raw_file)
+        menu.addAction(act_rn)
+        act_mv = QAction("Cambiar de colección…", self)
+        act_mv.triggered.connect(self.move_selected_raw_file)
+        menu.addAction(act_mv)
+        menu.addSeparator()
+        act_del = QAction("Borrar", self)
+        act_del.triggered.connect(self.delete_selected_file)
+        menu.addAction(act_del)
+        menu.exec(self.file_list.mapToGlobal(pos))
+
+    def rename_selected_raw_file(self):
+        coll = self._collection_for_file_panel()
+        it = self.file_list.currentItem()
+        if not coll or not it:
+            QMessageBox.warning(self, "Selección", "Selecciona una colección y un archivo.")
+            return
+        old = it.text()
+        new_name, ok = QInputDialog.getText(
+            self, "Cambiar nombre", "Nuevo nombre (debe ser único y terminar en .raw):",
+            text=old)
+        if not ok or not new_name.strip():
+            return
+        new_name = new_name.strip()
+        if new_name == old:
+            return
+        if not self.manager.rename_file(coll, old, new_name):
+            QMessageBox.warning(
+                self, "Error",
+                "No se pudo renombrar: compruebe que el nombre no exista ya y que sea válido.")
+            return
+        self._refresh_viewer_path_after_file_rename(coll, old, new_name)
+        self.refresh_file_list(coll)
+
+    def move_selected_raw_file(self):
+        coll = self._collection_for_file_panel()
+        it = self.file_list.currentItem()
+        if not coll or not it:
+            QMessageBox.warning(self, "Selección", "Selecciona una colección y un archivo.")
+            return
+        fn = it.text()
+        others = [c for c in self.manager.get_collections() if c != coll]
+        if not others:
+            QMessageBox.information(self, "Mover", "No hay otra colección de destino.")
+            return
+        dst, ok = QInputDialog.getItem(
+            self, "Cambiar de colección",
+            f"Mover «{fn}» a la colección:", others, 0, False)
+        if not ok:
+            return
+        if not self.manager.move_file_to_collection(coll, dst, fn):
+            QMessageBox.warning(
+                self, "Error",
+                "No se pudo mover (¿ya existe un archivo con el mismo nombre en destino?).")
+            return
+        self._refresh_viewer_path_after_file_move(coll, dst, fn)
+        self.refresh_file_list(coll)
+
+    def _refresh_viewer_path_after_file_rename(self, coll, old_name, new_name):
+        if not getattr(self, "current_view_file", None):
+            return
+        p = Path(self.current_view_file)
+        if p.parent.name == coll and p.name == old_name:
+            self.current_view_file = str(p.parent / new_name)
+            fi = self.lbl_frame_info.text()
+            if old_name in fi:
+                self.lbl_frame_info.setText(fi.replace(old_name, new_name, 1))
+
+    def _refresh_viewer_path_after_file_move(self, src_coll, dst_coll, fname):
+        if not getattr(self, "current_view_file", None):
+            return
+        p = Path(self.current_view_file)
+        if p.parent.name == src_coll and p.name == fname:
+            self.current_view_file = str(Path(self.root_folder) / dst_coll / fname)
 
     def delete_selected_file(self):
         it = self.file_list.currentItem()
-        if it and self.active_collection:
-            if QMessageBox.question(self, "Borrar", f"¿Borrar {it.text()}?", QMessageBox.StandardButton.Yes|QMessageBox.StandardButton.No) == QMessageBox.StandardButton.Yes:
-                self.manager.delete_file(self.active_collection, it.text())
-                if hasattr(self, 'current_view_file') and Path(self.current_view_file).name == it.text():
-                    self.viewer_play.clear(); self.play_timer.stop()
-                self.refresh_file_list(self.active_collection)
+        coll = self._collection_for_file_panel()
+        if not it or not coll:
+            return
+        if QMessageBox.question(
+                self, "Borrar", f"¿Borrar {it.text()}?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+        ) != QMessageBox.StandardButton.Yes:
+            return
+        self.manager.delete_file(coll, it.text())
+        if hasattr(self, "current_view_file") and self.current_view_file:
+            cp = Path(self.current_view_file)
+            if cp.parent.name == coll and cp.name == it.text():
+                self.viewer_play.clear()
+                self.play_timer.stop()
+        self.refresh_file_list(coll)
 
     def update_disk_space(self):
         try: self.lbl_disk.setText(f"Libre: {shutil.disk_usage(self.root_folder).free // 2**30} GB")
         except: pass
     
     def closeEvent(self, e):
+        if self.is_recording:
+            e.ignore()
+            self.show_toast("Captura en curso — detén la grabación antes de cerrar", 3500)
+            return
+        self.save_config()
+        _windows_set_execution_state(False, False)
+        self._execution_state_key = None
         if self.camera_worker: self.camera_worker.stop()
         if self.writer_worker: self.writer_worker.stop()
         e.accept()
@@ -1630,7 +2703,8 @@ class UniversalExportWorker(QThread):
 if __name__ == "__main__":
     app = QApplication(sys.argv)
     app.setStyle("Fusion")
-    
+    app.aboutToQuit.connect(lambda: _windows_set_execution_state(False, False))
+
     # Crear y mostrar Splash
     splash = IntroSplash()
     splash.start_loading()

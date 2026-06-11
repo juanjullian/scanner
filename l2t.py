@@ -7,6 +7,75 @@ import cv2
 import argparse
 from pathlib import Path
 from multiprocessing import Pool, cpu_count, freeze_support
+import qoi_utils
+
+L2T_DEFAULT_GAMMA = 2.2
+
+
+def process_qoi_frame_task(args):
+    """Procesa un frame QOI: decodifica y guarda como TIFF 8-bit (fiel al ISP)."""
+    f_path, offset, frame_size, w, h, out_path, mode = args
+    try:
+        qoi_data = qoi_utils.read_frame_at(str(f_path), offset, frame_size)
+        img = qoi_utils.decode_qoi(qoi_data, w, h)  # (H, W, 3) uint8
+        if mode == "BW":
+            gray = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
+            img = cv2.merge((gray, gray, gray))
+        imageio.imwrite(str(out_path), img)
+        return None
+    except Exception as e:
+        return f"Err QOI: {e}"
+
+
+def process_frame_task(args):
+    f_path, offset, math_size, w, h, out_path, mode, sharp_profile, is_rgb = args
+
+    try:
+        with open(f_path, 'rb') as f:
+            f.seek(offset)
+            raw_data = f.read(math_size)
+
+        if len(raw_data) == 0:
+            return "Vacío"
+
+        if is_rgb:
+            rgb = np.frombuffer(raw_data, dtype=np.uint8).reshape(h, w, 3)
+            img_f = rgb.astype(np.float32) / 255.0
+        else:
+            img_raw = unpack_12bit_packed_manual(raw_data, w, h)
+            rgb16 = cv2.cvtColor(img_raw, cv2.COLOR_BayerBG2RGB)
+            img_f = rgb16.astype(np.float32) / 4095.0
+            img_f = np.power(np.clip(img_f, 0, 1), 1.0 / L2T_DEFAULT_GAMMA)
+
+        try:
+            sigma, amount = map(float, sharp_profile.split(","))
+        except (TypeError, ValueError):
+            sigma, amount = 0, 0
+
+        if mode == "BW":
+            if len(img_f.shape) == 3:
+                gray = cv2.cvtColor(img_f, cv2.COLOR_RGB2GRAY)
+            else:
+                gray = img_f
+            if sigma > 0:
+                blur = cv2.GaussianBlur(gray, (0, 0), sigma)
+                gray = gray + (gray - blur) * amount
+            gray = np.clip(gray, 0, 1)
+            final_img = cv2.merge((gray, gray, gray))
+        else:
+            lab = cv2.cvtColor(img_f, cv2.COLOR_RGB2Lab)
+            l, a, b = cv2.split(lab)
+            if sigma > 0:
+                blur = cv2.GaussianBlur(l, (0, 0), sigma)
+                l = l + (l - blur) * amount
+            final_img = cv2.cvtColor(cv2.merge((l, a, b)), cv2.COLOR_Lab2RGB)
+
+        imageio.imwrite(out_path, (np.clip(final_img, 0, 1) * 65535).astype(np.uint16))
+        return None
+
+    except Exception as e:
+        return f"Err: {e}"
+
 
 # --- CONFIGURACIÓN DE RESOLUCIONES ---
 FORMAT_ROIS_LOOKUP = {
@@ -23,15 +92,15 @@ def get_format_params(file_path):
     1. Dimensions (w, h)
     2. MATH_SIZE: Lo que pesan los píxeles reales (sin basura).
     3. REAL_STRIDE: Cuánto espacio ocupa cada frame en el disco (con basura).
+    4. is_rgb, is_qoi: flags de formato
     """
     fsize = file_path.stat().st_size
     name = file_path.name
     
-    # Defaults
     w, h = 2840, 2200
     is_rgb = False
+    is_qoi = False
     
-    # 1. Intentar Metadata (Siempre es lo más seguro)
     meta_path = file_path.parent / "metadata.json"
     if meta_path.exists():
         try:
@@ -40,24 +109,25 @@ def get_format_params(file_path):
                 info = data.get(name, {})
                 roi = info.get("roi_key")
                 if roi in FORMAT_ROIS_LOOKUP: w, h = FORMAT_ROIS_LOOKUP[roi]
-                if info.get("pixel_format") == "rgb": is_rgb = True
+                pf = info.get("pixel_format", "bayer")
+                if pf == "rgb": is_rgb = True
+                elif pf == "qoi_rgb": is_qoi = True
         except: pass
 
-    # 2. Calcular Tamaños Matemáticos
-    if is_rgb:
+    if is_qoi:
+        math_size = 0
+        real_stride = 0
+        approx_frames = 0
+    elif is_rgb:
         math_size = int(w * h * 3)
+        approx_frames = max(1, round(fsize / math_size))
+        real_stride = fsize // approx_frames
     else:
         math_size = int(w * h * 1.5)
-        
-    # 3. Calcular Stride Real (Bytes por frame en disco)
-    # Dividimos el tamaño del archivo por el tamaño matemático para estimar frames
-    approx_frames = max(1, round(fsize / math_size))
+        approx_frames = max(1, round(fsize / math_size))
+        real_stride = fsize // approx_frames
     
-    # El stride real es el tamaño total dividido por la cantidad de frames
-    # Esto absorbe cualquier padding oculto al final de cada frame
-    real_stride = fsize // approx_frames
-    
-    return w, h, math_size, real_stride, approx_frames, is_rgb
+    return w, h, math_size, real_stride, approx_frames, is_rgb, is_qoi
 
 def unpack_12bit_packed_manual(raw_bytes, width, height):
     """ Desempaqueta Bayer 12-bit Packed a 16-bit """
@@ -86,60 +156,6 @@ def unpack_12bit_packed_manual(raw_bytes, width, height):
     
     return img_flat.reshape(height, width)
 
-def process_frame_task(args):
-    # args: f_path, offset, math_size, w, h, out_path, mode, sharp, is_rgb
-    f_path, offset, math_size, w, h, out_path, mode, sharp_profile, is_rgb = args
-    
-    try:
-        with open(f_path, 'rb') as f:
-            f.seek(offset)
-            # LEEMOS SOLO LA DATA ÚTIL (MATH_SIZE), IGNORANDO EL PADDING DEL DISCO
-            raw_data = f.read(math_size)
-            
-        if len(raw_data) == 0: return "Vacío"
-
-        # --- PIPELINE DE COLOR ---
-        if is_rgb:
-            rgb = np.frombuffer(raw_data, dtype=np.uint8).reshape(h, w, 3)
-            img_f = rgb.astype(np.float32) / 255.0
-        else:
-            # 1. Desempaquetar
-            img_raw = unpack_12bit_packed_manual(raw_data, w, h)
-            
-            # 2. Debayering (FIJO A BG - ÍNDICE 1)
-            # Usamos EdgeAware si está disponible, sino el normal
-            rgb16 = cv2.cvtColor(img_raw, cv2.COLOR_BayerBG2RGB)
-            
-            # 3. Normalizar (0-1) y Gamma Correct
-            img_f = rgb16.astype(np.float32) / 4095.0
-            img_f = np.power(img_f, 1.0/2.2) # Gamma Monitor Standard
-
-        # --- PROCESADO ---
-        try: sigma, amount = map(float, sharp_profile.split(','))
-        except: sigma, amount = 0, 0
-
-        if mode == "BW":
-            if len(img_f.shape) == 3: gray = cv2.cvtColor(img_f, cv2.COLOR_RGB2GRAY)
-            else: gray = img_f 
-            if sigma > 0:
-                blur = cv2.GaussianBlur(gray, (0,0), sigma)
-                gray = gray + (gray - blur) * amount
-            gray = np.clip(gray, 0, 1)
-            final_img = cv2.merge((gray, gray, gray))
-        else:
-            lab = cv2.cvtColor(img_f, cv2.COLOR_RGB2Lab)
-            l, a, b = cv2.split(lab)
-            if sigma > 0:
-                blur = cv2.GaussianBlur(l, (0,0), sigma)
-                l = l + (l - blur) * amount
-            final_img = cv2.cvtColor(cv2.merge((l,a,b)), cv2.COLOR_Lab2RGB)
-
-        # 4. Guardar
-        imageio.imwrite(out_path, (np.clip(final_img, 0, 1) * 65535).astype(np.uint16))
-        return None
-        
-    except Exception as e:
-        return f"Err: {e}"
 
 def main():
     freeze_support()
@@ -150,8 +166,9 @@ def main():
     parser.add_argument("input")
     parser.add_argument("--mode", default=None)
     parser.add_argument("--sharp", default="2.0,2.5")
+    parser.add_argument("--output-dir", default=None, help="Carpeta de salida (relativa al directorio del .raw)")
     args = parser.parse_args()
-    
+
     target_path = Path(args.input).resolve()
     
     if target_path.is_file():
@@ -173,36 +190,55 @@ def main():
     tasks = []
     print(f"INFO|Analizando {len(files)} archivos...")
     
+    qoi_tasks = []
+    
     for f in files:
-        # Detectar parámetros críticos
-        w, h, math_size, real_stride, count, is_rgb = get_format_params(f)
+        w, h, math_size, real_stride, count, is_rgb, is_qoi = get_format_params(f)
         
-        # Detectar modo BW si aplica
         mode_use = mode_arg
         if not args.mode and f.name in meta_data:
             if "Blanco" in meta_data[f.name].get("type", ""): mode_use = "BW"
 
-        raw_folder = base_dir / f.stem
+        out_stem = args.output_dir if args.output_dir else f.stem
+        raw_folder = base_dir / out_stem
         raw_folder.mkdir(exist_ok=True)
         
-        for i in range(count):
-            # LA CLAVE: 
-            # Saltamos usando 'real_stride' (incluye basura)
-            # Pero le decimos al worker que lea solo 'math_size'
-            offset = i * real_stride 
-            
-            out_name = f"{f.stem}_{i:06d}.tif" if count > 1 else f"{f.stem}.tif"
-            out_path = raw_folder / out_name
-            tasks.append((f, offset, math_size, w, h, out_path, mode_use, args.sharp, is_rgb))
+        if is_qoi:
+            # QOI: Indexar frames y crear tareas QOI
+            print(f"INFO|Indexando frames QOI en {f.name}...")
+            qoi_index = qoi_utils.build_frame_index(str(f))
+            print(f"INFO|{len(qoi_index)} frames QOI encontrados.")
+            for i, (offset, fsz) in enumerate(qoi_index):
+                out_name = f"{f.stem}_{i:06d}.tif"
+                out_path = raw_folder / out_name
+                qoi_tasks.append((f, offset, fsz, w, h, out_path, mode_use))
+        else:
+            for i in range(count):
+                offset = i * real_stride 
+                out_name = f"{f.stem}_{i:06d}.tif" if count > 1 else f"{f.stem}.tif"
+                out_path = raw_folder / out_name
+                tasks.append((f, offset, math_size, w, h, out_path, mode_use, args.sharp, is_rgb))
 
-    print(f"START|{len(tasks)}")
+    all_count = len(tasks) + len(qoi_tasks)
+    print(f"START|{all_count}")
     sys.stdout.flush()
     
+    processed = 0
     with Pool(max(1, cpu_count() - 1)) as pool:
-        for i, res in enumerate(pool.imap_unordered(process_frame_task, tasks)):
+        # Procesar tareas estándar (Bayer/RGB)
+        for res in pool.imap_unordered(process_frame_task, tasks):
+            processed += 1
             if res: print(f"ERROR|{res}")
-            print(f"PROG|{i+1}")
+            print(f"PROG|{processed}")
             sys.stdout.flush()
+        
+        # Procesar tareas QOI
+        for res in pool.imap_unordered(process_qoi_frame_task, qoi_tasks):
+            processed += 1
+            if res: print(f"ERROR|{res}")
+            print(f"PROG|{processed}")
+            sys.stdout.flush()
+    
     print("INFO|Listo.")
 
 if __name__ == "__main__":
