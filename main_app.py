@@ -93,13 +93,36 @@ class IntroSplash(QWidget):
         """)
         self.progress.setTextVisible(False)
         self.progress.setRange(0, 0) # Modo "infinito" (loading)
+
+        self.lbl_detail = QLabel("")
+        self.lbl_detail.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.lbl_detail.setWordWrap(True)
+        self.lbl_detail.setStyleSheet("color: #aaa; font-size: 10pt; margin: 8px 16px 0 16px; border: none;")
+        self.lbl_detail.hide()
+
+        self.btn_continue = QPushButton("Continuar en modo visor")
+        self.btn_continue.setStyleSheet("""
+            QPushButton {
+                background-color: #0078d7;
+                color: white;
+                font-weight: bold;
+                padding: 10px 24px;
+                border: none;
+                border-radius: 6px;
+            }
+            QPushButton:hover { background-color: #1084e3; }
+        """)
+        self.btn_continue.hide()
+        self.btn_continue.clicked.connect(self.finish_loading)
         
         inner_layout.addStretch()
         inner_layout.addWidget(lbl_title)
         inner_layout.addWidget(lbl_subtitle)
         inner_layout.addStretch()
         inner_layout.addWidget(self.lbl_status)
+        inner_layout.addWidget(self.lbl_detail)
         inner_layout.addWidget(self.progress)
+        inner_layout.addWidget(self.btn_continue, 0, Qt.AlignmentFlag.AlignCenter)
         inner_layout.addSpacing(20)
         
         layout.addWidget(self.container)
@@ -144,24 +167,28 @@ class IntroSplash(QWidget):
                 self.lbl_status.setText(f"Buscando cámara{dots}")
         elif self.steps == 7:
             if not self._cam_found:
-                self.lbl_status.setText("Cámara no detectada.")
+                self.lbl_status.setText("Cámara no detectada")
                 self.lbl_status.setStyleSheet("color: #ff9800; font-weight: bold; border: none;")
-                self.progress.setRange(0, 100)
-                self.progress.setValue(100)
-                QMessageBox.warning(
-                    None,
-                    "Cámara no detectada",
+                self.lbl_detail.setText(
                     "No se encontró ninguna cámara Lucid conectada.\n\n"
                     "La aplicación abrirá en modo visor (solo reproducción).\n"
-                    "Se reintentará la conexión automáticamente cada pocos segundos.",
+                    "Se reintentará la conexión automáticamente cada pocos segundos."
                 )
+                self.lbl_detail.show()
+                self.btn_continue.show()
+                self.setFixedSize(520, 380)
+                self.progress.setRange(0, 100)
+                self.progress.setValue(100)
+                self.timer.stop()
             else:
                 self.lbl_status.setText("Listo.")
         elif self.steps >= 9:
-            self.finish_loading()
+            if self._cam_found:
+                self.finish_loading()
 
     def finish_loading(self):
         self.timer.stop()
+        self.btn_continue.setEnabled(False)
         self.close()
         if self.main_window:
             self.main_window.showMaximized()
@@ -381,6 +408,7 @@ class BatchExportDialog(QDialog):
                 "ProRes 4444 (Alta Calidad - 12bit)",
                 "ProRes 422 HQ (Estándar - 10bit)",
                 "HEVC 10-bit 4:4:4 (MP4 - Eficiente)",
+                "AV1 NVENC 10-bit (MP4 - Eficiente)",
                 "H.264 (MP4 - Proxy)"
             ])
             self.combo_fmt.setCurrentIndex(0)
@@ -391,7 +419,8 @@ class BatchExportDialog(QDialog):
                 "ProRes 4444 (Premiere - 12bit - Alta Calidad)", 
                 "GoPro CineForm (Premiere - 12bit - Intermedio)", 
                 "ProRes 422 HQ (Premiere - 10bit - Estándar)",
-                "HEVC 10-bit 4:4:4 (MP4 - Eficiente)", 
+                "HEVC 10-bit 4:4:4 (MP4 - Eficiente)",
+                "AV1 NVENC 10-bit (MP4 - Eficiente)",
                 "H.264 (MP4 - Proxy)"
             ])
             self.combo_fmt.setCurrentIndex(0)
@@ -502,10 +531,10 @@ class BatchExportDialog(QDialog):
                 files.append(item.text())
         
         if self.source_is_processed:
-            fmt_map = {0: 'tiff_seq', 1: 'prores', 2: 'prores_hq', 3: 'hevc', 4: 'h264'}
+            fmt_map = {0: 'tiff_seq', 1: 'prores', 2: 'prores_hq', 3: 'hevc', 4: 'av1', 5: 'h264'}
             sharp = '0,0'
         else:
-            fmt_map = {0: 'dng', 1: 'prores', 2: 'cineform', 3: 'prores_hq', 4: 'hevc', 5: 'h264'}
+            fmt_map = {0: 'dng', 1: 'prores', 2: 'cineform', 3: 'prores_hq', 4: 'hevc', 5: 'av1', 6: 'h264'}
             sharp_map = {0: '0,0', 1: '0.8,1.5', 2: '1.3,1.5', 3: '2.0,2.5'}
             sharp = sharp_map.get(self.combo_sharp.currentIndex(), '0,0')
         
@@ -2373,6 +2402,9 @@ class MainWindow(QMainWindow):
                 settings = export_settings.get(
                     f, default_settings_for_file(f, coll_meta, fmt),
                 ) if fmt != "dng" else None
+                if settings:
+                    from export_grade import persist_export_settings
+                    persist_export_settings(self.manager, target_collection, f, settings)
                 self.export_queue.append((path, fmt, sharp, settings))
 
             if not self.is_exporting_batch:
@@ -2434,6 +2466,15 @@ class MainWindow(QMainWindow):
         if output_name:
             cmd.extend(["--output", output_name])
 
+        grade = (settings or {}).get("grade")
+        if grade and grade.get("enabled"):
+            cmd.extend(["--grade", json.dumps(grade)])
+
+        if settings and settings.get("test_export"):
+            from export_grade import TEST_EXPORT_SKIP_FRAMES, TEST_EXPORT_FRAME_COUNT
+            cmd.extend(["--skip-frames", str(TEST_EXPORT_SKIP_FRAMES)])
+            cmd.extend(["--max-frames", str(TEST_EXPORT_FRAME_COUNT)])
+
         if output_name:
             self.current_video_output = nf.parent / output_name
         elif effective_fmt == 'dng':
@@ -2441,7 +2482,10 @@ class MainWindow(QMainWindow):
         elif effective_fmt == 'tiff_seq':
             self.current_video_output = nf.parent / f"{nf.stem}_TIFF_SEQ"
         else:
-            ext_map = {'prores': '.mov', 'prores_hq': '.mov', 'ffv1': '.mkv', 'h264': '.mp4', 'hevc': '.mp4', 'cineform': '.mov'}
+            ext_map = {
+                'prores': '.mov', 'prores_hq': '.mov', 'ffv1': '.mkv',
+                'h264': '.mp4', 'hevc': '.mp4', 'cineform': '.mov', 'av1': '.mp4',
+            }
             ext = ext_map.get(effective_fmt, ".mp4")
             self.current_video_output = nf.parent / f"{nf.stem}_{effective_fmt}{ext}"
         

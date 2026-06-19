@@ -1853,9 +1853,22 @@ class CollectionManager:
 
     def delete_file(self, collection_name, filename):
         file_path = self.root_path / collection_name / filename
+        coll_dir = self.root_path / collection_name
+        stem = Path(filename).stem
+
         if file_path.exists():
-            try: os.remove(file_path)
-            except: return False
+            try:
+                os.remove(file_path)
+            except OSError:
+                return False
+
+        dng_folder = coll_dir / f"{stem}_DNG_SEQ"
+        if dng_folder.is_dir():
+            try:
+                shutil.rmtree(dng_folder)
+            except OSError as e:
+                print(f"WARN no se pudo borrar carpeta DNG {dng_folder.name}: {e}")
+
         data = self.load_metadata(collection_name)
         if filename in data:
             del data[filename]

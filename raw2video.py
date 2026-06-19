@@ -10,8 +10,26 @@ import time
 from pathlib import Path
 import qoi_utils
 import multiprocessing
+import threading
+import queue
 from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
 from collections import deque
+
+FFMPEG_STDIN_BUFSIZE = 4 * 1024 * 1024  # buffer tubería stdin → FFmpeg
+RESERVE_CORES_FOR_OS = 2  # cores libres para el SO (p. ej. E-cores en i7 híbrido)
+DETECT_PREFETCH_WORKERS = 2  # detección glitch: pocos hilos, el resto va al procesado
+PROCESS_DEPTH_EXTRA = 12  # cuadros extra en vuelo para evitar ráfagas CPU
+
+
+def _parallel_worker_count() -> tuple[int, int]:
+    """Hilos de procesado: todos los cores lógicos menos la reserva para el SO."""
+    total = multiprocessing.cpu_count()
+    workers = max(1, total - RESERVE_CORES_FOR_OS)
+    return workers, total
+
+
+def _process_depth(video_workers: int) -> int:
+    return max(4, video_workers + PROCESS_DEPTH_EXTRA)
 
 # Intento de importar tifffile para exportación DNG
 try:
@@ -208,6 +226,49 @@ def es_glitch_magenta(img_uint16, factor=1.4, umbral=40):
     return rb_bajo > (g_alto * factor) and rb_bajo > umbral
 
 
+MAX_GLITCH_RUN = 5
+
+
+class MagentaGlitchFilter:
+    """
+    Ventana temporal anti-glitch magenta (Bayer).
+    Rachas cortas (≤ MAX_GLITCH_RUN) se descartan; rachas largas se tratan como cast natural.
+    """
+
+    def __init__(self, max_glitch_run: int = MAX_GLITCH_RUN):
+        self.max_glitch_run = max_glitch_run
+        self.pending: list = []
+        self.in_long_run = False
+        self.discarded_count = 0
+
+    def feed(self, item, is_magenta: bool) -> list:
+        """Devuelve los items que deben incluirse en la salida (0, 1 o varios)."""
+        out = []
+        if is_magenta:
+            if self.in_long_run:
+                out.append(item)
+            elif len(self.pending) < self.max_glitch_run:
+                self.pending.append(item)
+            else:
+                self.in_long_run = True
+                out.extend(self.pending)
+                self.pending.clear()
+                out.append(item)
+        else:
+            self.in_long_run = False
+            if self.pending:
+                self.discarded_count += len(self.pending)
+                self.pending.clear()
+            out.append(item)
+        return out
+
+    def finalize(self):
+        """Descarta frames magenta pendientes al final del archivo."""
+        if self.pending:
+            self.discarded_count += len(self.pending)
+            self.pending.clear()
+
+
 def _save_dng_task(img_16bit, out_path, width, height):
     """
     Guarda un frame ya desempaquetado como DNG.
@@ -218,41 +279,457 @@ def _save_dng_task(img_16bit, out_path, width, height):
     return out_path.name
 
 
-def process_video_frame(raw_data, is_rgb, width, height, mode):
+def _apply_bw_mode(img_rgb8, mode):
+    if mode != "BW":
+        return img_rgb8
+    gray = cv2.cvtColor(img_rgb8, cv2.COLOR_RGB2GRAY)
+    return cv2.merge((gray, gray, gray))
+
+
+def _rgb8_to_export_bytes(img_rgb8, is_rgb):
+    if is_rgb:
+        return img_rgb8.tobytes()
+    img_final_16 = (img_rgb8.astype(np.uint32) * 65535 // 255).astype(np.uint16)
+    return img_final_16.tobytes()
+
+
+def _finalize_export_frame(img_rgb8, grade, width, height, is_rgb, is_bayer):
+    if grade and grade.get("enabled"):
+        from export_grade import apply_frame_geometry_from_settings, geometry_has_changes
+        if geometry_has_changes(grade, width):
+            img_rgb8 = apply_frame_geometry_from_settings(img_rgb8, grade, preview_downscale=1)
+    return _rgb8_to_export_bytes(img_rgb8, is_rgb or (not is_bayer))
+
+
+def process_video_frame_passthrough(raw_data, is_rgb, is_bayer, width, height, mode, grade=None):
     """
-    Procesa un frame (RGB o Bayer) y devuelve los bytes listos
-    para enviar a FFmpeg (rgb24 o rgb48le según el caso).
-    Pensado para ejecutarse en hilos paralelos.
+    Exportación sin gradación: ISP/RGB directo o debayer base (gamma 2.2) para Bayer.
     """
     if is_rgb:
+        img_rgb8 = np.frombuffer(raw_data, dtype=np.uint8).reshape(height, width, 3).copy()
+    elif is_bayer:
+        import bayer_render
+        img_rgb8 = bayer_render.render_capture_view(
+            raw_data, width, height, downscale=1, to_bgr=False,
+        )
+    else:
+        img = np.frombuffer(raw_data, dtype=np.uint8).reshape(height, width, 3)
+        img_rgb8 = img.copy()
+
+    img_rgb8 = _apply_bw_mode(img_rgb8, mode)
+    return _finalize_export_frame(img_rgb8, grade, width, height, is_rgb, is_bayer)
+
+
+def process_video_frame_graded(raw_data, is_rgb, is_bayer, width, height, mode, grade):
+    """Exportación con gradación (--grade JSON)."""
+    from export_grade import apply_export_grade
+
+    if is_rgb or not is_bayer:
         img = np.frombuffer(raw_data, dtype=np.uint8).reshape(height, width, 3)
         img_f = img.astype(np.float32) / 255.0
     else:
-        img_unpacked_16bit = unpack_12bit_packed_manual(raw_data, width, height)
-        img_rgb = cv2.cvtColor(img_unpacked_16bit, cv2.COLOR_BayerBG2RGB)
-        img_f = img_rgb.astype(np.float32) / 65535.0
+        import bayer_render
+        bayer = bayer_render.unpack_12bit_le(raw_data, width, height)
+        rgb16 = cv2.cvtColor(bayer, cv2.COLOR_BayerBG2RGB)
+        img_f = rgb16.astype(np.float32) / 4095.0
 
-    img_proc = apply_processing_chain(
-        img_f, CFG_GAMMA, CFG_BLACK_LVL, CFG_WHITE_LVL,
-        CFG_SHARP_SIGMA, CFG_SHARP_AMOUNT, CFG_CHROMA_BLUR_SIZE,
+    img_proc = apply_export_grade(img_f, grade, mode)
+    img_rgb8 = (np.clip(img_proc, 0, 1) * 255).astype(np.uint8)
+    return _finalize_export_frame(img_rgb8, grade, width, height, is_rgb, is_bayer)
+
+
+def process_video_frame(raw_data, is_rgb, width, height, mode, grade=None, is_bayer=False):
+    """
+    Procesa un frame y devuelve bytes listos para FFmpeg (rgb24 o rgb48le).
+    Sin grade → passthrough ISP / debayer base. Con grade → cadena de gradación.
+    """
+    if grade and grade.get("enabled"):
+        return process_video_frame_graded(
+            raw_data, is_rgb, is_bayer, width, height, mode, grade,
+        )
+    return process_video_frame_passthrough(
+        raw_data, is_rgb, is_bayer, width, height, mode, grade,
     )
 
-    if mode == "BW":
-        if len(img_proc.shape) == 3:
-            gray = cv2.cvtColor(img_proc, cv2.COLOR_RGB2GRAY)
-        else:
-            gray = img_proc
-        img_final = cv2.merge((gray, gray, gray))
+
+class TempFileFrameWriter:
+    """Escribe frames procesados en orden a un archivo temporal (fase 1 del pipeline)."""
+
+    def __init__(self, path: Path, queue_size: int = 6):
+        self._path = path
+        self._f = open(path, "wb")
+        self._q: queue.Queue = queue.Queue(maxsize=max(2, queue_size))
+        self._err = None
+        self._thread = threading.Thread(target=self._run, name="temp-raw-writer", daemon=True)
+        self._thread.start()
+
+    def _run(self):
+        try:
+            while True:
+                data = self._q.get()
+                if data is None:
+                    break
+                self._f.write(data)
+        except OSError as exc:
+            self._err = exc
+
+    def submit(self, data: bytes):
+        if self._err:
+            raise self._err
+        self._q.put(data)
+
+    def close(self):
+        self._q.put(None)
+        self._thread.join()
+        self._f.close()
+        if self._err:
+            raise self._err
+
+
+def _append_ffmpeg_codec_args(cmd: list, codec: str) -> str:
+    """Añade códec/salida a cmd; devuelve extensión de archivo."""
+    if codec == 'prores':
+        cmd += ['-c:v', 'prores_ks', '-profile:v', '4', '-vendor', 'apl0', '-qscale:v', '5', '-pix_fmt', 'yuv444p10le']
+        return ".mov"
+    if codec == 'prores_hq':
+        cmd += ['-c:v', 'prores_ks', '-profile:v', '3', '-vendor', 'apl0', '-qscale:v', '9', '-pix_fmt', 'yuv422p10le']
+        return ".mov"
+    if codec == 'cineform':
+        cmd += ['-c:v', 'cfhd', '-quality', '5']
+        return ".mov"
+    if codec == 'hevc':
+        cmd += ['-c:v', 'libx265', '-preset', 'medium', '-crf', '18', '-pix_fmt', 'yuv444p10le', '-tag:v', 'hvc1']
+        return ".mp4"
+    if codec == 'h264':
+        cmd += ['-c:v', 'libx264', '-preset', 'medium', '-crf', '23', '-pix_fmt', 'yuv420p']
+        return ".mp4"
+    if codec == 'av1':
+        cmd += [
+            '-c:v', 'av1_nvenc', '-preset', 'p7', '-rc', 'vbr', '-b:v', '9M',
+            '-maxrate', '13M', '-bufsize', '24M', '-multipass', 'fullres',
+            '-spatial-aq', '1', '-temporal-aq', '1', '-rc-lookahead', '32', '-pix_fmt', 'p010le',
+        ]
+        return ".mp4"
+    cmd += ['-c:v', 'libx264', '-preset', 'medium', '-crf', '23', '-pix_fmt', 'yuv420p']
+    return ".mp4"
+
+
+def _build_ffmpeg_cmd(
+    input_spec: str,
+    export_w: int,
+    export_h: int,
+    input_pix_fmt: str,
+    fps: str,
+    codec: str,
+    output_file: Path,
+) -> list:
+    cmd = [
+        'ffmpeg', '-y', '-f', 'rawvideo', '-vcodec', 'rawvideo',
+        '-s', f'{export_w}x{export_h}', '-pix_fmt', input_pix_fmt, '-r', str(fps),
+        '-i', input_spec,
+    ]
+    _append_ffmpeg_codec_args(cmd, codec)
+    cmd.append(str(output_file))
+    return cmd
+
+
+def _run_ffmpeg_encode(cmd: list) -> int:
+    print(f"INFO|FFmpeg cmd: {' '.join(cmd)}")
+    result = subprocess.run(cmd, stderr=sys.stderr)
+    if result.returncode != 0:
+        raise RuntimeError(f"FFmpeg fallo con codigo {result.returncode}")
+    return result.returncode
+
+
+def _skip_raw_frames(
+    raw_file,
+    skip_count: int,
+    frame_bytes: int,
+    w: int,
+    h: int,
+    glitch_filter: MagentaGlitchFilter | None,
+):
+    if skip_count <= 0:
+        return
+    print(f"INFO|Omitiendo primeros {skip_count} cuadros...")
+    if glitch_filter:
+        for _ in range(skip_count):
+            raw_data = raw_file.read(frame_bytes)
+            if len(raw_data) < frame_bytes:
+                return
+            raw_data, is_magenta = _unpack_detect_magenta(raw_data, w, h)
+            for _chunk in glitch_filter.feed(raw_data, is_magenta):
+                pass
     else:
-        img_final = img_proc
+        raw_file.seek(skip_count * frame_bytes, os.SEEK_CUR)
 
-    rgb8 = (np.clip(img_final, 0, 1) * 255).astype(np.uint8)
 
-    if is_rgb:
-        return rgb8.tobytes()
+class FfmpegStdinWriter:
+    """Hilo dedicado que alimenta FFmpeg; cola acotada aplica backpressure y limita RAM."""
 
-    img_final_16 = (rgb8.astype(np.uint32) * 65535 // 255).astype(np.uint16)
-    return img_final_16.tobytes()
+    def __init__(self, proc, queue_size: int = 6):
+        self._proc = proc
+        self._q: queue.Queue = queue.Queue(maxsize=max(2, queue_size))
+        self._err = None
+        self._thread = threading.Thread(target=self._run, name="ffmpeg-stdin-writer", daemon=True)
+        self._thread.start()
+
+    def _run(self):
+        try:
+            while True:
+                data = self._q.get()
+                if data is None:
+                    break
+                self._proc.stdin.write(data)
+        except (BrokenPipeError, OSError, ValueError) as exc:
+            self._err = exc
+
+    def submit(self, data: bytes):
+        if self._err:
+            raise self._err
+        self._q.put(data)
+
+    def close(self):
+        self._q.put(None)
+        self._thread.join()
+        if self._err:
+            raise self._err
+
+
+def _log_export_progress(current: int, total: int, start_time: float):
+    elapsed = time.time() - start_time
+    fps_proc = current / elapsed if elapsed > 0 else 0
+    print(f"PROG|{current}|{total}")
+    pct = (current / total * 100) if total else 0
+    print(f"INFO|Frame: {current}/{total} ({pct:.1f}%) | Vel: {fps_proc:.2f} fps")
+    sys.stdout.flush()
+
+
+def _unpack_detect_magenta(raw_data, w, h):
+    img = unpack_12bit_packed_manual(raw_data, w, h)
+    return raw_data, es_glitch_magenta(img)
+
+
+def _export_video_ordered(
+    raw_file,
+    num_frames: int,
+    frame_bytes: int,
+    frame_writer,
+    w, h,
+    is_rgb: bool,
+    args,
+    grade_settings,
+    glitch_filter: MagentaGlitchFilter | None,
+    start_time: float,
+    skip_frames: int = 0,
+):
+    """
+    Pipeline video: detección glitch (paralela, Bayer) → procesado (pool) →
+    hilo escritor (cola acotada) → FFmpeg. Evita acumular decenas de frames en RAM.
+    """
+    video_workers, total_cores = _parallel_worker_count()
+    process_depth = _process_depth(video_workers)
+    detect_depth = max(8, video_workers + 4) if glitch_filter else 0
+    write_queue_size = max(8, video_workers + 4)
+
+    print(
+        f"INFO|Fase 1 multihilo: {video_workers} workers procesado "
+        f"({total_cores} cores, {RESERVE_CORES_FOR_OS} reservados SO), "
+        f"profundidad={process_depth}, cola_escritura={write_queue_size}"
+        + (f", prefetch_glitch={DETECT_PREFETCH_WORKERS}" if glitch_filter else "")
+    )
+
+    writer = frame_writer
+    executor = ThreadPoolExecutor(max_workers=video_workers)
+    detect_pool = (
+        ThreadPoolExecutor(max_workers=DETECT_PREFETCH_WORKERS) if glitch_filter else None
+    )
+
+    future_map: dict[int, object] = {}
+    next_to_write = 0
+    submit_idx = 0
+    read_count = 0
+    detect_queue: deque = deque()
+
+    def drain_completed():
+        nonlocal next_to_write
+        while next_to_write in future_map and future_map[next_to_write].done():
+            writer.submit(future_map[next_to_write].result())
+            del future_map[next_to_write]
+            next_to_write += 1
+
+    def submit_raw(raw_data: bytes):
+        nonlocal submit_idx
+        while len(future_map) >= process_depth:
+            wait(list(future_map.values()), return_when=FIRST_COMPLETED)
+            drain_completed()
+        future_map[submit_idx] = executor.submit(
+            process_video_frame,
+            raw_data, is_rgb, w, h, args.mode, grade_settings, not is_rgb,
+        )
+        submit_idx += 1
+        drain_completed()
+
+    def fill_detect():
+        nonlocal read_count
+        while len(detect_queue) < detect_depth and read_count < num_frames:
+            raw_data = raw_file.read(frame_bytes)
+            if len(raw_data) < frame_bytes:
+                break
+            detect_queue.append(
+                detect_pool.submit(_unpack_detect_magenta, raw_data, w, h)
+            )
+            read_count += 1
+
+    try:
+        _skip_raw_frames(raw_file, skip_frames, frame_bytes, w, h, glitch_filter)
+        if glitch_filter:
+            fill_detect()
+            processed = 0
+            while detect_queue:
+                raw_data, is_magenta = detect_queue.popleft().result()
+                fill_detect()
+                processed += 1
+                for chunk in glitch_filter.feed(raw_data, is_magenta):
+                    submit_raw(chunk)
+                drain_completed()
+                if processed % 10 == 0:
+                    _log_export_progress(processed, num_frames, start_time)
+            glitch_filter.finalize()
+        else:
+            next_raw = raw_file.read(frame_bytes)
+            for i in range(num_frames):
+                raw_data = next_raw
+                if len(raw_data) < frame_bytes:
+                    break
+                if i + 1 < num_frames:
+                    next_raw = raw_file.read(frame_bytes)
+                read_count = i + 1
+                submit_raw(raw_data)
+                if (i + 1) % 10 == 0:
+                    _log_export_progress(i + 1, num_frames, start_time)
+
+        while future_map:
+            wait(list(future_map.values()), return_when=FIRST_COMPLETED)
+            drain_completed()
+
+        if glitch_filter and glitch_filter.discarded_count:
+            print(
+                f"INFO|Glitches magenta descartados del video: {glitch_filter.discarded_count} frames "
+                f"(de {read_count} leídos, {next_to_write} en salida)"
+            )
+    finally:
+        writer.close()
+        if detect_pool:
+            detect_pool.shutdown(wait=True)
+        executor.shutdown(wait=True)
+
+
+def _export_video_qoi(
+    input_path,
+    qoi_index,
+    num_frames: int,
+    frame_writer,
+    w, h,
+    args,
+    grade_settings,
+    start_time: float,
+    skip_frames: int = 0,
+):
+    """Exportación QOI/RGB8 con procesado paralelo y hilo escritor a FFmpeg."""
+    video_workers, total_cores = _parallel_worker_count()
+    process_depth = _process_depth(video_workers)
+    write_queue_size = max(8, video_workers + 4)
+    path_str = str(input_path)
+
+    print(
+        f"INFO|Fase 1 multihilo (QOI): {video_workers} workers "
+        f"({total_cores} cores, {RESERVE_CORES_FOR_OS} reservados SO), "
+        f"profundidad={process_depth}, cola={write_queue_size}"
+    )
+
+    def _decode_and_process(entry):
+        offset, fsz = entry
+        qoi_data = qoi_utils.read_frame_at(path_str, offset, fsz)
+        img = qoi_utils.decode_qoi(qoi_data, w, h)
+        return process_video_frame(
+            img.tobytes(), True, w, h, args.mode, grade_settings, False,
+        )
+
+    writer = frame_writer
+    executor = ThreadPoolExecutor(max_workers=video_workers)
+    future_map: dict[int, object] = {}
+    next_to_write = 0
+
+    def drain_completed():
+        nonlocal next_to_write
+        while next_to_write in future_map and future_map[next_to_write].done():
+            writer.submit(future_map[next_to_write].result())
+            del future_map[next_to_write]
+            next_to_write += 1
+
+    try:
+        start_idx = skip_frames
+        end_idx = min(len(qoi_index), start_idx + num_frames)
+        export_indices = list(range(start_idx, end_idx))
+        if skip_frames > 0:
+            print(f"INFO|Omitiendo primeros {skip_frames} cuadros QOI...")
+        for seq, idx in enumerate(export_indices):
+            while len(future_map) >= process_depth:
+                wait(list(future_map.values()), return_when=FIRST_COMPLETED)
+                drain_completed()
+            future_map[seq] = executor.submit(_decode_and_process, qoi_index[idx])
+            drain_completed()
+            if (seq + 1) % 10 == 0:
+                _log_export_progress(seq + 1, len(export_indices), start_time)
+
+        while future_map:
+            wait(list(future_map.values()), return_when=FIRST_COMPLETED)
+            drain_completed()
+    finally:
+        writer.close()
+        executor.shutdown(wait=True)
+
+
+def _create_video_frame_writer(video_ctx: dict, args):
+    video_workers, _total = _parallel_worker_count()
+    write_queue_size = max(8, video_workers + 4)
+    if video_ctx['stage_temp']:
+        return TempFileFrameWriter(video_ctx['temp_path'], queue_size=write_queue_size)
+    if video_ctx['process'] is None:
+        cmd = _build_ffmpeg_cmd(
+            '-', video_ctx['export_w'], video_ctx['export_h'],
+            video_ctx['input_pix_fmt'], args.fps, args.codec, video_ctx['output_file'],
+        )
+        print(f"INFO|FFmpeg cmd (stdin): {' '.join(cmd)}")
+        video_ctx['process'] = subprocess.Popen(
+            cmd, stdin=subprocess.PIPE, stderr=sys.stderr, bufsize=FFMPEG_STDIN_BUFSIZE,
+        )
+    return FfmpegStdinWriter(video_ctx['process'], queue_size=write_queue_size)
+
+
+def _finish_video_export(video_ctx: dict | None, args):
+    if not video_ctx:
+        return
+    if video_ctx['stage_temp']:
+        tp = video_ctx['temp_path']
+        if tp.exists():
+            size_mb = tp.stat().st_size / (1024 * 1024)
+            print(f"INFO|Fase 2: codificando desde temporal ({size_mb:.1f} MiB)...")
+            cmd = _build_ffmpeg_cmd(
+                str(tp), video_ctx['export_w'], video_ctx['export_h'],
+                video_ctx['input_pix_fmt'], args.fps, args.codec, video_ctx['output_file'],
+            )
+            _run_ffmpeg_encode(cmd)
+            tp.unlink(missing_ok=True)
+    elif video_ctx.get('process'):
+        proc = video_ctx['process']
+        if proc.stdin:
+            proc.stdin.close()
+        ret = proc.wait()
+        if ret != 0:
+            raise RuntimeError(f"FFmpeg fallo con codigo {ret}")
+
 
 def apply_processing_chain(img_f, gamma, blk, wht, sigma, amount, chroma_blur):
     # ... (Tu código de procesado de video se mantiene igual) ...
@@ -275,7 +752,16 @@ def apply_processing_chain(img_f, gamma, blk, wht, sigma, amount, chroma_blur):
     return np.clip(img_final, 0.0, 1.0)
 
 def main():
-    sys.stdout.reconfigure(line_buffering=True)
+    if hasattr(sys.stdout, "reconfigure"):
+        try:
+            sys.stdout.reconfigure(encoding="utf-8", errors="replace", line_buffering=True)
+        except Exception:
+            pass
+    if hasattr(sys.stderr, "reconfigure"):
+        try:
+            sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
     parser = argparse.ArgumentParser()
     parser.add_argument("input")
     parser.add_argument("--codec", default="prores") # 'dng' activa el modo raw
@@ -283,17 +769,46 @@ def main():
     parser.add_argument("--sharp", default="0,0") 
     parser.add_argument("--mode", default="COLOR")
     parser.add_argument("--output", default=None, help="Nombre de archivo o carpeta de salida (relativo al directorio del .raw)")
+    parser.add_argument("--grade", default=None, help="JSON con ajustes de gradación (export_grade.DEFAULT_GRADE)")
+    parser.add_argument(
+        "--max-frames", type=int, default=None,
+        help="Cantidad maxima de cuadros a exportar (despues de --skip-frames)",
+    )
+    parser.add_argument(
+        "--skip-frames", type=int, default=0,
+        help="Cuadros iniciales a omitir antes de exportar",
+    )
+    parser.add_argument(
+        "--no-stage-temp", action="store_true",
+        help="Enviar frames a FFmpeg por stdin (sin archivo temporal intermedio)",
+    )
     args = parser.parse_args()
 
-    global CFG_SHARP_SIGMA, CFG_SHARP_AMOUNT
-    try:
-        sigma, amount = map(float, str(args.sharp).split(","))
-        CFG_SHARP_SIGMA = sigma
-        CFG_SHARP_AMOUNT = amount
-    except (TypeError, ValueError):
-        pass
-    if CFG_SHARP_SIGMA > 0 or CFG_SHARP_AMOUNT > 0:
-        print(f"INFO|Sharpen export: sigma={CFG_SHARP_SIGMA:.1f} amount={CFG_SHARP_AMOUNT:.1f}")
+    grade_settings = None
+    if args.grade:
+        try:
+            grade_settings = json.loads(args.grade)
+            if grade_settings.get("enabled"):
+                print(
+                    f"INFO|Gradación activa: gamma={grade_settings.get('gamma')} "
+                    f"black={grade_settings.get('black_level')} "
+                    f"white={grade_settings.get('white_level')}"
+                )
+                from export_grade import geometry_ffmpeg_filter, geometry_has_changes, export_frame_size
+                if geometry_has_changes(grade_settings, FIXED_W):
+                    ew, eh = export_frame_size(grade_settings, FIXED_W, FIXED_H)
+                    vf = geometry_ffmpeg_filter(grade_settings, FIXED_W, FIXED_H)
+                    print(
+                        f"INFO|Encuadre: rot={grade_settings.get('rotate_deg')}deg "
+                        f"zoom={grade_settings.get('zoom_px')}px "
+                        f"pan=({grade_settings.get('pan_x')},{grade_settings.get('pan_y')})px "
+                        f"salida={ew}x{eh}px"
+                    )
+                    if vf:
+                        print(f"INFO|Encuadre equivalente FFmpeg -vf: {vf}")
+        except (json.JSONDecodeError, TypeError) as e:
+            print(f"WARN|No se pudo parsear --grade: {e}")
+            grade_settings = None
     
     input_path = Path(args.input)
     if not input_path.exists():
@@ -333,24 +848,45 @@ def main():
         total_size = input_path.stat().st_size
         num_frames = total_size // frame_bytes
         qoi_index = None
+
+    file_frame_count = num_frames
+    skip = max(0, int(args.skip_frames or 0))
+    if skip >= file_frame_count:
+        print(f"ERROR|--skip-frames ({skip}) >= cuadros en archivo ({file_frame_count})")
+        return
+
+    remaining = file_frame_count - skip
+    export_count = remaining
+    if args.max_frames is not None and args.max_frames > 0:
+        export_count = min(export_count, args.max_frames)
+
+    if skip > 0 or export_count < file_frame_count:
+        first = skip + 1
+        last = skip + export_count
+        print(
+            f"INFO|Rango exportacion: cuadros {first}-{last} "
+            f"({export_count} total, archivo tiene {file_frame_count})"
+        )
+    num_frames = export_count
+    skip_frames = skip
     
     print(f"INFO|Procesando: {input_path.name}")
     
     # === MODO DNG ===
     is_dng_mode = (args.codec.lower() == 'dng')
     is_tiff_seq_mode = (args.codec.lower() == 'tiff_seq')
+    video_ctx = None
+    process = None
+    temp_path = None
     
     if is_dng_mode:
         if is_rgb or is_qoi:
             print("ERROR|No se puede exportar DNG desde una fuente RGB/QOI. Se requiere RAW Bayer.")
             return
         
-        dng_folder      = input_path.parent / (args.output or f"{input_path.stem}_DNG_SEQ")
-        descarte_folder = input_path.parent / f"{dng_folder.name}_descarte"
+        dng_folder = input_path.parent / (args.output or f"{input_path.stem}_DNG_SEQ")
         dng_folder.mkdir(exist_ok=True)
-        descarte_folder.mkdir(exist_ok=True)
         print(f"INFO|Modo DNG RAW activo. Salida en: {dng_folder}")
-        print(f"INFO|Carpeta de descarte (glitch magenta): {descarte_folder}")
         process = None
 
     elif is_tiff_seq_mode:
@@ -360,40 +896,42 @@ def main():
         process = None
     else:
         # === MODO VIDEO (FFMPEG) ===
-        # Para RGB/QOI: Entrada en rgb24 (8bit). Para Bayer: rgb48le (16bit).
         is_processed_src = (is_rgb or is_qoi)
         input_pix_fmt = 'rgb24' if is_processed_src else 'rgb48le'
-        print(f"INFO|Res: {w}x{h} | Modo Video: {args.codec} | Fuente: {'RGB8 ISP' if is_processed_src else 'Bayer'} | pix_fmt: {input_pix_fmt}")
-        
-        ffmpeg_cmd = [
-            'ffmpeg', '-y', '-f', 'rawvideo', '-vcodec', 'rawvideo',
-            '-s', f'{w}x{h}', '-pix_fmt', input_pix_fmt, '-r', args.fps,
-            '-i', '-'
-        ]
-        
-        if args.codec == 'prores':
-            ffmpeg_cmd += ['-c:v', 'prores_ks', '-profile:v', '4', '-vendor', 'apl0', '-qscale:v', '5', '-pix_fmt', 'yuv444p10le']
-            ext = ".mov"
-        elif args.codec == 'prores_hq':
-            ffmpeg_cmd += ['-c:v', 'prores_ks', '-profile:v', '3', '-vendor', 'apl0', '-qscale:v', '9', '-pix_fmt', 'yuv422p10le']
-            ext = ".mov"
-        elif args.codec == 'cineform':
-            ffmpeg_cmd += ['-c:v', 'cfhd', '-quality', '5']
-            ext = ".mov"
-        elif args.codec == 'hevc':
-            ffmpeg_cmd += ['-c:v', 'libx265', '-preset', 'medium', '-crf', '18', '-pix_fmt', 'yuv444p10le', '-tag:v', 'hvc1']
-            ext = ".mp4"
-        elif args.codec == 'h264':
-            ffmpeg_cmd += ['-c:v', 'libx264', '-preset', 'medium', '-crf', '23', '-pix_fmt', 'yuv420p']
-            ext = ".mp4"
-        else:
-            ffmpeg_cmd += ['-c:v', 'libx264', '-preset', 'medium', '-crf', '23', '-pix_fmt', 'yuv420p']
-            ext = ".mp4"
-            
+        export_w, export_h = w, h
+        if grade_settings and grade_settings.get("enabled"):
+            from export_grade import export_frame_size
+            export_w, export_h = export_frame_size(grade_settings, w, h)
+        print(
+            f"INFO|Res captura: {w}x{h} | Salida video: {export_w}x{export_h} | "
+            f"Modo Video: {args.codec} | Fuente: {'RGB8 ISP' if is_processed_src else 'Bayer'} | "
+            f"pix_fmt: {input_pix_fmt}"
+        )
+
+        ext = _append_ffmpeg_codec_args([], args.codec)
         output_file = input_path.parent / (args.output or f"{input_path.stem}_{args.codec}{ext}")
-        ffmpeg_cmd.append(str(output_file))
-        print(f"INFO|FFmpeg cmd: {' '.join(ffmpeg_cmd)}")
-        process = subprocess.Popen(ffmpeg_cmd, stdin=subprocess.PIPE, stderr=sys.stderr)
+        stage_temp = not args.no_stage_temp
+        temp_path = input_path.parent / f".{input_path.stem}_stage_{os.getpid()}.raw"
+        if stage_temp:
+            bpf = export_w * export_h * (3 if input_pix_fmt == 'rgb24' else 6)
+            est_mb = (bpf * num_frames) / (1024 * 1024)
+            vw, tc = _parallel_worker_count()
+            print(
+                f"INFO|Pipeline 2 fases: fase 1 multihilo ({vw}/{tc} cores) -> "
+                f"temporal (~{est_mb:.0f} MiB) -> FFmpeg"
+            )
+        else:
+            print("INFO|Pipeline directo: procesado -> FFmpeg stdin")
+
+        video_ctx = {
+            'stage_temp': stage_temp,
+            'temp_path': temp_path,
+            'export_w': export_w,
+            'export_h': export_h,
+            'input_pix_fmt': input_pix_fmt,
+            'output_file': output_file,
+            'process': None,
+        }
 
     # --- BUCLE PRINCIPAL ---
     print(f"START|{num_frames}")
@@ -404,69 +942,45 @@ def main():
 
     try:
         if is_qoi:
-            # --- LECTURA QOI (contenedor con headers) ---
-            for i in range(num_frames):
-                offset, fsz = qoi_index[i]
-                qoi_data = qoi_utils.read_frame_at(str(input_path), offset, fsz)
-                img = qoi_utils.decode_qoi(qoi_data, w, h)  # -> (H, W, 3) uint8 RGB
-
-                if is_tiff_seq_mode:
-                    if not HAS_TIFFFILE:
-                        print("ERROR|Se requiere tifffile para exportar TIFF. Instálalo: pip install tifffile")
-                        return
+            if is_tiff_seq_mode:
+                if not HAS_TIFFFILE:
+                    print("ERROR|Se requiere tifffile para exportar TIFF. Instálalo: pip install tifffile")
+                    return
+                for i in range(num_frames):
+                    offset, fsz = qoi_index[i]
+                    qoi_data = qoi_utils.read_frame_at(str(input_path), offset, fsz)
+                    img = qoi_utils.decode_qoi(qoi_data, w, h)
                     frame_name = f"{input_path.stem}_{i:06d}.tif"
                     tifffile.imwrite(str(tiff_folder / frame_name), img)
-                elif is_dng_mode:
-                    pass
-                else:
-                    # Video FFmpeg: RGB8 directo
-                    if args.mode == "BW":
-                        gray = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
-                        img = cv2.merge((gray, gray, gray))
-                    data_out = img.tobytes()
-                    if process:
-                        try:
-                            process.stdin.write(data_out)
-                        except (BrokenPipeError, OSError):
-                            break
-                
-                if i % 10 == 0:
-                    elapsed = time.time() - start_time
-                    fps_proc = (i + 1) / elapsed if elapsed > 0 else 0
-                    print(f"PROG|{i+1}|{num_frames}")
-                    print(f"INFO|Frame: {i+1}/{num_frames} ({(i+1)/num_frames*100:.1f}%) | Vel: {fps_proc:.2f} fps")
-                    sys.stdout.flush()
+                    if i % 10 == 0:
+                        _log_export_progress(i + 1, num_frames, start_time)
+            elif not is_dng_mode:
+                writer = _create_video_frame_writer(video_ctx, args)
+                try:
+                    _export_video_qoi(
+                        input_path, qoi_index, num_frames, writer,
+                        w, h, args, grade_settings, start_time, skip_frames,
+                    )
+                finally:
+                    writer.close()
+                _finish_video_export(video_ctx, args)
         else:
             # --- LECTURA ESTÁNDAR (Bayer / RGB plano) ---
             if is_dng_mode:
                 # MODO DNG: pipeline de dos pools para mantener CPU y NVMe saturados.
-                #
-                # unpack_pool: desempaqueta 12-bit → uint16 y detecta glitch (CPU-bound, paralelo).
-                # save_pool:   escribe el DNG en disco (I/O-bound, paralelo).
-                # main thread: recoge resultados del unpack EN ORDEN y aplica la ventana temporal;
-                #              solo decide el destino de cada frame, sin hacer trabajo pesado.
-                #
-                # Ventana temporal: rachas ≤ MAX_GLITCH_RUN → glitch (_descarte, nro original).
-                #                   rachas > MAX_GLITCH_RUN → cast natural (dng_folder, nro continuo).
-                MAX_GLITCH_RUN = 5
-
-                total_cores = multiprocessing.cpu_count()
-                dng_workers = max(1, total_cores - 2)
-                PIPELINE    = max(8, dng_workers * 3)   # frames en vuelo simultáneo
+                dng_workers, total_cores = _parallel_worker_count()
+                PIPELINE = max(8, dng_workers * 3)
                 print(f"INFO|DNG pipeline: {dng_workers} workers unpack + {dng_workers} workers escritura "
-                      f"({total_cores} cores totales, profundidad {PIPELINE})")
+                      f"({total_cores} cores, {RESERVE_CORES_FOR_OS} reservados SO, profundidad {PIPELINE})")
 
                 unpack_pool = ThreadPoolExecutor(max_workers=dng_workers)
-                save_pool   = ThreadPoolExecutor(max_workers=dng_workers)
+                save_pool = ThreadPoolExecutor(max_workers=dng_workers)
+                glitch_filter = MagentaGlitchFilter()
 
-                unpack_queue = deque()   # (orig_idx, Future<(img, is_magenta)>)
-                save_futures  = []
+                unpack_queue = deque()
+                save_futures = []
                 max_save_pend = dng_workers * 8
-
-                pending_magenta      = []    # [(img, orig_idx)] – frames aún sin destino decidido
-                in_long_run          = False
-                saved_count          = 0
-                glitches_descartados = 0
+                saved_count = 0
                 stem = input_path.stem
 
                 def _unpack_detect(raw_data):
@@ -486,37 +1000,12 @@ def main():
                     _enqueue_save(img, dng_folder / f"{stem}_{saved_count:06d}.dng")
                     saved_count += 1
 
-                def _flush_to_dng():
-                    for buf_img, _ in pending_magenta:
-                        _commit_dng(buf_img)
-                    pending_magenta.clear()
-
-                def _flush_to_descarte():
-                    nonlocal glitches_descartados
-                    for buf_img, orig_idx in pending_magenta:
-                        _enqueue_save(buf_img, descarte_folder / f"{stem}_{orig_idx:06d}.dng")
-                    glitches_descartados += len(pending_magenta)
-                    pending_magenta.clear()
-
-                def _process_result(orig_idx, img, is_magenta):
-                    nonlocal in_long_run
-                    if is_magenta:
-                        if in_long_run:
-                            _commit_dng(img)
-                        elif len(pending_magenta) < MAX_GLITCH_RUN:
-                            pending_magenta.append((img, orig_idx))
-                        else:
-                            in_long_run = True
-                            _flush_to_dng()
-                            _commit_dng(img)
-                    else:
-                        in_long_run = False
-                        if pending_magenta:
-                            _flush_to_descarte()
-                        _commit_dng(img)
+                def _process_result(_orig_idx, img, is_magenta):
+                    for to_save in glitch_filter.feed(img, is_magenta):
+                        _commit_dng(to_save)
 
                 with open(input_path, "rb") as f:
-                    read_idx      = 0
+                    read_idx = 0
                     file_exhausted = False
 
                     def _fill_pipeline():
@@ -535,8 +1024,8 @@ def main():
 
                     while unpack_queue:
                         orig_idx, fut = unpack_queue.popleft()
-                        img, is_magenta = fut.result()   # espera solo el frame más antiguo
-                        _fill_pipeline()                 # rellena el pipeline inmediatamente
+                        img, is_magenta = fut.result()
+                        _fill_pipeline()
                         _process_result(orig_idx, img, is_magenta)
 
                         if orig_idx % 10 == 0:
@@ -547,9 +1036,7 @@ def main():
                                   f"({(orig_idx+1)/num_frames*100:.1f}%) | Vel: {fps_proc:.2f} fps")
                             sys.stdout.flush()
 
-                # Vaciar buffer trailing (≤ MAX_GLITCH_RUN al final → glitches)
-                if pending_magenta:
-                    _flush_to_descarte()
+                glitch_filter.finalize()
 
                 if save_futures:
                     done, _ = wait(save_futures)
@@ -558,11 +1045,10 @@ def main():
                 unpack_pool.shutdown(wait=True)
                 save_pool.shutdown(wait=True)
 
-                if glitches_descartados:
-                    print(f"INFO|Glitches magenta descartados: {glitches_descartados} frames → {descarte_folder.name}")
+                if glitch_filter.discarded_count:
+                    print(f"INFO|Glitches magenta descartados: {glitch_filter.discarded_count} frames")
 
             elif is_tiff_seq_mode:
-                # MODO TIFF SEQUENCE (RGB procesado)
                 if not HAS_TIFFFILE:
                     print("ERROR|Se requiere tifffile para exportar TIFF. Instálalo: pip install tifffile")
                     return
@@ -574,7 +1060,6 @@ def main():
                             break
 
                         if not is_rgb:
-                            # Por diseño, tiff_seq se ofrece solo para fuentes RGB.
                             continue
 
                         img = np.frombuffer(raw_data, dtype=np.uint8).reshape(h, w, 3)
@@ -582,76 +1067,36 @@ def main():
                         tifffile.imwrite(str(tiff_folder / frame_name), img)
 
                         if i % 10 == 0:
-                            elapsed = time.time() - start_time
-                            fps_proc = (i + 1) / elapsed if elapsed > 0 else 0
-                            print(f"PROG|{i+1}|{num_frames}")
-                            print(f"INFO|Frame: {i+1}/{num_frames} ({(i+1)/num_frames*100:.1f}%) | Vel: {fps_proc:.2f} fps")
-                            sys.stdout.flush()
+                            _log_export_progress(i + 1, num_frames, start_time)
 
             else:
-                # MODO VIDEO (NO QOI): paralelizamos el procesado previo a FFmpeg
-                total_cores = multiprocessing.cpu_count()
-                video_workers = max(1, total_cores - 2)
-                print(f"INFO|Video multithreading: usando {video_workers} de {total_cores} cores (dejando 2 libres)")
+                use_glitch_filter = not is_rgb
+                glitch_filter = MagentaGlitchFilter() if use_glitch_filter else None
+                if use_glitch_filter:
+                    print(f"INFO|Filtro glitch magenta activo (misma regla que DNG, racha <={MAX_GLITCH_RUN})")
 
-                executor = ThreadPoolExecutor(max_workers=video_workers)
-                future_map = {}
-                next_to_write = 0
-                max_in_flight = video_workers * 4
-
-                def flush_ready_frames():
-                    nonlocal next_to_write
-                    while next_to_write in future_map and future_map[next_to_write].done():
-                        data_out = future_map[next_to_write].result()
-                        if process:
-                            try:
-                                process.stdin.write(data_out)
-                            except (BrokenPipeError, OSError):
-                                return False
-                        del future_map[next_to_write]
-                        next_to_write += 1
-                    return True
-
-                with open(input_path, "rb") as f:
-                    for i in range(num_frames):
-                        raw_data = f.read(frame_bytes)
-                        if len(raw_data) < frame_bytes:
-                            break
-
-                        fut = executor.submit(
-                            process_video_frame,
-                            raw_data,
-                            is_rgb,
-                            w,
-                            h,
-                            args.mode
+                writer = _create_video_frame_writer(video_ctx, args)
+                try:
+                    with open(input_path, "rb") as f:
+                        _export_video_ordered(
+                            f, num_frames, frame_bytes, writer,
+                            w, h, is_rgb, args, grade_settings,
+                            glitch_filter, start_time, skip_frames,
                         )
-                        future_map[i] = fut
-
-                        if len(future_map) >= max_in_flight:
-                            wait(list(future_map.values()), return_when=FIRST_COMPLETED)
-                            if not flush_ready_frames():
-                                break
-
-                        if i % 10 == 0:
-                            elapsed = time.time() - start_time
-                            fps_proc = (i + 1) / elapsed if elapsed > 0 else 0
-                            print(f"PROG|{i+1}|{num_frames}")
-                            print(f"INFO|Frame: {i+1}/{num_frames} ({(i+1)/num_frames*100:.1f}%) | Vel: {fps_proc:.2f} fps")
-                            sys.stdout.flush()
-
-                # Vaciar cualquier frame pendiente
-                if future_map:
-                    wait(list(future_map.values()))
-                    flush_ready_frames()
-                executor.shutdown(wait=True)
+                finally:
+                    writer.close()
+                _finish_video_export(video_ctx, args)
 
     except Exception as e:
         print(f"ERROR|{e}")
+        if video_ctx and video_ctx.get('stage_temp'):
+            tp = video_ctx['temp_path']
+            if tp.exists():
+                try:
+                    tp.unlink()
+                except OSError:
+                    pass
     finally:
-        if process and process.stdin: 
-            process.stdin.close()
-            process.wait()
         print("INFO|Proceso finalizado.")
 
 if __name__ == "__main__":
