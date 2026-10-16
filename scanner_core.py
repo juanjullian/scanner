@@ -1202,6 +1202,9 @@ class CameraWorker(QThread):
         self.apply_settings_from_file(self.device, self.settings_file)
         nodemap = self.device.nodemap
         self._apply_capture_hardware_settings(nodemap)
+        # Después del archivo: GainAuto=Off y recién ahí Gain=0. Si no, queda
+        # la ganancia alta de la calibración y la imagen sale con ruido.
+        self._force_manual_capture_levels(nodemap)
 
         try:
             self._isp_baseline = self._read_isp_camera_settings(nodemap)
@@ -1259,6 +1262,67 @@ class CameraWorker(QThread):
                 print(f"Error fijando resolución: {e}")
         except Exception as e:
             print(f"Warning _apply_capture_hardware_settings: {e}")
+
+    def _force_manual_capture_levels(self, nodemap):
+        """Deja disparo externo, auto apagado y ganancia en 0.
+
+        config_bayer.txt escribe Gain antes de GainAuto=Off. Con la autoganancia
+        de la calibración todavía activa, Gain no es escribible; al apagarla la
+        cámara conserva el valor alto y la imagen queda ruidosa.
+        """
+        self._set_exposure_auto_off(nodemap)
+        try:
+            ga = nodemap.get_node("GainAuto")
+            if ga is not None:
+                try:
+                    ga.value = "Off"
+                except Exception:
+                    if hasattr(ga, "from_string"):
+                        ga.from_string("Off")
+        except Exception as e:
+            print(f"WARN GainAuto Off (arranque): {e}")
+        try:
+            gs = nodemap.get_node("GainSelector")
+            if gs is not None:
+                gs.value = "All"
+            node_gain = nodemap.get_node("Gain")
+            if node_gain is not None:
+                q = self._quantize_gain(node_gain, 0.0)
+                node_gain.value = float(q)
+                read = float(node_gain.value)
+                if abs(read) > 0.05:
+                    time.sleep(0.05)
+                    node_gain = nodemap.get_node("Gain")
+                    q = self._quantize_gain(node_gain, 0.0)
+                    node_gain.value = float(q)
+                    read = float(node_gain.value)
+                print(f"INFO: Gain manual = {read}")
+        except Exception as e:
+            print(f"WARN Gain manual: {e}")
+        try:
+            bls = nodemap.get_node("BlackLevelSelector")
+            if bls is not None:
+                bls.value = "All"
+            bl = nodemap.get_node("BlackLevel")
+            if bl is not None:
+                bl.value = float(self._clamp_to_node(bl, 0.0))
+        except Exception as e:
+            print(f"WARN BlackLevel manual: {e}")
+        try:
+            ts = nodemap.get_node("TriggerSelector")
+            if ts is not None:
+                ts.value = "FrameStart"
+            tm = nodemap.get_node("TriggerMode")
+            if tm is not None:
+                try:
+                    tm.value = "On"
+                except Exception:
+                    tm.value = True
+            src = nodemap.get_node("TriggerSource")
+            if src is not None:
+                src.value = "Line0"
+        except Exception as e:
+            print(f"WARN TriggerMode arranque: {e}")
 
     def apply_settings_from_file(self, device, filepath):
         if not os.path.exists(filepath): 

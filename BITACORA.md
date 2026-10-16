@@ -1,5 +1,18 @@
 # Bitácora — Lucid Scanner
 
+## 2026-10-16 — Restaurar la cámara al salir de calibración
+
+### Por qué
+Al abrir **Calibrar posición de cámara** la PHX pasa a corrida libre: `TriggerMode Off`, `ExposureAuto Continuous` y `GainAuto Continuous`. Al cerrar el visor se reaplicaba `config_bayer.txt` en caliente. Ese archivo escribe `TriggerMode` y `Gain` antes de apagar la autoexposición y la autoganancia, y esos nodos no son escribibles mientras el automático sigue activo. El disparo no volvía, y la ganancia alta de la calibración se quedaba pegada (imagen con mucho ruido). Solo un cierre completo del programa recargaba el user set de fábrica.
+
+### Cómo
+- Al cerrar el visor se destruye el `CameraWorker` y se crea uno nuevo, el mismo camino que al abrir el programa (`setup_camera` + exposición, preview e ISP actuales).
+- Después de cargar `config_bayer.txt`, `_force_manual_capture_levels` apaga `ExposureAuto` y `GainAuto`, fija `Gain` y black level en 0, y deja `TriggerMode On` con fuente `Line0`.
+- Mientras rearma, el indicador queda naranja y el toast dice que se está restaurando la configuración.
+
+### Hecho
+- Salir de calibración devuelve el disparo externo y la ganancia manual del arranque, sin tener que cerrar el programa.
+
 ## 2026-06-11 — Exportación y bloqueo de cierre
 
 ### Exportación de video (no-DNG)

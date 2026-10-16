@@ -733,12 +733,8 @@ class CameraCalibrationDialog(QDialog):
                 w.image_received.disconnect(self._on_frame)
             except (TypeError, RuntimeError):
                 pass
-            mw = self.main_window
-            idx = mw.sld_exposure.value()
-            short = idx == mw.SHORT_EXP_IDX
-            val = mw.EXP_STEPS[idx]
-            w.set_restore_exposure_after_calibration(short, val)
-            w.request_calibration_live_mode(False)
+        # El diálogo se cierra primero; el rearme corre en el siguiente ciclo de la UI.
+        QTimer.singleShot(0, self.main_window.restart_camera_after_calibration)
 
     def accept(self):
         self._restore_camera()
@@ -887,6 +883,7 @@ class MainWindow(QMainWindow):
         }
         self._calibration_dialog = None
         self._timer_dialog = None
+        self._restore_config_toast = False
         self._execution_state_key = None  # None | (display, system) último estado aplicado
 
         # Variables visor
@@ -1474,6 +1471,33 @@ class MainWindow(QMainWindow):
             self.camera_worker.stop()
             self.camera_worker.wait()
         self.init_camera_thread()
+
+    def restart_camera_after_calibration(self):
+        """Destruye la cámara y la rearma como al abrir el programa.
+
+        Reaplicar config_bayer.txt en caliente no restaura TriggerMode: el archivo
+        lo escribe antes de apagar ExposureAuto, y esos nodos no son escribibles
+        mientras la calibración dejó la autoexposición activa.
+        """
+        if self.is_recording or not self.camera_worker:
+            return
+        self._persist["ui"] = self._collect_ui_persist()
+        self._persist["isp"] = self._collect_isp_persist()
+        idx = self.sld_exposure.value()
+        self._pending_exp_short = idx == self.SHORT_EXP_IDX
+        self._pending_exp_val = self.EXP_STEPS[idx]
+
+        self._camera_connected = False
+        self._restore_config_toast = True
+        self.lbl_cam_status.setStyleSheet("color: #ff9800; font-size: 14pt; margin-right: 4px;")
+        self.lbl_cam_status.setToolTip("Restaurando configuración de cámara…")
+        self.show_toast("Restaurando configuración de cámara…", 2500)
+        self._update_calibrate_camera_btn()
+
+        self.camera_worker.stop()
+        self.camera_worker.wait()
+        self.camera_worker = None
+        self.start_camera_thread()
 
     def _export_blocks_system_sleep(self) -> bool:
         """Cola por lotes o worker TIF activo."""
@@ -2063,7 +2087,10 @@ class MainWindow(QMainWindow):
             self.lbl_cam_status.setToolTip("Cámara conectada")
             if not was_connected:
                 self._pending_config_toast = True
-                self.show_toast("Cámara conectada", 2500)
+                if self._restore_config_toast:
+                    self._restore_config_toast = False
+                else:
+                    self.show_toast("Cámara conectada", 2500)
             if self.active_collection and not self.is_recording:
                 self.btn_record.setEnabled(True)
                 self.btn_record.setText("INICIAR CAPTURA")
