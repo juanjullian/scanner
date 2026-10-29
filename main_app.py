@@ -416,8 +416,11 @@ class BatchExportDialog(QDialog):
             # Fuente Bayer: Opciones completas con DNG
             self.combo_fmt.addItems([
                 "DNG Raw Sequence (DaVinci Resolve - 16bit) [Recomendado]",
-                "ProRes 4444 (Premiere - 12bit - Alta Calidad)", 
-                "GoPro CineForm (Premiere - 12bit - Intermedio)", 
+                "EXR lineal (secuencia half, clip del sensor = 1.0)",
+                "ProRes 4444 XQ (revelado Rec.709)",
+                "HEVC 4:4:4 lossless NVENC 10-bit (revelado Rec.709)",
+                "ProRes 4444 (Premiere - 12bit - Alta Calidad)",
+                "GoPro CineForm (Premiere - 12bit - Intermedio)",
                 "ProRes 422 HQ (Premiere - 10bit - Estándar)",
                 "HEVC 10-bit 4:4:4 (MP4 - Eficiente)",
                 "AV1 NVENC 10-bit (MP4 - Eficiente)",
@@ -432,7 +435,7 @@ class BatchExportDialog(QDialog):
             self.combo_sharp = QComboBox()
             self.combo_sharp.addItems(["N/A (ISP de cámara)"])
         else:
-            sett_layout.addWidget(QLabel("Perfil de Revelado (Solo Video - No afecta DNG):"))
+            sett_layout.addWidget(QLabel("Perfil de Revelado (solo el video con gamma; no afecta DNG, EXR, ProRes XQ ni HEVC lossless):"))
             self.combo_sharp = QComboBox()
             self.combo_sharp.addItems([
                 "DCB Puro",
@@ -442,7 +445,23 @@ class BatchExportDialog(QDialog):
             ])
             self.combo_sharp.setCurrentIndex(3)
         sett_layout.addWidget(self.combo_sharp)
-        
+
+        if not self.source_is_processed:
+            from reveal_pipeline import coerce_reveal, summary_line
+            host = self.parent()
+            saved = host._persist.get("reveal") if host is not None and hasattr(host, "_persist") else None
+            self._reveal = coerce_reveal(saved)
+            hint = QLabel("Opcional. Se guarda y se aplica al exportar ProRes 4444 XQ o HEVC lossless NVENC.")
+            hint.setWordWrap(True)
+            hint.setStyleSheet("color: #888; font-size: 9pt;")
+            sett_layout.addWidget(hint)
+            self.lbl_reveal = QLabel(summary_line(self._reveal))
+            self.lbl_reveal.setWordWrap(True)
+            sett_layout.addWidget(self.lbl_reveal)
+            btn_reveal = QPushButton("Ajustes de revelado…")
+            btn_reveal.clicked.connect(self._open_reveal)
+            sett_layout.addWidget(btn_reveal)
+
         settings_group.setLayout(sett_layout)
         layout.addWidget(settings_group)
         
@@ -534,11 +553,31 @@ class BatchExportDialog(QDialog):
             fmt_map = {0: 'tiff_seq', 1: 'prores', 2: 'prores_hq', 3: 'hevc', 4: 'av1', 5: 'h264'}
             sharp = '0,0'
         else:
-            fmt_map = {0: 'dng', 1: 'prores', 2: 'cineform', 3: 'prores_hq', 4: 'hevc', 5: 'av1', 6: 'h264'}
+            fmt_map = {
+                0: 'dng', 1: 'exr', 2: 'prores_xq', 3: 'hevc_nvenc', 4: 'prores',
+                5: 'cineform', 6: 'prores_hq', 7: 'hevc', 8: 'av1', 9: 'h264',
+            }
             sharp_map = {0: '0,0', 1: '0.8,1.5', 2: '1.3,1.5', 3: '2.0,2.5'}
             sharp = sharp_map.get(self.combo_sharp.currentIndex(), '0,0')
         
         return files, fmt_map.get(self.combo_fmt.currentIndex(), 'dng'), sharp
+
+    def _open_reveal(self):
+        from reveal_dialog import RevealDialog
+        from reveal_pipeline import summary_line
+        files = [self.list_widget.item(i).text() for i in range(self.list_widget.count())]
+        current = self.list_widget.currentItem()
+        start = current.text() if current is not None else (files[0] if files else None)
+        dlg = RevealDialog(
+            self, Path(self.root) / self.coll, files, self.collection_meta, self._reveal, start,
+        )
+        if dlg.exec():
+            self._reveal = dlg.settings()
+            host = self.parent()
+            if host is not None and hasattr(host, "_persist"):
+                host._persist["reveal"] = self._reveal
+                host.save_config()
+            self.lbl_reveal.setText(summary_line(self._reveal))
 
 
 class CalibrationLiveViewer(QWidget):
@@ -946,6 +985,14 @@ class MainWindow(QMainWindow):
             "isp": {
                 "tone": [2.0, 0.0, 1.0],
             },
+            "reveal": {
+                "gain_r": 1.0,
+                "gain_b": 1.0,
+                "ev": 0.0,
+                "shadow_b": 12.0,
+                "shadow_lift": 0.0,
+                "midtone": 0.0,
+            },
         }
 
     @staticmethod
@@ -1180,9 +1227,12 @@ class MainWindow(QMainWindow):
         btn_group = QGroupBox("Opciones")
         bg_layout = QVBoxLayout()
         btn_change_root = QPushButton("📂 Directorio Datos"); btn_change_root.clicked.connect(self.change_root_folder)
+        btn_dng_reveal = QPushButton("Revelar secuencias DNG…")
+        btn_dng_reveal.clicked.connect(self.open_dng_reveal)
         
         bg_layout.addWidget(btn_refresh)
         bg_layout.addWidget(btn_change_root)
+        bg_layout.addWidget(btn_dng_reveal)
         btn_group.setLayout(bg_layout)
         
         left_layout.addWidget(btn_group)
@@ -2330,6 +2380,8 @@ class MainWindow(QMainWindow):
         settings = confirm_dlg.get_all_settings().get(
             target_input.name, default_settings_for_file(target_input.name, coll_meta, "tif"),
         )
+        tif_dir = Path(settings.get("output_dir") or target_input.parent)
+        tif_dest = tif_dir / settings["output_name"]
 
         self.pd_tif = QProgressDialog(f"Procesando {target_input.name}...", "Cancelar", 0, 100, self)
         self.pd_tif.setWindowTitle("Exportando Secuencia TIF")
@@ -2341,7 +2393,7 @@ class MainWindow(QMainWindow):
         # 2. Configurar Worker
         cmd = [
             sys.executable, "l2t.py", str(target_input),
-            "--output-dir", settings["output_name"],
+            "--output-dir", str(tif_dest),
         ]
         
         self.tif_worker = UniversalExportWorker(cmd)
@@ -2352,7 +2404,7 @@ class MainWindow(QMainWindow):
         self.tif_worker.finished_signal.connect(self.on_tif_finished)
         self.pd_tif.canceled.connect(self.on_tif_cancelled)
         
-        self.current_tif_output = target_input.parent / settings["output_name"]
+        self.current_tif_output = tif_dest
         
         # 4. Iniciar
         self.tif_worker.start()
@@ -2437,6 +2489,53 @@ class MainWindow(QMainWindow):
             if not self.is_exporting_batch:
                 self.process_export_queue()
 
+    def open_dng_reveal(self):
+        if self.is_exporting_batch:
+            QMessageBox.information(self, "Ocupado", "Hay una exportación en curso.")
+            return
+        dlg = DngRevealDialog(self)
+        if not dlg.exec():
+            return
+        self.dng_jobs = dlg.jobs()
+        self._start_next_dng_job()
+
+    def _start_next_dng_job(self):
+        if not getattr(self, "dng_jobs", None):
+            self.is_exporting_batch = False
+            self._sync_execution_state()
+            QMessageBox.information(self, "Fin", "Secuencias reveladas.")
+            return
+        self.is_exporting_batch = True
+        self._sync_execution_state()
+        job = self.dng_jobs.pop(0)
+        self.current_video_output = Path(job["output"])
+        left = 1 + len(self.dng_jobs)
+        self.pd = QProgressDialog(
+            f"Revelando {job['label']}…  ({left} en cola)",
+            "Cancelar", 0, 100, self,
+        )
+        self.pd.setWindowModality(Qt.WindowModality.ApplicationModal)
+        self.pd.setAutoClose(False)
+        self.pd.setValue(0)
+        self.pd.show()
+        self.worker = UniversalExportWorker(job["cmd"])
+        self.worker.progress_signal.connect(self.pd.setValue)
+        self.worker.info_signal.connect(self.pd.setLabelText)
+        self.worker.finished_signal.connect(self._on_dng_job_finished)
+        self.pd.canceled.connect(self.on_batch_cancel)
+        self.worker.start()
+
+    def _on_dng_job_finished(self, ok, message):
+        try:
+            self.pd.canceled.disconnect(self.on_batch_cancel)
+        except Exception:
+            pass
+        if not self.pd.wasCanceled():
+            self.pd.close()
+            if not ok:
+                print(f"Error revelado DNG: {message}")
+            self._start_next_dng_job()
+
     def process_export_queue(self):
         if not self.export_queue:
             self.is_exporting_batch = False
@@ -2461,6 +2560,7 @@ class MainWindow(QMainWindow):
         mode = "BW" if "Blanco" in info.get("type", "Color") else "COLOR"
         fps = int((settings or {}).get("fps", info.get("fps", 18)))
         output_name = (settings or {}).get("output_name")
+        output_dir = Path((settings or {}).get("output_dir") or nf.parent)
         pixel_fmt = info.get("pixel_format", "bayer")
 
         # Si el usuario pidió DNG pero el archivo es RGB procesado (no Bayer),
@@ -2474,6 +2574,15 @@ class MainWindow(QMainWindow):
                 f"\"{nf.name}\" fue capturado en RGB procesado por la cámara.\n"
                 f"No es posible exportarlo como DNG RAW, se usará TIFF 8-bit Sequence en su lugar."
             )
+        if effective_fmt in ("exr", "prores_xq", "hevc_nvenc") and pixel_fmt in ("rgb", "qoi_rgb"):
+            QMessageBox.information(
+                self,
+                "Aviso de formato",
+                f"\"{nf.name}\" fue capturado en RGB ya revelado.\n"
+                "EXR lineal, ProRes 4444 XQ y HEVC lossless solo salen de un RAW Bayer.",
+            )
+            self.process_export_queue()
+            return
         
         print(f"Procesando: {nf.name} | Colección: {collection_name} | Modo: {mode} | pixel_fmt={pixel_fmt} | codec={effective_fmt}")
         
@@ -2491,31 +2600,35 @@ class MainWindow(QMainWindow):
             "--mode", mode,
         ]
         if output_name:
-            cmd.extend(["--output", output_name])
+            dest = output_dir / output_name
+        elif effective_fmt == "dng":
+            dest = output_dir / f"{nf.stem}_DNG_SEQ"
+        elif effective_fmt == "exr":
+            dest = output_dir / f"{nf.stem}_EXR_SEQ"
+        elif effective_fmt == "tiff_seq":
+            dest = output_dir / f"{nf.stem}_TIFF_SEQ"
+        else:
+            ext_map = {
+                "prores": ".mov", "prores_hq": ".mov", "prores_xq": ".mov", "ffv1": ".mkv",
+                "h264": ".mp4", "hevc": ".mp4", "hevc_nvenc": ".mp4", "cineform": ".mov", "av1": ".mp4",
+            }
+            ext = ext_map.get(effective_fmt, ".mp4")
+            dest = output_dir / f"{nf.stem}_{effective_fmt}{ext}"
+        cmd.extend(["--output", str(dest)])
+        self.current_video_output = dest
 
         grade = (settings or {}).get("grade")
-        if grade and grade.get("enabled"):
+        if grade and grade.get("enabled") and effective_fmt not in ("exr", "prores_xq", "hevc_nvenc"):
             cmd.extend(["--grade", json.dumps(grade)])
+        if effective_fmt in ("prores_xq", "hevc_nvenc"):
+            from reveal_pipeline import coerce_reveal
+            cmd.extend(["--reveal", json.dumps(coerce_reveal(self._persist.get("reveal")))])
 
         if settings and settings.get("test_export"):
             from export_grade import TEST_EXPORT_SKIP_FRAMES, TEST_EXPORT_FRAME_COUNT
             cmd.extend(["--skip-frames", str(TEST_EXPORT_SKIP_FRAMES)])
             cmd.extend(["--max-frames", str(TEST_EXPORT_FRAME_COUNT)])
 
-        if output_name:
-            self.current_video_output = nf.parent / output_name
-        elif effective_fmt == 'dng':
-            self.current_video_output = nf.parent / f"{nf.stem}_DNG_SEQ"
-        elif effective_fmt == 'tiff_seq':
-            self.current_video_output = nf.parent / f"{nf.stem}_TIFF_SEQ"
-        else:
-            ext_map = {
-                'prores': '.mov', 'prores_hq': '.mov', 'ffv1': '.mkv',
-                'h264': '.mp4', 'hevc': '.mp4', 'cineform': '.mov', 'av1': '.mp4',
-            }
-            ext = ext_map.get(effective_fmt, ".mp4")
-            self.current_video_output = nf.parent / f"{nf.stem}_{effective_fmt}{ext}"
-        
         self.worker = UniversalExportWorker(cmd)
         self.worker.progress_signal.connect(self.pd.setValue)
         self.worker.info_signal.connect(self.pd.setLabelText)
@@ -2526,6 +2639,7 @@ class MainWindow(QMainWindow):
 
     def on_batch_cancel(self):
         self.export_queue = [] # Detener resto de la cola
+        self.dng_jobs = []
         self.is_exporting_batch = False
         if self.worker: self.worker.kill()
         
@@ -2668,6 +2782,170 @@ class MainWindow(QMainWindow):
         if self.camera_worker: self.camera_worker.stop()
         if self.writer_worker: self.writer_worker.stop()
         e.accept()
+
+class DngRevealDialog(QDialog):
+    """Carpetas de secuencia DNG → ProRes 4444 XQ o HEVC, con el revelado guardado."""
+
+    def __init__(self, host):
+        super().__init__(host)
+        self.setWindowTitle("Revelar secuencias DNG")
+        self.resize(640, 520)
+        self._host = host
+        self._folders: list[Path] = []
+        from reveal_pipeline import coerce_reveal, summary_line
+        saved = host._persist.get("reveal") if hasattr(host, "_persist") else None
+        self._reveal = coerce_reveal(saved)
+
+        layout = QVBoxLayout(self)
+        layout.addWidget(QLabel("Carpetas con los DNG que exportó esta app."))
+        self.list = QListWidget()
+        layout.addWidget(self.list, 1)
+        row = QHBoxLayout()
+        btn_add = QPushButton("Agregar carpeta")
+        btn_add.clicked.connect(self._add_one)
+        btn_kids = QPushButton("Agregar las de adentro")
+        btn_kids.clicked.connect(self._add_children)
+        btn_del = QPushButton("Quitar")
+        btn_del.clicked.connect(self._remove)
+        row.addWidget(btn_add)
+        row.addWidget(btn_kids)
+        row.addWidget(btn_del)
+        layout.addLayout(row)
+
+        form = QHBoxLayout()
+        form.addWidget(QLabel("Codec"))
+        self.codec = QComboBox()
+        self.codec.addItem("ProRes 4444 XQ", "prores_xq")
+        self.codec.addItem("HEVC 4:4:4 lossless NVENC", "hevc_nvenc")
+        form.addWidget(self.codec, 1)
+        form.addWidget(QLabel("FPS"))
+        self.fps = QSpinBox()
+        self.fps.setRange(1, 60)
+        self.fps.setValue(16)
+        form.addWidget(self.fps)
+        layout.addLayout(form)
+
+        self.bw = QCheckBox("Blanco y negro")
+        layout.addWidget(self.bw)
+
+        out_row = QHBoxLayout()
+        self.lbl_out = QLabel("Carpeta de salida: sin elegir")
+        self.lbl_out.setWordWrap(True)
+        btn_out = QPushButton("Elegir carpeta de salida")
+        btn_out.clicked.connect(self._pick_out)
+        out_row.addWidget(self.lbl_out, 1)
+        out_row.addWidget(btn_out)
+        layout.addLayout(out_row)
+        self._out = None
+
+        note = QLabel(summary_line(self._reveal))
+        note.setWordWrap(True)
+        layout.addWidget(note)
+        hint = QLabel(
+            "Se aplica ese revelado a cada carpeta, en orden. "
+            "El filtro magenta no se vuelve a correr: ya quedó al exportar los DNG. "
+            "Si el archivo de salida existe, se le agrega un número."
+        )
+        hint.setWordWrap(True)
+        hint.setStyleSheet("color: #888; font-size: 9pt;")
+        layout.addWidget(hint)
+
+        buttons = QHBoxLayout()
+        btn_go = QPushButton("Iniciar lote")
+        btn_go.clicked.connect(self._accept)
+        btn_cancel = QPushButton("Cancelar")
+        btn_cancel.clicked.connect(self.reject)
+        buttons.addStretch(1)
+        buttons.addWidget(btn_cancel)
+        buttons.addWidget(btn_go)
+        layout.addLayout(buttons)
+
+    def _add_folder(self, folder: Path):
+        folder = folder.resolve()
+        if folder in self._folders:
+            return True
+        count = sum(1 for p in folder.iterdir() if p.is_file() and p.suffix.lower() == ".dng")
+        if count <= 0:
+            return False
+        self._folders.append(folder)
+        self.list.addItem(f"{folder.name}  ({count} cuadros)")
+        return True
+
+    def _add_one(self):
+        start = str(self._out or Path.home())
+        chosen = QFileDialog.getExistingDirectory(self, "Carpeta de la secuencia DNG", start)
+        if not chosen:
+            return
+        if not self._add_folder(Path(chosen)):
+            QMessageBox.information(self, "Sin DNG", "Esa carpeta no tiene archivos .dng.")
+
+    def _add_children(self):
+        start = str(self._out or Path.home())
+        chosen = QFileDialog.getExistingDirectory(self, "Carpeta que contiene las secuencias", start)
+        if not chosen:
+            return
+        added = 0
+        for child in sorted(Path(chosen).iterdir()):
+            if child.is_dir() and self._add_folder(child):
+                added += 1
+        if added == 0:
+            QMessageBox.information(
+                self, "Sin secuencias",
+                "Ninguna subcarpeta tiene archivos .dng.",
+            )
+
+    def _remove(self):
+        row = self.list.currentRow()
+        if row < 0:
+            return
+        self.list.takeItem(row)
+        del self._folders[row]
+
+    def _pick_out(self):
+        start = str(self._out or Path.home())
+        chosen = QFileDialog.getExistingDirectory(self, "Carpeta de salida", start)
+        if not chosen:
+            return
+        self._out = Path(chosen)
+        self.lbl_out.setText(f"Carpeta de salida: {self._out}")
+
+    def _accept(self):
+        if not self._folders:
+            QMessageBox.information(self, "Falta la secuencia", "Agrega al menos una carpeta con DNG.")
+            return
+        if self._out is None:
+            QMessageBox.information(self, "Falta la salida", "Elige la carpeta donde se guardan los videos.")
+            return
+        self.accept()
+
+    def jobs(self) -> list[dict]:
+        codec = self.codec.currentData()
+        ext = ".mp4" if codec == "hevc_nvenc" else ".mov"
+        mode = "BW" if self.bw.isChecked() else "COLOR"
+        script = str(Path(__file__).resolve().parent / "raw2video.py")
+        reveal = json.dumps(self._reveal)
+        used = set()
+        jobs = []
+        for folder in self._folders:
+            stem = folder.name[:-8] if folder.name.endswith("_DNG_SEQ") else folder.name
+            dest = self._out / f"{stem}_{codec}{ext}"
+            n = 2
+            while dest in used or dest.exists():
+                dest = self._out / f"{stem}_{codec}_{n}{ext}"
+                n += 1
+            used.add(dest)
+            cmd = [
+                sys.executable, script,
+                "--dng-dir", str(folder),
+                "--codec", codec,
+                "--fps", str(int(self.fps.value())),
+                "--mode", mode,
+                "--output", str(dest),
+                "--reveal", reveal,
+            ]
+            jobs.append({"cmd": cmd, "output": str(dest), "label": folder.name})
+        return jobs
+
 
 # --- CLASE WORKER ---
 # --- WORKER UNIVERSAL (VIDEO + TIF) ---

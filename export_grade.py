@@ -15,7 +15,7 @@ from PyQt6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
     QTableWidget, QTableWidgetItem, QHeaderView, QLineEdit, QSpinBox,
     QAbstractItemView, QWidget, QSlider, QGroupBox, QCheckBox,
-    QGridLayout, QDoubleSpinBox,
+    QGridLayout, QDoubleSpinBox, QFileDialog,
 )
 
 import scanner_core
@@ -29,8 +29,10 @@ RAW12_MAX = 4095
 _EXT_MAP = {
     "prores": ".mov",
     "prores_hq": ".mov",
+    "prores_xq": ".mov",
     "cineform": ".mov",
     "hevc": ".mp4",
+    "hevc_nvenc": ".mp4",
     "h264": ".mp4",
     "av1": ".mp4",
     "ffv1": ".mkv",
@@ -78,6 +80,8 @@ def default_output_name(stem: str, fmt: str) -> str:
         return f"{stem}_TIFF_SEQ"
     if fmt == "dng":
         return f"{stem}_DNG_SEQ"
+    if fmt == "exr":
+        return f"{stem}_EXR_SEQ"
     if fmt == "tif":
         return stem
     ext = _EXT_MAP.get(fmt, ".mp4")
@@ -1176,14 +1180,37 @@ class ExportConfirmDialog(QDialog):
         self._grade_settings: dict[str, dict] = {}
         self._grade_labels: dict[str, QLabel] = {}
         self._test_checks: dict[str, QCheckBox] = {}
-        self._show_grade = fmt not in ("tiff_seq", "dng", "tif")
+        self._show_grade = fmt not in ("tiff_seq", "dng", "tif", "exr", "prores_xq", "hevc_nvenc")
+        self._show_test = self._show_grade or fmt in ("exr", "prores_xq", "hevc_nvenc")
 
         self.setWindowTitle("Confirmar exportación")
         self.setMinimumSize(920, 480)
         self.resize(980, 580)
 
         layout = QVBoxLayout(self)
-        if self._show_grade:
+        if fmt == "exr":
+            info_text = (
+                "Secuencia OpenEXR half en RGB lineal: 1.0 es el clip del sensor (código 4095). "
+                "Mismo debayer que el visor HQ, sin gamma ni gradación. "
+                "Los cuadros rosados cortos se descartan. "
+                "En Resolve o Nuke, interpreta el EXR como lineal. "
+                "Marca Prueba para exportar solo un tramo."
+            )
+        elif fmt == "prores_xq":
+            info_text = (
+                "ProRes 4444 XQ con el revelado guardado. La imagen ya queda en Rec.709. "
+                "Los cuadros rosados cortos se descartan. "
+                "Este FFmpeg escribe el perfil XQ en 10 bits 4:4:4. "
+                "Marca Prueba para exportar solo un tramo."
+            )
+        elif fmt == "hevc_nvenc":
+            info_text = (
+                "HEVC 4:4:4 lossless por la GPU, con el mismo revelado guardado del ProRes XQ. "
+                "La imagen queda en Rec.709, 10 bits, sin pérdida en el codec. "
+                "Los cuadros rosados cortos se descartan. "
+                "Marca Prueba para exportar solo un tramo."
+            )
+        elif self._show_grade:
             info_text = (
                 "Revisa el nombre de salida y los FPS de cada archivo. "
                 "Por defecto se exporta con el ISP de la cámara (Arena), sin gradación extra. "
@@ -1199,10 +1226,26 @@ class ExportConfirmDialog(QDialog):
         info.setStyleSheet("color: #aaa; font-size: 9pt;")
         layout.addWidget(info)
 
-        col_count = 6 if self._show_grade else 4
+        self._default_output_dir = self.root / self.collection
+        self._output_dir = self._default_output_dir
+        dir_row = QHBoxLayout()
+        self.lbl_output_dir = QLabel(f"Carpeta de salida: {self._output_dir}")
+        self.lbl_output_dir.setWordWrap(True)
+        btn_dir = QPushButton("Elegir carpeta")
+        btn_dir.clicked.connect(self._pick_output_dir)
+        btn_dir_reset = QPushButton("Junto al archivo")
+        btn_dir_reset.clicked.connect(self._reset_output_dir)
+        dir_row.addWidget(self.lbl_output_dir, 1)
+        dir_row.addWidget(btn_dir)
+        dir_row.addWidget(btn_dir_reset)
+        layout.addLayout(dir_row)
+
         headers = ["", "Archivo origen", "Nombre de salida", "FPS"]
         if self._show_grade:
-            headers.extend(["Gradación", "Prueba"])
+            headers.append("Gradación")
+        if self._show_test:
+            headers.append("Prueba")
+        col_count = len(headers)
         self.table = QTableWidget(len(self.filenames), col_count)
         self.table.setHorizontalHeaderLabels(headers)
         hdr = self.table.horizontalHeader()
@@ -1210,14 +1253,20 @@ class ExportConfirmDialog(QDialog):
         hdr.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
         hdr.setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
         hdr.setSectionResizeMode(3, QHeaderView.ResizeMode.Fixed)
+        extra_col = 4
         if self._show_grade:
-            hdr.setSectionResizeMode(4, QHeaderView.ResizeMode.Fixed)
-            hdr.setSectionResizeMode(5, QHeaderView.ResizeMode.Fixed)
+            hdr.setSectionResizeMode(extra_col, QHeaderView.ResizeMode.Fixed)
+            extra_col += 1
+        if self._show_test:
+            hdr.setSectionResizeMode(extra_col, QHeaderView.ResizeMode.Fixed)
         self.table.setColumnWidth(0, 180)
         self.table.setColumnWidth(3, 72)
+        extra_col = 4
         if self._show_grade:
-            self.table.setColumnWidth(4, 130)
-            self.table.setColumnWidth(5, 72)
+            self.table.setColumnWidth(extra_col, 130)
+            extra_col += 1
+        if self._show_test:
+            self.table.setColumnWidth(extra_col, 72)
         self.table.verticalHeader().setVisible(False)
         self.table.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
         self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
@@ -1255,6 +1304,7 @@ class ExportConfirmDialog(QDialog):
             self.table.setCellWidget(row, 3, fps_wrap)
 
             self._grade_settings[fn] = defaults["grade"]
+            col = 4
             if self._show_grade:
                 grade_wrap = QWidget()
                 grade_lay = QVBoxLayout(grade_wrap)
@@ -1266,8 +1316,10 @@ class ExportConfirmDialog(QDialog):
                 btn_grade.clicked.connect(lambda _checked=False, f=fn: self._open_grade_dialog(f))
                 grade_lay.addWidget(lbl_grade)
                 grade_lay.addWidget(btn_grade)
-                self.table.setCellWidget(row, 4, grade_wrap)
+                self.table.setCellWidget(row, col, grade_wrap)
+                col += 1
 
+            if self._show_test:
                 test_wrap = QWidget()
                 test_lay = QHBoxLayout(test_wrap)
                 test_lay.setContentsMargins(4, 0, 4, 0)
@@ -1279,18 +1331,20 @@ class ExportConfirmDialog(QDialog):
                 )
                 self._test_checks[fn] = chk_test
                 test_lay.addWidget(chk_test)
-                self.table.setCellWidget(row, 5, test_wrap)
+                self.table.setCellWidget(row, col, test_wrap)
 
         layout.addWidget(self.table, 1)
 
-        if self._show_grade:
+        if self._show_grade or self._show_test:
             copy_row = QHBoxLayout()
-            self.chk_copy_grade = QCheckBox("Copiar gradación del primer archivo a todos al ajustar")
-            copy_row.addWidget(self.chk_copy_grade)
-            self.chk_copy_test = QCheckBox(
-                f"Marcar prueba ({TEST_EXPORT_FRAME_COUNT} cuadros desde #{TEST_EXPORT_SKIP_FRAMES + 1}) en todos"
-            )
-            copy_row.addWidget(self.chk_copy_test)
+            if self._show_grade:
+                self.chk_copy_grade = QCheckBox("Copiar gradación del primer archivo a todos al ajustar")
+                copy_row.addWidget(self.chk_copy_grade)
+            if self._show_test:
+                self.chk_copy_test = QCheckBox(
+                    f"Marcar prueba ({TEST_EXPORT_FRAME_COUNT} cuadros desde #{TEST_EXPORT_SKIP_FRAMES + 1}) en todos"
+                )
+                copy_row.addWidget(self.chk_copy_test)
             copy_row.addStretch()
             layout.addLayout(copy_row)
 
@@ -1339,6 +1393,20 @@ class ExportConfirmDialog(QDialog):
                 self._grade_settings[fn] = copy.deepcopy(new_grade)
                 self._grade_labels[fn].setText(self._grade_status_text(new_grade))
 
+    def _set_output_dir(self, folder: Path):
+        self._output_dir = folder
+        self.lbl_output_dir.setText(f"Carpeta de salida: {folder}")
+
+    def _pick_output_dir(self):
+        chosen = QFileDialog.getExistingDirectory(
+            self, "Carpeta de salida", str(self._output_dir),
+        )
+        if chosen:
+            self._set_output_dir(Path(chosen))
+
+    def _reset_output_dir(self):
+        self._set_output_dir(self._default_output_dir)
+
     def _on_export(self):
         from PyQt6.QtWidgets import QMessageBox
         if getattr(self, "chk_copy_test", None) and self.chk_copy_test.isChecked():
@@ -1358,6 +1426,7 @@ class ExportConfirmDialog(QDialog):
         for fn in self.filenames:
             entry = {
                 "output_name": self._output_edits[fn].text().strip(),
+                "output_dir": str(self._output_dir),
                 "fps": int(self._fps_spins[fn].value()),
                 "grade": copy.deepcopy(self._grade_settings.get(fn, default_grade_settings())),
             }

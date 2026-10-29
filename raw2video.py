@@ -1,10 +1,12 @@
+import os
+os.environ.setdefault("OPENCV_IO_ENABLE_OPENEXR", "1")
+
 import subprocess
 import struct
 import numpy as np
 import cv2
 import argparse
 import sys
-import os
 import json
 import time
 from pathlib import Path
@@ -17,6 +19,11 @@ from collections import deque
 
 FFMPEG_STDIN_BUFSIZE = 4 * 1024 * 1024  # buffer tubería stdin → FFmpeg
 RESERVE_CORES_FOR_OS = 2  # cores libres para el SO (p. ej. E-cores en i7 híbrido)
+XQ_REVEAL_WORKERS = 4  # revelado XQ: el resto de los núcleos queda para prores_ks
+# Mismos ajustes de revelado, otro contenedor.
+REVEAL_CODECS = frozenset({"prores_xq", "hevc_nvenc"})
+# El encoder corre en la GPU. AV1 ya iba por NVENC; HEVC lossless también.
+HW_ENCODER_CODECS = frozenset({"hevc_nvenc", "av1"})
 DETECT_PREFETCH_WORKERS = 2  # detección glitch: pocos hilos, el resto va al procesado
 PROCESS_DEPTH_EXTRA = 12  # cuadros extra en vuelo para evitar ráfagas CPU
 
@@ -26,6 +33,15 @@ def _parallel_worker_count() -> tuple[int, int]:
     total = multiprocessing.cpu_count()
     workers = max(1, total - RESERVE_CORES_FOR_OS)
     return workers, total
+
+
+def _hw_reveal_workers() -> int:
+    """Workers cuando el codec es de hardware.
+
+    En este i7 son 12. El encoder no usa el CPU, así que se puede pasar de 8.
+    Se dejan 8 hilos para el sistema y para la conversión RGB→YUV de FFmpeg.
+    """
+    return max(6, multiprocessing.cpu_count() - 8)
 
 
 def _process_depth(video_workers: int) -> int:
@@ -269,6 +285,41 @@ class MagentaGlitchFilter:
             self.pending.clear()
 
 
+def _linear_to_bw(rgb):
+    y = (
+        rgb[..., 0] * np.float32(0.2126)
+        + rgb[..., 1] * np.float32(0.7152)
+        + rgb[..., 2] * np.float32(0.0722)
+    )
+    return np.stack((y, y, y), axis=-1)
+
+
+def _save_exr_half(rgb_lin, path):
+    """OpenEXR half, ZIP. 1.0 = clip del sensor.
+
+    OpenCV deja el codec EXR apagado hasta que esta variable está en 1.
+    """
+    os.environ["OPENCV_IO_ENABLE_OPENEXR"] = "1"
+    rgb = np.ascontiguousarray(np.clip(rgb_lin, 0.0, 1.0), dtype=np.float32)
+    bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+    params = [
+        int(cv2.IMWRITE_EXR_TYPE), int(cv2.IMWRITE_EXR_TYPE_HALF),
+        int(cv2.IMWRITE_EXR_COMPRESSION), int(cv2.IMWRITE_EXR_COMPRESSION_ZIP),
+    ]
+    ok, buf = cv2.imencode(".exr", bgr, params)
+    if not ok:
+        raise RuntimeError(f"OpenCV no pudo codificar EXR: {path}")
+    Path(path).write_bytes(buf.tobytes())
+
+
+def process_prores_xq_frame(raw_data, is_rgb, width, height, mode, grade=None, is_bayer=False):
+    """Bayer → edge-aware → tabla de revelado → rgb48. El YUV de NVENC se arma después."""
+    from reveal_pipeline import debayer_codes, reveal_codes_rgb48
+    codes = debayer_codes(raw_data, width, height)
+    settings = getattr(process_prores_xq_frame, "settings", None)
+    return reveal_codes_rgb48(codes, settings, mode)
+
+
 def _save_dng_task(img_16bit, out_path, width, height):
     """
     Guarda un frame ya desempaquetado como DNG.
@@ -388,8 +439,18 @@ class TempFileFrameWriter:
 
 def _append_ffmpeg_codec_args(cmd: list, codec: str) -> str:
     """Añade códec/salida a cmd; devuelve extensión de archivo."""
+    codec = codec.lower()
     if codec == 'prores':
         cmd += ['-c:v', 'prores_ks', '-profile:v', '4', '-vendor', 'apl0', '-qscale:v', '5', '-pix_fmt', 'yuv444p10le']
+        return ".mov"
+    if codec == 'prores_xq':
+        # Perfil XQ. Este FFmpeg escribe 10 bits 4:4:4; la curva ya es Rec.709.
+        cmd += [
+            '-c:v', 'prores_ks', '-profile:v', '5', '-vendor', 'apl0',
+            '-qscale:v', '4', '-pix_fmt', 'yuv444p10le',
+            '-colorspace', 'bt709', '-color_primaries', 'bt709', '-color_trc', 'bt709',
+            '-metadata', 'comment=Revelado Rec.709. Debayer edge-aware. Blanco del sensor = 1.',
+        ]
         return ".mov"
     if codec == 'prores_hq':
         cmd += ['-c:v', 'prores_ks', '-profile:v', '3', '-vendor', 'apl0', '-qscale:v', '9', '-pix_fmt', 'yuv422p10le']
@@ -399,6 +460,15 @@ def _append_ffmpeg_codec_args(cmd: list, codec: str) -> str:
         return ".mov"
     if codec == 'hevc':
         cmd += ['-c:v', 'libx265', '-preset', 'medium', '-crf', '18', '-pix_fmt', 'yuv444p10le', '-tag:v', 'hvc1']
+        return ".mp4"
+    if codec == 'hevc_nvenc':
+        # Lossless no gana calidad con un preset lento. p1 es el más rápido.
+        cmd += [
+            '-c:v', 'hevc_nvenc', '-preset', 'p1', '-tune', 'lossless',
+            '-profile:v', 'rext', '-pix_fmt', 'yuv444p10msble', '-tag:v', 'hvc1',
+            '-colorspace', 'bt709', '-color_primaries', 'bt709', '-color_trc', 'bt709',
+            '-metadata', 'comment=Revelado Rec.709. Debayer edge-aware. HEVC 4:4:4 lossless 10 bits.',
+        ]
         return ".mp4"
     if codec == 'h264':
         cmd += ['-c:v', 'libx264', '-preset', 'medium', '-crf', '23', '-pix_fmt', 'yuv420p']
@@ -422,12 +492,16 @@ def _build_ffmpeg_cmd(
     fps: str,
     codec: str,
     output_file: Path,
+    threads: int | None = None,
 ) -> list:
+    codec = codec.lower()
     cmd = [
         'ffmpeg', '-y', '-f', 'rawvideo', '-vcodec', 'rawvideo',
-        '-s', f'{export_w}x{export_h}', '-pix_fmt', input_pix_fmt, '-r', str(fps),
-        '-i', input_spec,
+        '-s', f'{export_w}x{export_h}', '-pix_fmt', input_pix_fmt,
+        '-r', str(fps), '-i', input_spec,
     ]
+    if threads:
+        cmd += ['-threads', str(int(threads))]
     _append_ffmpeg_codec_args(cmd, codec)
     cmd.append(str(output_file))
     return cmd
@@ -522,23 +596,33 @@ def _export_video_ordered(
     glitch_filter: MagentaGlitchFilter | None,
     start_time: float,
     skip_frames: int = 0,
+    frame_fn=None,
+    workers: int | None = None,
 ):
     """
     Pipeline video: detección glitch (paralela, Bayer) → procesado (pool) →
     hilo escritor (cola acotada) → FFmpeg. Evita acumular decenas de frames en RAM.
     """
-    video_workers, total_cores = _parallel_worker_count()
+    total_cores = multiprocessing.cpu_count()
+    if workers is None:
+        video_workers, total_cores = _parallel_worker_count()
+        core_note = f"{RESERVE_CORES_FOR_OS} reservados SO"
+    else:
+        video_workers = max(1, int(workers))
+        core_note = f"el resto ({max(1, total_cores - video_workers)} hilos) queda para FFmpeg"
     process_depth = _process_depth(video_workers)
     detect_depth = max(8, video_workers + 4) if glitch_filter else 0
     write_queue_size = max(8, video_workers + 4)
 
     print(
         f"INFO|Fase 1 multihilo: {video_workers} workers procesado "
-        f"({total_cores} cores, {RESERVE_CORES_FOR_OS} reservados SO), "
+        f"({total_cores} cores, {core_note}), "
         f"profundidad={process_depth}, cola_escritura={write_queue_size}"
         + (f", prefetch_glitch={DETECT_PREFETCH_WORKERS}" if glitch_filter else "")
     )
 
+    if frame_fn is None:
+        frame_fn = process_video_frame
     writer = frame_writer
     executor = ThreadPoolExecutor(max_workers=video_workers)
     detect_pool = (
@@ -564,7 +648,7 @@ def _export_video_ordered(
             wait(list(future_map.values()), return_when=FIRST_COMPLETED)
             drain_completed()
         future_map[submit_idx] = executor.submit(
-            process_video_frame,
+            frame_fn,
             raw_data, is_rgb, w, h, args.mode, grade_settings, not is_rgb,
         )
         submit_idx += 1
@@ -692,7 +776,7 @@ def _export_video_qoi(
 
 
 def _create_video_frame_writer(video_ctx: dict, args):
-    video_workers, _total = _parallel_worker_count()
+    video_workers = video_ctx.get('reveal_workers') or _parallel_worker_count()[0]
     write_queue_size = max(8, video_workers + 4)
     if video_ctx['stage_temp']:
         return TempFileFrameWriter(video_ctx['temp_path'], queue_size=write_queue_size)
@@ -700,8 +784,24 @@ def _create_video_frame_writer(video_ctx: dict, args):
         cmd = _build_ffmpeg_cmd(
             '-', video_ctx['export_w'], video_ctx['export_h'],
             video_ctx['input_pix_fmt'], args.fps, args.codec, video_ctx['output_file'],
+            threads=video_ctx.get('ffmpeg_threads'),
         )
         print(f"INFO|FFmpeg cmd (stdin): {' '.join(cmd)}")
+        yuv_wh = video_ctx.get('yuv10_wh')
+        if yuv_wh:
+            # Otro proceso: tiene su propio GIL y la tarjeta. Este proceso solo revela.
+            bridge = subprocess.Popen(
+                [sys.executable, '-u', str(Path(__file__).resolve()),
+                 '--yuv10-bridge', str(yuv_wh[0]), str(yuv_wh[1])],
+                stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=sys.stderr,
+                bufsize=FFMPEG_STDIN_BUFSIZE,
+            )
+            video_ctx['yuv_bridge'] = bridge
+            video_ctx['process'] = subprocess.Popen(
+                cmd, stdin=bridge.stdout, stderr=sys.stderr,
+            )
+            bridge.stdout.close()
+            return FfmpegStdinWriter(bridge, queue_size=write_queue_size)
         video_ctx['process'] = subprocess.Popen(
             cmd, stdin=subprocess.PIPE, stderr=sys.stderr, bufsize=FFMPEG_STDIN_BUFSIZE,
         )
@@ -723,6 +823,12 @@ def _finish_video_export(video_ctx: dict | None, args):
             _run_ffmpeg_encode(cmd)
             tp.unlink(missing_ok=True)
     elif video_ctx.get('process'):
+        bridge = video_ctx.get('yuv_bridge')
+        if bridge is not None and bridge.stdin:
+            bridge.stdin.close()
+            bridge_ret = bridge.wait()
+            if bridge_ret != 0:
+                raise RuntimeError(f"El puente YUV fallo con codigo {bridge_ret}")
         proc = video_ctx['process']
         if proc.stdin:
             proc.stdin.close()
@@ -751,6 +857,199 @@ def apply_processing_chain(img_f, gamma, blk, wht, sigma, amount, chroma_blur):
     img_final = cv2.cvtColor(img_processed, cv2.COLOR_YCrCb2RGB)
     return np.clip(img_final, 0.0, 1.0)
 
+def _export_exr_sequence(
+    input_path, exr_folder, frame_bytes, num_frames, skip_frames, w, h, mode, start_time,
+):
+    """Secuencia OpenEXR half lineal. 1.0 = clip del sensor. Descarta rachas magenta cortas."""
+    import bayer_render
+
+    workers, total_cores = _parallel_worker_count()
+    pipeline = max(4, workers)
+    print(
+        "INFO|EXR half ZIP, RGB lineal (1.0 = código 4095). "
+        f"Debayer BayerBG, el mismo del visor HQ. Filtro magenta, racha <={MAX_GLITCH_RUN}."
+    )
+    print(
+        f"INFO|EXR pipeline: {workers} workers "
+        f"({total_cores} cores, {RESERVE_CORES_FOR_OS} reservados SO, profundidad {pipeline})"
+    )
+
+    unpack_pool = ThreadPoolExecutor(max_workers=workers)
+    save_pool = ThreadPoolExecutor(max_workers=workers)
+    glitch_filter = MagentaGlitchFilter()
+    unpack_queue = deque()
+    save_futures = []
+    max_save_pend = max(4, workers * 4)
+    saved_count = 0
+    stem = input_path.stem
+
+    def _unpack_detect(raw_data):
+        img = unpack_12bit_packed_manual(raw_data, w, h)
+        return img, es_glitch_magenta(img)
+
+    def _write_exr(img, out_path):
+        lin = bayer_render.render_linear_from_shifted(img)
+        if mode == "BW":
+            lin = _linear_to_bw(lin)
+        _save_exr_half(lin, out_path)
+        return out_path.name
+
+    def _enqueue_save(img, out_path):
+        save_futures.append(save_pool.submit(_write_exr, img, out_path))
+        if len(save_futures) >= max_save_pend:
+            done, not_done = wait(save_futures, return_when=FIRST_COMPLETED)
+            save_futures[:] = list(not_done)
+            for fut in done:
+                fut.result()
+
+    def _commit(img):
+        nonlocal saved_count
+        _enqueue_save(img, exr_folder / f"{stem}_{saved_count:06d}.exr")
+        saved_count += 1
+
+    try:
+        with open(input_path, "rb") as f:
+            if skip_frames:
+                print(f"INFO|Omitiendo primeros {skip_frames} cuadros...")
+                for _ in range(skip_frames):
+                    raw_data = f.read(frame_bytes)
+                    if len(raw_data) < frame_bytes:
+                        break
+                    img = unpack_12bit_packed_manual(raw_data, w, h)
+                    glitch_filter.feed(img, es_glitch_magenta(img))
+
+            read_idx = 0
+            file_exhausted = False
+
+            def _fill():
+                nonlocal read_idx, file_exhausted
+                while (
+                    not file_exhausted
+                    and len(unpack_queue) < pipeline
+                    and read_idx < num_frames
+                ):
+                    raw_data = f.read(frame_bytes)
+                    if len(raw_data) < frame_bytes:
+                        file_exhausted = True
+                        break
+                    unpack_queue.append((read_idx, unpack_pool.submit(_unpack_detect, raw_data)))
+                    read_idx += 1
+
+            _fill()
+            while unpack_queue:
+                orig_idx, fut = unpack_queue.popleft()
+                img, is_magenta = fut.result()
+                _fill()
+                for item in glitch_filter.feed(img, is_magenta):
+                    _commit(item)
+                if orig_idx % 10 == 0:
+                    _log_export_progress(orig_idx + 1, num_frames, start_time)
+
+        glitch_filter.finalize()
+        if save_futures:
+            done, _ = wait(save_futures)
+            for fut in done:
+                fut.result()
+        if glitch_filter.discarded_count:
+            print(f"INFO|Glitches magenta descartados: {glitch_filter.discarded_count} frames")
+        print(f"INFO|EXR escritos: {saved_count}")
+    finally:
+        unpack_pool.shutdown(wait=True)
+        save_pool.shutdown(wait=True)
+
+
+def _reveal_dng_path(path, mode):
+    """Un DNG del mosaico → rgb48 revelado."""
+    mosaic = tifffile.imread(path)
+    if getattr(mosaic, "ndim", 0) != 2:
+        raise RuntimeError(f"DNG sin mosaico de un canal: {path.name}")
+    from reveal_pipeline import debayer_dng_mosaic, reveal_codes_rgb48
+    codes = debayer_dng_mosaic(mosaic)
+    return reveal_codes_rgb48(codes, process_prores_xq_frame.settings, mode)
+
+
+def _dng_output_file(folder: Path, codec_name: str, output) -> Path:
+    ext = ".mp4" if codec_name == "hevc_nvenc" else ".mov"
+    if output:
+        dest = Path(output)
+        if dest.is_dir():
+            stem = folder.name[:-8] if folder.name.endswith("_DNG_SEQ") else folder.name
+            return dest / f"{stem}_{codec_name}{ext}"
+        return dest
+    stem = folder.name[:-8] if folder.name.endswith("_DNG_SEQ") else folder.name
+    return folder.parent / f"{stem}_{codec_name}{ext}"
+
+
+def _export_dng_directory(args, codec_name: str):
+    """Secuencia DNG ya filtrada → el revelado guardado → ProRes XQ o HEVC."""
+    if not HAS_TIFFFILE:
+        print("ERROR|Falta tifffile para leer los DNG.")
+        return
+    folder = Path(args.dng_dir)
+    if not folder.is_dir():
+        print(f"ERROR|No es una carpeta: {folder}")
+        return
+    frames = sorted(p for p in folder.iterdir() if p.is_file() and p.suffix.lower() == ".dng")
+    if not frames:
+        print(f"ERROR|No hay archivos DNG en {folder}")
+        return
+    sample = tifffile.imread(frames[0])
+    if getattr(sample, "ndim", 0) != 2:
+        print(f"ERROR|El primer DNG no es un mosaico: {frames[0].name}")
+        return
+    h, w = int(sample.shape[0]), int(sample.shape[1])
+    out = _dng_output_file(folder, codec_name, args.output)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    workers = _hw_reveal_workers() if codec_name in HW_ENCODER_CODECS else XQ_REVEAL_WORKERS
+    mode = args.mode or "COLOR"
+    print(f"INFO|Secuencia DNG: {folder.name} | {len(frames)} cuadros | {w}x{h} | {codec_name}")
+    print(f"INFO|Salida: {out}")
+    input_pix = "yuv444p10msble" if codec_name == "hevc_nvenc" else "rgb48le"
+    video_ctx = {
+        "stage_temp": False,
+        "temp_path": out.parent / f".{out.stem}_stage_{os.getpid()}.raw",
+        "reveal_workers": workers,
+        "ffmpeg_threads": max(1, multiprocessing.cpu_count() - workers),
+        "export_w": w,
+        "export_h": h,
+        "input_pix_fmt": input_pix,
+        "yuv10_wh": (w, h) if codec_name == "hevc_nvenc" else None,
+        "output_file": out,
+        "process": None,
+    }
+    print(f"START|{len(frames)}")
+    sys.stdout.flush()
+    writer = _create_video_frame_writer(video_ctx, args)
+    executor = ThreadPoolExecutor(max_workers=workers)
+    future_map = {}
+    next_to_write = 0
+    depth = _process_depth(workers)
+    start_time = time.time()
+    try:
+        for idx, path in enumerate(frames):
+            while len(future_map) >= depth:
+                wait(list(future_map.values()), return_when=FIRST_COMPLETED)
+                while next_to_write in future_map and future_map[next_to_write].done():
+                    writer.submit(future_map.pop(next_to_write).result())
+                    next_to_write += 1
+            future_map[idx] = executor.submit(_reveal_dng_path, path, mode)
+            while next_to_write in future_map and future_map[next_to_write].done():
+                writer.submit(future_map.pop(next_to_write).result())
+                next_to_write += 1
+            done = idx + 1
+            if done % 10 == 0 or done == len(frames):
+                _log_export_progress(done, len(frames), start_time)
+        while future_map:
+            wait(list(future_map.values()), return_when=FIRST_COMPLETED)
+            while next_to_write in future_map and future_map[next_to_write].done():
+                writer.submit(future_map.pop(next_to_write).result())
+                next_to_write += 1
+    finally:
+        writer.close()
+        executor.shutdown(wait=True)
+        _finish_video_export(video_ctx, args)
+
+
 def main():
     if hasattr(sys.stdout, "reconfigure"):
         try:
@@ -763,13 +1062,15 @@ def main():
         except Exception:
             pass
     parser = argparse.ArgumentParser()
-    parser.add_argument("input")
+    parser.add_argument("input", nargs="?")
+    parser.add_argument("--dng-dir", default=None, help="Carpeta con una secuencia DNG de esta app")
     parser.add_argument("--codec", default="prores") # 'dng' activa el modo raw
     parser.add_argument("--fps", default="18")
     parser.add_argument("--sharp", default="0,0") 
     parser.add_argument("--mode", default="COLOR")
     parser.add_argument("--output", default=None, help="Nombre de archivo o carpeta de salida (relativo al directorio del .raw)")
     parser.add_argument("--grade", default=None, help="JSON con ajustes de gradación (export_grade.DEFAULT_GRADE)")
+    parser.add_argument("--reveal", default=None, help="JSON del revelado Rec.709 para ProRes 4444 XQ")
     parser.add_argument(
         "--max-frames", type=int, default=None,
         help="Cantidad maxima de cuadros a exportar (despues de --skip-frames)",
@@ -809,7 +1110,49 @@ def main():
         except (json.JSONDecodeError, TypeError) as e:
             print(f"WARN|No se pudo parsear --grade: {e}")
             grade_settings = None
-    
+    codec_name = args.codec.lower()
+    if codec_name in REVEAL_CODECS:
+        from reveal_pipeline import coerce_reveal, reveal_tables, summary_line
+        parsed_reveal = None
+        if args.reveal:
+            try:
+                parsed_reveal = json.loads(args.reveal)
+            except json.JSONDecodeError as e:
+                print(f"WARN|No se pudo leer --reveal: {e}")
+        process_prores_xq_frame.settings = coerce_reveal(parsed_reveal)
+        reveal_tables(process_prores_xq_frame.settings)
+        cv2.setNumThreads(1)
+        reveal_workers = _hw_reveal_workers() if codec_name in HW_ENCODER_CODECS else XQ_REVEAL_WORKERS
+        print(f"INFO|{summary_line(process_prores_xq_frame.settings)}")
+        if codec_name in HW_ENCODER_CODECS:
+            print(
+                f"INFO|Revelado en {reveal_workers} workers, un hilo de OpenCV por cuadro. "
+                "La curva sale de una tabla. El codec corre en la GPU."
+            )
+        else:
+            print(
+                f"INFO|Revelado en {reveal_workers} workers, un hilo de OpenCV por cuadro. "
+                "La curva sale de una tabla. El resto del CPU codifica."
+            )
+    if codec_name in ("exr",) or codec_name in REVEAL_CODECS:
+        if grade_settings and grade_settings.get("enabled"):
+            print("INFO|La gradación del video no se aplica a EXR, ProRes 4444 XQ ni HEVC lossless.")
+        grade_settings = None
+
+    if args.dng_dir:
+        if codec_name not in REVEAL_CODECS:
+            print("ERROR|Una secuencia DNG solo se revela a ProRes 4444 XQ o HEVC lossless.")
+            sys.exit(1)
+        try:
+            _export_dng_directory(args, codec_name)
+        except Exception as e:
+            print(f"ERROR|{e}")
+            sys.exit(1)
+        return
+    if not args.input:
+        print("ERROR|Falta el archivo de entrada.")
+        return
+
     input_path = Path(args.input)
     if not input_path.exists():
         print(f"ERROR|Archivo no encontrado: {input_path}")
@@ -872,21 +1215,37 @@ def main():
     
     print(f"INFO|Procesando: {input_path.name}")
     
-    # === MODO DNG ===
-    is_dng_mode = (args.codec.lower() == 'dng')
-    is_tiff_seq_mode = (args.codec.lower() == 'tiff_seq')
+    # === MODO DNG / EXR / VIDEO ===
+    codec = args.codec.lower()
+    is_dng_mode = codec == 'dng'
+    is_exr_mode = codec == 'exr'
+    is_reveal_mode = codec in REVEAL_CODECS
+    is_hw_mode = codec in HW_ENCODER_CODECS
+    if is_hw_mode:
+        hw_workers = _hw_reveal_workers()
+    elif is_reveal_mode:
+        hw_workers = XQ_REVEAL_WORKERS
+    else:
+        hw_workers = None
+    is_tiff_seq_mode = codec == 'tiff_seq'
     video_ctx = None
     process = None
     temp_path = None
-    
+
+    if (is_dng_mode or is_exr_mode or is_reveal_mode) and (is_rgb or is_qoi):
+        print("ERROR|Esta salida necesita RAW Bayer. La fuente RGB/QOI ya está revelada.")
+        return
+
     if is_dng_mode:
-        if is_rgb or is_qoi:
-            print("ERROR|No se puede exportar DNG desde una fuente RGB/QOI. Se requiere RAW Bayer.")
-            return
-        
         dng_folder = input_path.parent / (args.output or f"{input_path.stem}_DNG_SEQ")
         dng_folder.mkdir(exist_ok=True)
         print(f"INFO|Modo DNG RAW activo. Salida en: {dng_folder}")
+        process = None
+
+    elif is_exr_mode:
+        exr_folder = input_path.parent / (args.output or f"{input_path.stem}_EXR_SEQ")
+        exr_folder.mkdir(exist_ok=True)
+        print(f"INFO|Modo EXR lineal activo. Salida en: {exr_folder}")
         process = None
 
     elif is_tiff_seq_mode:
@@ -897,7 +1256,10 @@ def main():
     else:
         # === MODO VIDEO (FFMPEG) ===
         is_processed_src = (is_rgb or is_qoi)
-        input_pix_fmt = 'rgb24' if is_processed_src else 'rgb48le'
+        if codec == "hevc_nvenc":
+            input_pix_fmt = "yuv444p10msble"
+        else:
+            input_pix_fmt = 'rgb24' if is_processed_src else 'rgb48le'
         export_w, export_h = w, h
         if grade_settings and grade_settings.get("enabled"):
             from export_grade import export_frame_size
@@ -907,10 +1269,20 @@ def main():
             f"Modo Video: {args.codec} | Fuente: {'RGB8 ISP' if is_processed_src else 'Bayer'} | "
             f"pix_fmt: {input_pix_fmt}"
         )
+        if codec == "prores_xq":
+            print(
+                "INFO|ProRes 4444 XQ en Rec.709, 10 bits 4:4:4. "
+                "Demosaico edge-aware y revelado en el CPU. Pipe directo a FFmpeg."
+            )
+        elif codec == "hevc_nvenc":
+            print(
+                "INFO|HEVC 4:4:4 lossless en la GPU, 10 bits. "
+                "El YUV se arma en otro proceso, en la tarjeta. Este proceso solo revela."
+            )
 
         ext = _append_ffmpeg_codec_args([], args.codec)
         output_file = input_path.parent / (args.output or f"{input_path.stem}_{args.codec}{ext}")
-        stage_temp = not args.no_stage_temp
+        stage_temp = False if is_reveal_mode else (not args.no_stage_temp)
         temp_path = input_path.parent / f".{input_path.stem}_stage_{os.getpid()}.raw"
         if stage_temp:
             bpf = export_w * export_h * (3 if input_pix_fmt == 'rgb24' else 6)
@@ -926,9 +1298,12 @@ def main():
         video_ctx = {
             'stage_temp': stage_temp,
             'temp_path': temp_path,
+            'reveal_workers': hw_workers,
+            'ffmpeg_threads': max(1, multiprocessing.cpu_count() - hw_workers) if hw_workers else None,
             'export_w': export_w,
             'export_h': export_h,
             'input_pix_fmt': input_pix_fmt,
+            'yuv10_wh': (export_w, export_h) if codec == "hevc_nvenc" else None,
             'output_file': output_file,
             'process': None,
         }
@@ -1048,6 +1423,12 @@ def main():
                 if glitch_filter.discarded_count:
                     print(f"INFO|Glitches magenta descartados: {glitch_filter.discarded_count} frames")
 
+            elif is_exr_mode:
+                _export_exr_sequence(
+                    input_path, exr_folder, frame_bytes, num_frames, skip_frames,
+                    w, h, args.mode, start_time,
+                )
+
             elif is_tiff_seq_mode:
                 if not HAS_TIFFFILE:
                     print("ERROR|Se requiere tifffile para exportar TIFF. Instálalo: pip install tifffile")
@@ -1082,6 +1463,8 @@ def main():
                             f, num_frames, frame_bytes, writer,
                             w, h, is_rgb, args, grade_settings,
                             glitch_filter, start_time, skip_frames,
+                            frame_fn=process_prores_xq_frame if is_reveal_mode else None,
+                            workers=hw_workers,
                         )
                 finally:
                     writer.close()
@@ -1099,5 +1482,41 @@ def main():
     finally:
         print("INFO|Proceso finalizado.")
 
+def _read_exact(buf, size: int) -> bytes | None:
+    chunks = []
+    got = 0
+    while got < size:
+        part = buf.read(size - got)
+        if not part:
+            return None
+        chunks.append(part)
+        got += len(part)
+    if len(chunks) == 1:
+        return chunks[0]
+    return b"".join(chunks)
+
+
+def _yuv10_bridge_main(width: int, height: int) -> None:
+    """Lee rgb48 por stdin y escribe yuv444p10msble por stdout. Proceso aparte del revelado."""
+    from reveal_pipeline import warmup_yuv10, yuv10_from_rgb48
+    if warmup_yuv10():
+        print("INFO|Puente YUV listo en la tarjeta.", file=sys.stderr, flush=True)
+    else:
+        print("WARN|La tarjeta no armó el YUV. El puente sigue en el CPU.", file=sys.stderr, flush=True)
+    frame_in = width * height * 6
+    src = sys.stdin.buffer
+    dst = sys.stdout.buffer
+    while True:
+        data = _read_exact(src, frame_in)
+        if data is None:
+            break
+        dst.write(yuv10_from_rgb48(data, width, height))
+        dst.flush()
+    dst.close()
+
+
 if __name__ == "__main__":
-    main()
+    if len(sys.argv) >= 4 and sys.argv[1] == "--yuv10-bridge":
+        _yuv10_bridge_main(int(sys.argv[2]), int(sys.argv[3]))
+    else:
+        main()

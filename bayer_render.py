@@ -23,6 +23,17 @@ def unpack_12bit_le(packed_bytes, width, height):
     return flat.reshape(height, width)
 
 
+def render_linear_from_shifted(bayer_u16):
+    """RGB lineal float32 desde el mosaico uint16 ya desplazado << 4.
+
+    1.0 equivale al código 4095 del sensor. El debayer es el bilineal BayerBG
+    del visor HQ, así la prueba se compara con el mismo revelado de base.
+    """
+    rgb = cv2.cvtColor(np.ascontiguousarray(bayer_u16), cv2.COLOR_BayerBG2RGB)
+    full_scale = np.float32(RAW12_MAX << 4)  # 4095 << 4 = 65520
+    return rgb.astype(np.float32) * (np.float32(1.0) / full_scale)
+
+
 def render_capture_view(packed_bytes, width, height, downscale=1, to_gray=False, to_bgr=True):
     """
     Render fiel a la reproducción HQ del visor (pausa):

@@ -1926,12 +1926,16 @@ class CollectionManager:
             except OSError:
                 return False
 
-        dng_folder = coll_dir / f"{stem}_DNG_SEQ"
-        if dng_folder.is_dir():
-            try:
-                shutil.rmtree(dng_folder)
-            except OSError as e:
-                print(f"WARN no se pudo borrar carpeta DNG {dng_folder.name}: {e}")
+        for folder_name, label in (
+            (f"{stem}_DNG_SEQ", "DNG"),
+            (f"{stem}_EXR_SEQ", "EXR"),
+        ):
+            seq_folder = coll_dir / folder_name
+            if seq_folder.is_dir():
+                try:
+                    shutil.rmtree(seq_folder)
+                except OSError as e:
+                    print(f"WARN no se pudo borrar carpeta {label} {seq_folder.name}: {e}")
 
         data = self.load_metadata(collection_name)
         if filename in data:
