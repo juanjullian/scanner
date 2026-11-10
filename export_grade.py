@@ -75,6 +75,19 @@ def default_grade_settings() -> dict:
     return copy.deepcopy(DEFAULT_GRADE)
 
 
+def match_video_ext(name: str, fmt: str) -> str:
+    """ProRes va en .mov. Un nombre guardado de otro codec no puede dejarlo en .mp4."""
+    ext = _EXT_MAP.get(fmt)
+    if not ext or not name:
+        return name
+    path = Path(name)
+    if path.suffix.lower() == ext:
+        return name
+    if path.suffix:
+        return str(path.with_suffix(ext))
+    return f"{name}{ext}"
+
+
 def default_output_name(stem: str, fmt: str) -> str:
     if fmt == "tiff_seq":
         return f"{stem}_TIFF_SEQ"
@@ -100,7 +113,10 @@ def default_settings_for_file(filename: str, collection_meta: dict, fmt: str = "
         grade = copy.deepcopy(saved_grade)
     else:
         grade = default_grade_settings()
-    output_name = info.get("export_output_name") or default_output_name(stem, fmt)
+    output_name = match_video_ext(
+        info.get("export_output_name") or default_output_name(stem, fmt),
+        fmt,
+    )
     return {
         "fps": fps,
         "output_name": output_name,
