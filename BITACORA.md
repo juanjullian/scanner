@@ -1,5 +1,24 @@
 # Bitácora — Lucid Scanner
 
+## 2026-11-10 — Balance de la cámara, contenedor y revelado en la GPU
+
+### Por qué
+El visor de captura se veía más neutro que el revelado: la cámara ya aplica su balance (rojo ×1,92, azul ×2,32) y la curva del programa partía de 1. Un nombre de salida guardado de otro codec podía dejar un ProRes en `.mp4`. Y el edge-aware del CPU, repartido en workers, no usa la 5060 Ti. Malvar en la tarjeta se ve igual, pero escribe más: en 20 cuadros del mismo tramo, con el mismo ProRes, fueron 134 MB contra 123 MB del edge-aware.
+
+### Cómo
+- 1,00 en los sliders de rojo y azul es el balance de la PHX. La curva lo multiplica. El verde sigue en 1.
+- Al exportar, la extensión la manda el codec. ProRes y CineForm quedan en `.mov`.
+- En Ajustes de revelado se elige CPU o GPU. El preset sigue partiendo en CPU.
+- CPU: edge-aware, 4 workers, `prores_ks`. El HEVC lossless revela en el CPU y codifica con NVENC.
+- GPU: el Bayer empaquetado de 12 bits sube tal cual. En la tarjeta se desempaqueta, corre NPP (`nppiCFAToRGB` de 16 bits, códigos 0–4095, sin correrlos a la izquierda), la curva, el detalle y el YUV. El ProRes 4444 XQ lo escribe `prores_nv` y el ancho pasa al múltiplo de 16 (2840 → 2848). El HEVC lossless arma el YUV en la tarjeta y lo entrega a NVENC. Un solo proceso. El filtro magenta sigue en el CPU. La vista de los ajustes sigue con el edge-aware.
+- En 20 cuadros de `f8_99` (450 a 469), mismo revelado y `prores_ks`: edge-aware 123,3 MB, NPP 122,7 MB, bilineal 117,3 MB, Malvar 134,1 MB.
+- Quedaron afuera del repo el `persist.json` de esta máquina, los `__pycache__`, copias locales de `config_bayer`, los manuales de la PHX y los pesos de Gharbi (el script los vuelve a bajar).
+
+### Hecho
+- El revelado arranca en el blanco de la cámara.
+- El archivo de video sale con la extensión de su codec.
+- Se puede revelar y codificar el ProRes en la GPU con NPP, o seguir en el CPU.
+
 ## 2026-10-29 — Revelado Rec.709, HEVC NVENC y lote desde DNG
 
 ### Por qué
