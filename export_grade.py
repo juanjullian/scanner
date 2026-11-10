@@ -484,7 +484,20 @@ def rgb_to_qpixmap(rgb: np.ndarray) -> QPixmap:
 def make_thumbnail(path: Path, pixel_fmt: str) -> QPixmap | None:
     n = count_frames(path, pixel_fmt)
     idx = min(100, max(0, n - 1))
-    rgb = read_frame_rgb(path, idx, pixel_fmt, downscale=8)
+    if pixel_fmt not in ("rgb", "qoi_rgb"):
+        frame_bytes = int(FIXED_W * FIXED_H * 1.5)
+        try:
+            with open(path, "rb") as handle:
+                handle.seek(idx * frame_bytes)
+                packed = handle.read(frame_bytes)
+            if len(packed) < frame_bytes:
+                return None
+            small = bayer_render.render_thumb_rgb(packed, FIXED_W, FIXED_H)
+        except Exception as exc:
+            print(f"WARN thumbnail {path.name}: {exc}")
+            return None
+        return rgb_to_qpixmap(small)
+    rgb = read_frame_rgb(path, idx, pixel_fmt, downscale=4)
     if rgb is None:
         return None
     small = cv2.resize(rgb, (160, 120), interpolation=cv2.INTER_AREA)

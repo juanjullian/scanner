@@ -45,6 +45,13 @@ def render_capture_view(packed_bytes, width, height, downscale=1, to_gray=False,
     bayer = unpack_12bit_le(packed_bytes, width, height)
     if downscale > 1:
         bayer = bayer[::downscale, ::downscale]
+    # El debayer Bayer pide ancho y alto pares. Un salto que deja un lado impar
+    # (8 sobre 2840×2200 → 355×275) hace que OpenCV pierda el color o rechace el cuadro.
+    even_h = bayer.shape[0] - (bayer.shape[0] % 2)
+    even_w = bayer.shape[1] - (bayer.shape[1] % 2)
+    if even_h < 2 or even_w < 2:
+        raise ValueError("El mosaico quedó demasiado chico para el debayer")
+    bayer = np.ascontiguousarray(bayer[:even_h, :even_w])
 
     rgb16 = cv2.cvtColor(bayer, cv2.COLOR_BayerBG2RGB)
     rgb8 = _GAMMA_LUT[rgb16]
@@ -54,3 +61,21 @@ def render_capture_view(packed_bytes, width, height, downscale=1, to_gray=False,
     if to_bgr:
         return cv2.cvtColor(rgb8, cv2.COLOR_RGB2BGR)
     return rgb8
+
+
+def render_thumb_rgb(packed_bytes, width, height, out_w=160, out_h=120):
+    """Miniatura a color: debayer del visor HQ sobre un recorte par, y después se achica.
+
+    El origen del recorte es par para no correr la fase del mosaico Bayer.
+    """
+    bayer = unpack_12bit_le(packed_bytes, width, height)
+    crop_w = min(width, 720)
+    crop_h = min(height, 560)
+    crop_w -= crop_w % 2
+    crop_h -= crop_h % 2
+    x0 = max(0, ((width - crop_w) // 2) & ~1)
+    y0 = max(0, ((height - crop_h) // 2) & ~1)
+    tile = np.ascontiguousarray(bayer[y0:y0 + crop_h, x0:x0 + crop_w])
+    rgb16 = cv2.cvtColor(tile, cv2.COLOR_BayerBG2RGB)
+    rgb8 = _GAMMA_LUT[rgb16]
+    return cv2.resize(rgb8, (out_w, out_h), interpolation=cv2.INTER_AREA)

@@ -23,6 +23,7 @@ from PyQt6.QtGui import QImage, QPixmap, QAction, QPainter, QColor, QFont, QIcon
 # Importamos el núcleo del scanner
 import scanner_core
 from export_grade import ExportConfirmDialog, default_settings_for_file
+from export_session import ExportSessionDialog
 
 
 def _windows_set_execution_state(display_required: bool, system_required: bool) -> None:
@@ -345,239 +346,6 @@ class ScanViewer(QWidget):
 
         self._paint_exposure_overlay(painter)
 
-
-# --- DIÁLOGO DE EXPORTACIÓN CON THUMBNAILS ---
-class BatchExportDialog(QDialog):
-    def __init__(self, parent, file_list, root_folder, collection, collection_meta=None):
-        super().__init__(parent)
-        self.setWindowTitle("Exportación por Lotes")
-        self.resize(700, 600)
-        self.root = root_folder
-        self.coll = collection
-        self.collection_meta = collection_meta or {}
-        
-        # Detectar si la colección tiene archivos QOI/RGB (usar el primer archivo como referencia)
-        self.source_is_processed = False
-        if file_list and self.collection_meta:
-            first_info = self.collection_meta.get(file_list[0], {})
-            pf = first_info.get("pixel_format", "bayer")
-            self.source_is_processed = (pf in ("rgb", "qoi_rgb"))
-        
-        layout = QVBoxLayout(self)
-        
-        # Banner informativo si es QOI/RGB
-        if self.source_is_processed:
-            lbl_info = QLabel("Fuente: RGB procesado por ISP de cámara (ya tiene WB, Gamma, Sharpening)")
-            lbl_info.setStyleSheet("background: #1a237e; color: #90caf9; padding: 6px; border-radius: 4px; font-weight: bold;")
-            layout.addWidget(lbl_info)
-        
-        # 1. Lista Visual con Miniaturas
-        layout.addWidget(QLabel("Archivos a procesar (Vista previa cuadro #100):"))
-        self.list_widget = QListWidget()
-        self.list_widget.setIconSize(QSize(160, 120))
-        
-        for f_name in file_list:
-            item = QListWidgetItem(f_name)
-            item.setCheckState(Qt.CheckState.Checked)
-            icon = self.generate_thumbnail(f_name)
-            if icon: item.setIcon(icon)
-            self.list_widget.addItem(item)
-            
-        layout.addWidget(self.list_widget)
-        
-        # Botones selección
-        btn_box = QHBoxLayout()
-        btn_all = QPushButton("Marcar Todos")
-        btn_all.clicked.connect(lambda: self.set_all(True))
-        btn_none = QPushButton("Desmarcar Todos")
-        btn_none.clicked.connect(lambda: self.set_all(False))
-        btn_box.addWidget(btn_all); btn_box.addWidget(btn_none)
-        layout.addLayout(btn_box)
-        
-        # 2. Configuración (formato-aware)
-        settings_group = QGroupBox("Configuración de Salida")
-        sett_layout = QVBoxLayout()
-        
-        sett_layout.addWidget(QLabel("Formato de Salida:"))
-        self.combo_fmt = QComboBox()
-        
-        if self.source_is_processed:
-            # Fuente RGB/QOI: NO ofrecer DNG (no tiene sentido para datos ya debayerizados)
-            self.combo_fmt.addItems([
-                "TIFF 8-bit Sequence (Fiel al ISP - Sin procesamiento) [Recomendado]",
-                "ProRes 4444 (Alta Calidad - 12bit)",
-                "ProRes 422 HQ (Estándar - 10bit)",
-                "HEVC 10-bit 4:4:4 (MP4 - Eficiente)",
-                "AV1 NVENC 10-bit (MP4 - Eficiente)",
-                "H.264 (MP4 - Proxy)"
-            ])
-            self.combo_fmt.setCurrentIndex(0)
-        else:
-            # Fuente Bayer: Opciones completas con DNG
-            self.combo_fmt.addItems([
-                "DNG Raw Sequence (DaVinci Resolve - 16bit) [Recomendado]",
-                "EXR lineal (secuencia half, clip del sensor = 1.0)",
-                "ProRes 4444 XQ (revelado Rec.709)",
-                "HEVC 4:4:4 lossless NVENC 10-bit (revelado Rec.709)",
-                "ProRes 4444 (Premiere - 12bit - Alta Calidad)",
-                "GoPro CineForm (Premiere - 12bit - Intermedio)",
-                "ProRes 422 HQ (Premiere - 10bit - Estándar)",
-                "HEVC 10-bit 4:4:4 (MP4 - Eficiente)",
-                "AV1 NVENC 10-bit (MP4 - Eficiente)",
-                "H.264 (MP4 - Proxy)"
-            ])
-            self.combo_fmt.setCurrentIndex(0)
-        sett_layout.addWidget(self.combo_fmt)
-        
-        # Perfil de revelado (solo para Bayer, para RGB el ISP ya lo hizo)
-        if self.source_is_processed:
-            sett_layout.addWidget(QLabel("(Sin perfil de revelado - La cámara ya aplicó ISP)"))
-            self.combo_sharp = QComboBox()
-            self.combo_sharp.addItems(["N/A (ISP de cámara)"])
-        else:
-            sett_layout.addWidget(QLabel("Perfil de Revelado (solo el video con gamma; no afecta DNG, EXR, ProRes XQ ni HEVC lossless):"))
-            self.combo_sharp = QComboBox()
-            self.combo_sharp.addItems([
-                "DCB Puro",
-                "Suave (S:0.8 / A:1.5)",
-                "Medio (S:1.3 / A:1.5)",
-                "Grueso (S:2.0 / A:2.5) [Recomendado para Video]"
-            ])
-            self.combo_sharp.setCurrentIndex(3)
-        sett_layout.addWidget(self.combo_sharp)
-
-        if not self.source_is_processed:
-            from reveal_pipeline import coerce_reveal, summary_line
-            host = self.parent()
-            saved = host._persist.get("reveal") if host is not None and hasattr(host, "_persist") else None
-            self._reveal = coerce_reveal(saved)
-            hint = QLabel("Opcional. Se guarda y se aplica al exportar ProRes 4444 XQ o HEVC lossless NVENC.")
-            hint.setWordWrap(True)
-            hint.setStyleSheet("color: #888; font-size: 9pt;")
-            sett_layout.addWidget(hint)
-            self.lbl_reveal = QLabel(summary_line(self._reveal))
-            self.lbl_reveal.setWordWrap(True)
-            sett_layout.addWidget(self.lbl_reveal)
-            btn_reveal = QPushButton("Ajustes de revelado…")
-            btn_reveal.clicked.connect(self._open_reveal)
-            sett_layout.addWidget(btn_reveal)
-
-        settings_group.setLayout(sett_layout)
-        layout.addWidget(settings_group)
-        
-        self.btn_export = QPushButton("Iniciar Cola")
-        self.btn_export.setStyleSheet("background-color: #0078d7; color: white; font-weight: bold; padding: 10px;")
-        self.btn_export.clicked.connect(self.accept)
-        layout.addWidget(self.btn_export)
-
-    def generate_thumbnail(self, filename):
-        try:
-            full_path = Path(self.root) / self.coll / filename
-            fsize = full_path.stat().st_size
-            w, h = 2840, 2200 
-            
-            # Detectar formato desde metadata si disponible
-            file_meta = self.collection_meta.get(filename, {})
-            pixel_fmt = file_meta.get("pixel_format", "")
-            is_qoi = (pixel_fmt == "qoi_rgb")
-            is_rgb = (pixel_fmt == "rgb")
-            
-            # Fallback por tamaño si no hay metadata
-            if not pixel_fmt:
-                if fsize % int(w * h * 3) == 0: is_rgb = True
-                elif fsize % int(w * h * 1.5) == 0: is_rgb = False
-            
-            if is_qoi:
-                # QOI: Leer frame usando el índice del contenedor
-                frame_index = qoi_utils.build_frame_index(str(full_path))
-                target = min(100, len(frame_index) - 1) if frame_index else 0
-                if not frame_index: return None
-                offset, fsz = frame_index[target]
-                qoi_data = qoi_utils.read_frame_at(str(full_path), offset, fsz)
-                rgb = qoi_utils.decode_qoi(qoi_data, w, h)
-                small = cv2.resize(rgb, (160, 120), interpolation=cv2.INTER_NEAREST)
-            elif is_rgb:
-                frame_bytes = int(w * h * 3)
-                total_frames = fsize // frame_bytes
-                target_frame = 100 if total_frames > 100 else max(0, total_frames - 1)
-                with open(full_path, "rb") as f:
-                    f.seek(target_frame * frame_bytes)
-                    raw_data = f.read(frame_bytes)
-                if len(raw_data) < frame_bytes: return None
-                rgb = np.frombuffer(raw_data, dtype=np.uint8).reshape(h, w, 3)
-                small = rgb[::8, ::8, :].copy()
-            else:
-                # BAYER RAW
-                frame_bytes = int(w * h * 1.5)
-                total_frames = fsize // frame_bytes
-                target_frame = 100 if total_frames > 100 else max(0, total_frames - 1)
-                with open(full_path, "rb") as f:
-                    f.seek(target_frame * frame_bytes)
-                    raw_data = f.read(frame_bytes)
-                if len(raw_data) < frame_bytes: return None
-                data = np.frombuffer(raw_data, dtype=np.uint8).reshape(-1, 3)
-                b0, b1, b2 = data[:, 0], data[:, 1], data[:, 2]
-                p0 = ((b1 & 0x0F) << 4) | (b0 >> 4)
-                p1 = b2
-                img_flat = np.empty(w*h, dtype=np.uint8)
-                img_flat[0::2] = p0; img_flat[1::2] = p1
-                img_bayer = img_flat.reshape(h, w)
-                r_ch = img_bayer[0::2, 0::2]
-                g_ch = img_bayer[0::2, 1::2]
-                b_ch = img_bayer[1::2, 1::2]
-                small = np.dstack((r_ch, g_ch, b_ch))
-                small = cv2.resize(small, (160, 120), interpolation=cv2.INTER_NEAREST)
-                avg = np.mean(small)
-                if avg > 0: small = np.clip(small * (100/avg), 0, 255).astype(np.uint8)
-            
-            ih, iw = small.shape[:2]
-            if small.ndim == 2: small = cv2.cvtColor(small, cv2.COLOR_GRAY2RGB)
-            if not small.flags['C_CONTIGUOUS']: small = np.ascontiguousarray(small)
-            qimg = QImage(small.data, iw, ih, iw*3, QImage.Format.Format_RGB888)
-            return QIcon(QPixmap.fromImage(qimg))
-        except Exception as e:
-            print(f"Thumbnail error ({filename}): {e}")
-            return None
-    def set_all(self, state):
-        for i in range(self.list_widget.count()):
-            self.list_widget.item(i).setCheckState(Qt.CheckState.Checked if state else Qt.CheckState.Unchecked)
-
-    def get_selection(self):
-        files = []
-        for i in range(self.list_widget.count()):
-            item = self.list_widget.item(i)
-            if item.checkState() == Qt.CheckState.Checked:
-                files.append(item.text())
-        
-        if self.source_is_processed:
-            fmt_map = {0: 'tiff_seq', 1: 'prores', 2: 'prores_hq', 3: 'hevc', 4: 'av1', 5: 'h264'}
-            sharp = '0,0'
-        else:
-            fmt_map = {
-                0: 'dng', 1: 'exr', 2: 'prores_xq', 3: 'hevc_nvenc', 4: 'prores',
-                5: 'cineform', 6: 'prores_hq', 7: 'hevc', 8: 'av1', 9: 'h264',
-            }
-            sharp_map = {0: '0,0', 1: '0.8,1.5', 2: '1.3,1.5', 3: '2.0,2.5'}
-            sharp = sharp_map.get(self.combo_sharp.currentIndex(), '0,0')
-        
-        return files, fmt_map.get(self.combo_fmt.currentIndex(), 'dng'), sharp
-
-    def _open_reveal(self):
-        from reveal_dialog import RevealDialog
-        from reveal_pipeline import summary_line
-        files = [self.list_widget.item(i).text() for i in range(self.list_widget.count())]
-        current = self.list_widget.currentItem()
-        start = current.text() if current is not None else (files[0] if files else None)
-        dlg = RevealDialog(
-            self, Path(self.root) / self.coll, files, self.collection_meta, self._reveal, start,
-        )
-        if dlg.exec():
-            self._reveal = dlg.settings()
-            host = self.parent()
-            if host is not None and hasattr(host, "_persist"):
-                host._persist["reveal"] = self._reveal
-                host.save_config()
-            self.lbl_reveal.setText(summary_line(self._reveal))
 
 
 class CalibrationLiveViewer(QWidget):
@@ -2437,58 +2205,40 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "Error", f"Fallo en l2t:\n{msg}")
         self._sync_execution_state()
 
+    def _export_ui_parent(self):
+        session = getattr(self, "_export_session", None)
+        return session if session is not None else self
+
+    def begin_export_session(self, dialog, jobs) -> bool:
+        if self.is_exporting_batch:
+            QMessageBox.information(dialog, "Ocupado", "Hay una exportación en curso.")
+            return False
+        self._export_session = dialog
+        self._batch_was_canceled = False
+        self.export_queue = list(jobs)
+        self.process_export_queue()
+        return True
+
     def open_batch_export_window(self):
-        # 1. Determinar qué colección usar
-        # Prioridad: Colección Activa (Grabación) -> Colección Seleccionada (Visual)
+        if self.is_exporting_batch:
+            QMessageBox.information(self, "Ocupado", "Hay una exportación en curso.")
+            return
         target_collection = self.active_collection
         if not target_collection and self.col_list.currentItem():
             target_collection = self.col_list.currentItem().text()
-            
-        if not target_collection: 
+        if not target_collection:
             QMessageBox.warning(self, "Atención", "Selecciona una colección de la lista izquierda primero.")
             return
-        
-        # 2. Obtener archivos
-        # Aseguramos que la lista visual corresponda a la colección objetivo
-        # (Si el usuario seleccionó otra cosa en la lista pero tiene activa otra, podría haber desincronización,
-        #  así que recargamos la lista visual si es necesario o confiamos en lo que ve el usuario).
-        # Por simplicidad, usamos lo que está en la lista visual self.file_list
         if self.file_list.count() == 0:
             QMessageBox.warning(self, "Atención", "La colección está vacía.")
             return
 
         files = [self.file_list.item(x).text() for x in range(self.file_list.count())]
-        
-        # 3. Abrir Diálogo (con metadata para detectar formato de captura)
         coll_meta = self.manager.load_metadata(target_collection)
-        dlg = BatchExportDialog(self, files, self.root_folder, target_collection, coll_meta)
-        
-        if dlg.exec():
-            sel, fmt, sharp = dlg.get_selection()
-            if not sel:
-                return
-
-            export_settings = {}
-            if fmt != "dng":
-                confirm_dlg = ExportConfirmDialog(
-                    self, sel, self.root_folder, target_collection, coll_meta, fmt,
-                )
-                if not confirm_dlg.exec():
-                    return
-                export_settings = confirm_dlg.get_all_settings()
-
-            for f in sel:
-                path = Path(self.root_folder) / target_collection / f
-                settings = export_settings.get(
-                    f, default_settings_for_file(f, coll_meta, fmt),
-                ) if fmt != "dng" else None
-                if settings:
-                    from export_grade import persist_export_settings
-                    persist_export_settings(self.manager, target_collection, f, settings)
-                self.export_queue.append((path, fmt, sharp, settings))
-
-            if not self.is_exporting_batch:
-                self.process_export_queue()
+        dlg = ExportSessionDialog(
+            self, files, self.root_folder, target_collection, coll_meta, self.manager,
+        )
+        dlg.exec()
 
     def open_dng_reveal(self):
         if self.is_exporting_batch:
@@ -2541,11 +2291,20 @@ class MainWindow(QMainWindow):
         if not self.export_queue:
             self.is_exporting_batch = False
             self._sync_execution_state()
+            session = getattr(self, "_export_session", None)
+            if session is not None:
+                self._export_session = None
+                session.note_queue_finished()
+                return
             QMessageBox.information(self, "Fin", "Cola terminada.")
             return
 
         self.is_exporting_batch = True
         nf, fmt, sharp, settings = self.export_queue.pop(0)
+        self._export_active_name = nf.name
+        session = getattr(self, "_export_session", None)
+        if session is not None:
+            session.note_file_started(nf.name)
         
         # --- CORRECCIÓN CRÍTICA ---
         # No usamos self.active_collection porque puede ser None.
@@ -2567,31 +2326,39 @@ class MainWindow(QMainWindow):
         # Si el usuario pidió DNG pero el archivo es RGB procesado (no Bayer),
         # cambiamos silenciosamente a TIFF sequence (fiel al ISP) y avisamos una vez.
         effective_fmt = fmt
+        ui_parent = self._export_ui_parent()
         if fmt == "dng" and pixel_fmt in ("rgb", "qoi_rgb"):
             effective_fmt = "tiff_seq"
             QMessageBox.information(
-                self,
+                ui_parent,
                 "Aviso de formato",
                 f"\"{nf.name}\" fue capturado en RGB procesado por la cámara.\n"
                 f"No es posible exportarlo como DNG RAW, se usará TIFF 8-bit Sequence en su lugar."
             )
         if effective_fmt in ("exr", "prores_xq", "hevc_nvenc") and pixel_fmt in ("rgb", "qoi_rgb"):
             QMessageBox.information(
-                self,
+                ui_parent,
                 "Aviso de formato",
                 f"\"{nf.name}\" fue capturado en RGB ya revelado.\n"
                 "EXR lineal, ProRes 4444 XQ y HEVC lossless solo salen de un RAW Bayer.",
             )
+            if session is not None:
+                session.note_file_finished(nf.name, False, "Este archivo no es RAW Bayer.")
             self.process_export_queue()
             return
         
         print(f"Procesando: {nf.name} | Colección: {collection_name} | Modo: {mode} | pixel_fmt={pixel_fmt} | codec={effective_fmt}")
-        
-        self.pd = QProgressDialog(f"Exportando {nf.name}...", "Cancelar", 0, 100, self)
-        self.pd.setWindowModality(Qt.WindowModality.ApplicationModal)
-        self.pd.setAutoClose(False)
-        self.pd.setValue(0)
-        self.pd.show()
+
+        if settings:
+            from export_grade import persist_export_settings
+            persist_export_settings(self.manager, collection_name, nf.name, settings)
+
+        if session is None:
+            self.pd = QProgressDialog(f"Exportando {nf.name}...", "Cancelar", 0, 100, self)
+            self.pd.setWindowModality(Qt.WindowModality.ApplicationModal)
+            self.pd.setAutoClose(False)
+            self.pd.setValue(0)
+            self.pd.show()
         
         cmd = [
             sys.executable, "raw2video.py", str(nf),
@@ -2621,7 +2388,9 @@ class MainWindow(QMainWindow):
         self.current_video_output = dest
 
         grade = (settings or {}).get("grade")
-        if grade and grade.get("enabled") and effective_fmt not in ("exr", "prores_xq", "hevc_nvenc"):
+        if grade and grade.get("enabled") and effective_fmt not in (
+            "dng", "exr", "tiff_seq", "tif", "prores_xq", "hevc_nvenc",
+        ):
             cmd.extend(["--grade", json.dumps(grade)])
         if effective_fmt in ("prores_xq", "hevc_nvenc"):
             from reveal_pipeline import coerce_reveal
@@ -2633,42 +2402,74 @@ class MainWindow(QMainWindow):
             cmd.extend(["--max-frames", str(TEST_EXPORT_FRAME_COUNT)])
 
         self.worker = UniversalExportWorker(cmd)
-        self.worker.progress_signal.connect(self.pd.setValue)
-        self.worker.info_signal.connect(self.pd.setLabelText)
         self.worker.finished_signal.connect(self.on_batch_item_finished)
-        self.pd.canceled.connect(self.on_batch_cancel)
+        if session is not None:
+            name = nf.name
+            self.worker.progress_signal.connect(
+                lambda percent, file_name=name, host=session: host.note_progress(file_name, percent)
+            )
+            self.worker.info_signal.connect(
+                lambda text, file_name=name, host=session: host.note_info(file_name, text)
+            )
+        else:
+            self.worker.progress_signal.connect(self.pd.setValue)
+            self.worker.info_signal.connect(self.pd.setLabelText)
+            self.pd.canceled.connect(self.on_batch_cancel)
         self.worker.start()
         self._sync_execution_state()
 
     def on_batch_cancel(self):
+        self._batch_was_canceled = True
         self.export_queue = [] # Detener resto de la cola
         self.dng_jobs = []
         self.is_exporting_batch = False
         if self.worker: self.worker.kill()
-        
-        resp = QMessageBox.question(self, "Cancelado", "¿Desea eliminar los archivos incompletos generados?", QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+
+        ui_parent = self._export_ui_parent()
+        resp = QMessageBox.question(ui_parent, "Cancelado", "¿Quieres eliminar los archivos incompletos?", QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
         if resp == QMessageBox.StandardButton.Yes:
             try:
                 if hasattr(self, 'current_video_output') and self.current_video_output.exists():
                     if self.current_video_output.is_dir():
                         shutil.rmtree(self.current_video_output)
-                        QMessageBox.information(self, "Info", f"Carpeta eliminada: {self.current_video_output.name}")
+                        QMessageBox.information(ui_parent, "Info", f"Carpeta eliminada: {self.current_video_output.name}")
                     else:
                         os.remove(self.current_video_output)
-                        QMessageBox.information(self, "Info", f"Archivo eliminado: {self.current_video_output.name}")
+                        QMessageBox.information(ui_parent, "Info", f"Archivo eliminado: {self.current_video_output.name}")
             except Exception as e:
-                QMessageBox.warning(self, "Error", f"No se pudo borrar: {e}")
-        self.pd.close()
+                QMessageBox.warning(ui_parent, "Error", f"No se pudo borrar: {e}")
+        session = getattr(self, "_export_session", None)
+        if session is not None:
+            session.note_cancelled()
+            self._export_session = None
+        pd = getattr(self, "pd", None)
+        if pd is not None:
+            pd.close()
         self._sync_execution_state()
 
     def on_batch_item_finished(self, s, m):
-        try: self.pd.canceled.disconnect(self.on_batch_cancel)
-        except: pass
-        
-        if not self.pd.wasCanceled(): # Evitar doble cierre/error
-             self.pd.close()
+        if getattr(self, "_batch_was_canceled", False):
+            return
+        pd = getattr(self, "pd", None)
+        if pd is not None:
+            try:
+                pd.canceled.disconnect(self.on_batch_cancel)
+            except Exception:
+                pass
+
+        session = getattr(self, "_export_session", None)
+        if session is not None:
+            name = getattr(self, "_export_active_name", "")
+            session.note_file_finished(name, bool(s), m)
+            if not s:
+                print(f"Error export: {m}")
+            self.process_export_queue()
+            return
+
+        if pd is not None and not pd.wasCanceled():
+             pd.close()
              if not s: print(f"Error export: {m}")
-             self.process_export_queue() # Siguiente
+             self.process_export_queue()
 
     def open_file_context_menu(self, pos):
         it = self.file_list.itemAt(pos)

@@ -135,6 +135,9 @@ class RevealDialog(QDialog):
     def settings(self) -> dict:
         return self._collect()
 
+    def reference_name(self) -> str:
+        return self.combo.currentText()
+
     def _add_slider(self, layout, key, title, lo, hi, scale, tip):
         title_lbl = QLabel(title)
         title_lbl.setToolTip(tip)

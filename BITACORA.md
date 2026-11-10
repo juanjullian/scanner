@@ -1,5 +1,25 @@
 # Bitácora — Lucid Scanner
 
+## 2026-11-10 — Exportación en una sola tabla
+
+### Por qué
+Exportar video pasaba por tres ventanas: el formato y el perfil, después la confirmación, y al final una barra aparte. En DNG se saltaba la confirmación. La miniatura de esa tabla salía en blanco y negro porque el debayer corría sobre un mosaico impar (355×275) y OpenCV perdía el color. Cambiar de formato pisaba el nombre guardado, que era uno solo para todos los codecs.
+
+### Cómo
+- «Exportar Video» abre directo la tabla. El formato va agrupado: RAW (DNG), secuencia (EXR), revelado Rec.709 (ProRes 4444 XQ y HEVC lossless), video con gamma, comprimido de entrega, y, si la fuente ya es RGB del ISP, TIFF fiel y esos videos sin revelado.
+- Según el formato aparecen solo sus opciones. DNG muestra miniatura, archivo, nombre y carpeta. El revelado y la gradación se abren por archivo.
+- Cada formato guarda su borrador en `export_by_format` del metadata. Volver de DNG a ProRes recupera el nombre, la prueba, la gradación y el perfil. El revelado sigue siendo uno solo. Los FPS siguen siendo del archivo.
+- Si al exportar falta abrir el revelado o la gradación de algún archivo marcado, avisa. Se puede volver o exportar igual.
+- La cola corre en la misma tabla. La barra queda bajo la miniatura. El tiempo del archivo y el total salen de los cuadros que faltan y de la velocidad que ya informa el proceso.
+- La miniatura Bayer debayerea un recorte par, con la curva del visor HQ, y después se achica.
+- Los checkbox miden 22 px, con borde gris y palomita blanca sobre azul. La tabla y los campos quedaron en claro para que el texto se lea.
+- «Exportar secuencia TIF» y «Revelar secuencias DNG» siguen en sus ventanas.
+
+### Hecho
+- Una sola pantalla para elegir formato, revisar salidas y ver el avance.
+- Los ajustes de cada formato se conservan al cambiar de codec.
+- La miniatura de la tabla sale a color.
+
 ## 2026-11-10 — Balance de la cámara, contenedor y revelado en la GPU
 
 ### Por qué
