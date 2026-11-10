@@ -1004,6 +1004,9 @@ def _export_dng_directory(args, codec_name: str):
     mode = args.mode or "COLOR"
     print(f"INFO|Secuencia DNG: {folder.name} | {len(frames)} cuadros | {w}x{h} | {codec_name}")
     print(f"INFO|Salida: {out}")
+    if process_prores_xq_frame.settings.get("engine") == "gpu":
+        _export_dng_frames_on_gpu(frames, w, h, out, args.fps, codec_name, mode)
+        return
     input_pix = "yuv444p10msble" if codec_name == "hevc_nvenc" else "rgb48le"
     video_ctx = {
         "stage_temp": False,
@@ -1048,6 +1051,166 @@ def _export_dng_directory(args, codec_name: str):
         writer.close()
         executor.shutdown(wait=True)
         _finish_video_export(video_ctx, args)
+
+
+def _shutdown_ffmpeg(proc) -> int:
+    if proc is None:
+        return 0
+    if proc.stdin:
+        try:
+            proc.stdin.close()
+        except OSError:
+            pass
+    return proc.wait()
+
+
+def _open_hevc_from_yuv(output_file, width, height, fps):
+    cmd = [
+        "ffmpeg", "-y", "-f", "rawvideo", "-vcodec", "rawvideo",
+        "-s", f"{width}x{height}", "-pix_fmt", "yuv444p10msble",
+        "-r", str(fps), "-i", "-",
+    ]
+    _append_ffmpeg_codec_args(cmd, "hevc_nvenc")
+    for i, item in enumerate(cmd):
+        if isinstance(item, str) and item.startswith("comment="):
+            cmd[i] = "comment=Revelado Rec.709. NPP en la GPU. HEVC 4:4:4 lossless 10 bits."
+    cmd.append(str(output_file))
+    print(f"INFO|FFmpeg cmd (stdin): {' '.join(cmd)}")
+    return subprocess.Popen(
+        cmd, stdin=subprocess.PIPE, stderr=sys.stderr, bufsize=FFMPEG_STDIN_BUFSIZE,
+    )
+
+
+def _gpu_encoder(codec, output_file, out_w, out_h, fps):
+    if codec == "prores_xq":
+        from reveal_gpu import open_prores_nv
+        return open_prores_nv(output_file, out_w, out_h, int(float(fps)))
+    return _open_hevc_from_yuv(output_file, out_w, out_h, fps)
+
+
+def _start_gpu_reveal(codec, w, h, mode):
+    from reveal_gpu import GpuReveal, prores_nv_size
+
+    settings = process_prores_xq_frame.settings
+    if codec == "prores_xq":
+        out_w, out_h = prores_nv_size(w, h)
+        shift = 0
+    else:
+        out_w, out_h = w, h
+        shift = 6
+    if (out_w, out_h) != (w, h):
+        print(
+            f"INFO|prores_nv pide ancho múltiplo de 16 y alto múltiplo de 8. "
+            f"El cuadro pasa de {w}x{h} a {out_w}x{out_h}, repitiendo el borde."
+        )
+    gpu = GpuReveal(settings, w, h, mode=mode, shift=shift, out_w=out_w, out_h=out_h)
+    return gpu, out_w, out_h
+
+
+def _write_gpu_frame(proc, gpu, mosaic):
+    try:
+        proc.stdin.write(gpu.frame(mosaic))
+    except OSError as exc:
+        raise RuntimeError("FFmpeg cerró la entrada antes de terminar el revelado.") from exc
+
+
+def _mosaic_from_dng(mosaic, w, h):
+    img = np.ascontiguousarray(mosaic)
+    if getattr(img, "ndim", 0) != 2:
+        raise RuntimeError("DNG sin mosaico de un canal")
+    if img.dtype != np.uint16:
+        img = img.astype(np.uint16)
+    if int(img.max()) > 4095:
+        img = img >> 4
+    if img.shape != (h, w):
+        raise RuntimeError(f"El DNG mide {img.shape[1]}x{img.shape[0]} y el primero mide {w}x{h}")
+    return img
+
+
+def _export_dng_frames_on_gpu(frames, w, h, out, fps, codec, mode):
+    gpu, out_w, out_h = _start_gpu_reveal(codec, w, h, mode)
+    proc = _gpu_encoder(codec, out, out_w, out_h, fps)
+    start_time = time.time()
+    print(f"START|{len(frames)}")
+    sys.stdout.flush()
+    try:
+        for idx, path in enumerate(frames):
+            mosaic = tifffile.imread(path)
+            _write_gpu_frame(proc, gpu, _mosaic_from_dng(mosaic, w, h))
+            done = idx + 1
+            if done % 10 == 0 or done == len(frames):
+                _log_export_progress(done, len(frames), start_time)
+    finally:
+        ret = _shutdown_ffmpeg(proc)
+    if ret != 0:
+        raise RuntimeError(f"FFmpeg fallo con codigo {ret}")
+
+
+def _export_reveal_on_gpu(
+    raw_file, num_frames, frame_bytes, w, h, mode, output_file, fps, codec,
+    glitch_filter, start_time, skip_frames,
+):
+    """Un proceso: el filtro magenta mira el CPU. El cuadro empaquetado sube y NPP, la curva y el YUV se quedan en la tarjeta."""
+    gpu, out_w, out_h = _start_gpu_reveal(codec, w, h, mode)
+    proc = _gpu_encoder(codec, output_file, out_w, out_h, fps)
+    detect_pool = (
+        ThreadPoolExecutor(max_workers=DETECT_PREFETCH_WORKERS) if glitch_filter else None
+    )
+    detect_depth = max(8, DETECT_PREFETCH_WORKERS + 4) if glitch_filter else 0
+    detect_queue: deque = deque()
+    read_count = 0
+    try:
+        _skip_raw_frames(raw_file, skip_frames, frame_bytes, w, h, glitch_filter)
+
+        def emit(raw_data: bytes):
+            try:
+                proc.stdin.write(gpu.frame_raw(raw_data))
+            except OSError as exc:
+                raise RuntimeError("FFmpeg cerró la entrada antes de terminar el revelado.") from exc
+
+        if glitch_filter:
+            def fill_detect():
+                nonlocal read_count
+                while len(detect_queue) < detect_depth and read_count < num_frames:
+                    raw_data = raw_file.read(frame_bytes)
+                    if len(raw_data) < frame_bytes:
+                        break
+                    detect_queue.append(
+                        detect_pool.submit(_unpack_detect_magenta, raw_data, w, h)
+                    )
+                    read_count += 1
+
+            fill_detect()
+            processed = 0
+            while detect_queue:
+                raw_data, is_magenta = detect_queue.popleft().result()
+                fill_detect()
+                processed += 1
+                for chunk in glitch_filter.feed(raw_data, is_magenta):
+                    emit(chunk)
+                if processed % 10 == 0 or processed == num_frames:
+                    _log_export_progress(processed, num_frames, start_time)
+            glitch_filter.finalize()
+        else:
+            for i in range(num_frames):
+                raw_data = raw_file.read(frame_bytes)
+                if len(raw_data) < frame_bytes:
+                    break
+                emit(raw_data)
+                done = i + 1
+                if done % 10 == 0 or done == num_frames:
+                    _log_export_progress(done, num_frames, start_time)
+        if glitch_filter and glitch_filter.discarded_count:
+            print(
+                f"INFO|Glitches magenta descartados del video: {glitch_filter.discarded_count} frames "
+                f"(de {read_count} leídos)"
+            )
+    finally:
+        if detect_pool:
+            detect_pool.shutdown(wait=True)
+        ret = _shutdown_ffmpeg(proc)
+    if ret != 0:
+        raise RuntimeError(f"FFmpeg fallo con codigo {ret}")
 
 
 def main():
@@ -1111,6 +1274,7 @@ def main():
             print(f"WARN|No se pudo parsear --grade: {e}")
             grade_settings = None
     codec_name = args.codec.lower()
+    reveal_gpu = False
     if codec_name in REVEAL_CODECS:
         from reveal_pipeline import coerce_reveal, reveal_tables, summary_line
         parsed_reveal = None
@@ -1122,9 +1286,17 @@ def main():
         process_prores_xq_frame.settings = coerce_reveal(parsed_reveal)
         reveal_tables(process_prores_xq_frame.settings)
         cv2.setNumThreads(1)
-        reveal_workers = _hw_reveal_workers() if codec_name in HW_ENCODER_CODECS else XQ_REVEAL_WORKERS
+        reveal_gpu = process_prores_xq_frame.settings.get("engine") == "gpu"
+        reveal_workers = 1 if reveal_gpu else (
+            _hw_reveal_workers() if codec_name in HW_ENCODER_CODECS else XQ_REVEAL_WORKERS
+        )
         print(f"INFO|{summary_line(process_prores_xq_frame.settings)}")
-        if codec_name in HW_ENCODER_CODECS:
+        if reveal_gpu:
+            print(
+                "INFO|Revelado en un solo proceso, en la tarjeta. "
+                "NPP, curva y detalle no bajan hasta el codificador."
+            )
+        elif codec_name in HW_ENCODER_CODECS:
             print(
                 f"INFO|Revelado en {reveal_workers} workers, un hilo de OpenCV por cuadro. "
                 "La curva sale de una tabla. El codec corre en la GPU."
@@ -1269,10 +1441,19 @@ def main():
             f"Modo Video: {args.codec} | Fuente: {'RGB8 ISP' if is_processed_src else 'Bayer'} | "
             f"pix_fmt: {input_pix_fmt}"
         )
-        if codec == "prores_xq":
+        if codec == "prores_xq" and reveal_gpu:
+            print(
+                "INFO|ProRes 4444 XQ en la tarjeta: NPP, revelado y codificador prores_nv."
+            )
+        elif codec == "prores_xq":
             print(
                 "INFO|ProRes 4444 XQ en Rec.709, 10 bits 4:4:4. "
                 "Demosaico edge-aware y revelado en el CPU. Pipe directo a FFmpeg."
+            )
+        elif codec == "hevc_nvenc" and reveal_gpu:
+            print(
+                "INFO|HEVC 4:4:4 lossless en NVENC. "
+                "El revelado NPP y el YUV se arman en la tarjeta, en este proceso."
             )
         elif codec == "hevc_nvenc":
             print(
@@ -1282,6 +1463,8 @@ def main():
 
         ext = _append_ffmpeg_codec_args([], args.codec)
         output_file = input_path.parent / (args.output or f"{input_path.stem}_{args.codec}{ext}")
+        if output_file.suffix.lower() != ext:
+            output_file = output_file.with_suffix(ext)
         stage_temp = False if is_reveal_mode else (not args.no_stage_temp)
         temp_path = input_path.parent / f".{input_path.stem}_stage_{os.getpid()}.raw"
         if stage_temp:
@@ -1456,19 +1639,27 @@ def main():
                 if use_glitch_filter:
                     print(f"INFO|Filtro glitch magenta activo (misma regla que DNG, racha <={MAX_GLITCH_RUN})")
 
-                writer = _create_video_frame_writer(video_ctx, args)
-                try:
+                if reveal_gpu:
                     with open(input_path, "rb") as f:
-                        _export_video_ordered(
-                            f, num_frames, frame_bytes, writer,
-                            w, h, is_rgb, args, grade_settings,
+                        _export_reveal_on_gpu(
+                            f, num_frames, frame_bytes, w, h, args.mode,
+                            video_ctx["output_file"], args.fps, codec,
                             glitch_filter, start_time, skip_frames,
-                            frame_fn=process_prores_xq_frame if is_reveal_mode else None,
-                            workers=hw_workers,
                         )
-                finally:
-                    writer.close()
-                _finish_video_export(video_ctx, args)
+                else:
+                    writer = _create_video_frame_writer(video_ctx, args)
+                    try:
+                        with open(input_path, "rb") as f:
+                            _export_video_ordered(
+                                f, num_frames, frame_bytes, writer,
+                                w, h, is_rgb, args, grade_settings,
+                                glitch_filter, start_time, skip_frames,
+                                frame_fn=process_prores_xq_frame if is_reveal_mode else None,
+                                workers=hw_workers,
+                            )
+                    finally:
+                        writer.close()
+                    _finish_video_export(video_ctx, args)
 
     except Exception as e:
         print(f"ERROR|{e}")
