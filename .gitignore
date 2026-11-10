@@ -1,2 +1,20 @@
 venv/
-__pychache__
+.venv/
+__pycache__/
+*.py[cod]
+
+# Ajustes de esta máquina: carpeta, ventana y sliders.
+persist.json
+
+# Respaldos locales de la cámara. config_bayer.txt y config_rgb.txt siguen en el repo.
+config_bayer.bk*.txt
+config_bayer_minimo.txt
+config_bayer_original.txt
+config_qoi_rgb.txt
+config_tests/
+
+# Pesos de la prueba Gharbi. El script los vuelve a bajar.
+models/*.pth
+
+# Volcados de texto de los manuales de Lucid. Los PDF siguen en el repo.
+docs/*.txt
