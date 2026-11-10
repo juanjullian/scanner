@@ -1,8 +1,8 @@
 """Revelado de visionado: Bayer 12-bit lineal → Rec.709.
 
-El demosaico corre en el CPU (edge-aware de OpenCV). En este i7 un cuadro
-de 2840×2200 tarda unos 3 ms. El mismo paso en la GPU es más rápido como
-kernel, pero subir el mosaico y bajar el RGB lo deja igual o más lento.
+En CPU el demosaico es el edge-aware de OpenCV. Si el ajuste dice GPU,
+la exportación sube el cuadro empaquetado y hace NPP, la curva, el detalle
+y el YUV en la tarjeta.
 """
 from __future__ import annotations
 
@@ -23,6 +23,9 @@ _SIGMA_COARSE = np.float32(4.0)
 _LUMA_R = np.float32(0.2126)
 _LUMA_G = np.float32(0.7152)
 _LUMA_B = np.float32(0.0722)
+# BalanceRatio de la PHX con el automático apagado. 1,00 en el slider es este blanco.
+_CAM_WB_R = 1.9248
+_CAM_WB_B = 2.321
 
 
 def default_reveal() -> dict:
@@ -33,18 +36,24 @@ def default_reveal() -> dict:
         "shadow_b": 12.0,
         "shadow_lift": 0.0,
         "midtone": 0.0,
+        "engine": "cpu",
     }
 
 
 def coerce_reveal(data) -> dict:
     out = default_reveal()
+    engine = "cpu"
     if isinstance(data, dict):
+        if str(data.get("engine", "")).strip().lower() == "gpu":
+            engine = "gpu"
         for key in out:
-            if key in data:
-                try:
-                    out[key] = float(data[key])
-                except (TypeError, ValueError):
-                    pass
+            if key == "engine" or key not in data:
+                continue
+            try:
+                out[key] = float(data[key])
+            except (TypeError, ValueError):
+                pass
+    out["engine"] = engine
     out["gain_r"] = float(np.clip(out["gain_r"], 0.25, 4.0))
     out["gain_b"] = float(np.clip(out["gain_b"], 0.25, 4.0))
     out["ev"] = float(np.clip(out["ev"], -4.0, 4.0))
@@ -58,7 +67,8 @@ def summary_line(settings: dict) -> str:
     s = coerce_reveal(settings)
     return (
         f"Revelado XQ guardado: rojo {s['gain_r']:.2f}, azul {s['gain_b']:.2f}, "
-        f"EV {s['ev']:+.2f}, sombras {s['shadow_b']:.0f}, detalle {s['midtone']:.2f}"
+        f"EV {s['ev']:+.2f}, sombras {s['shadow_b']:.0f}, detalle {s['midtone']:.2f}, "
+        f"{'en la GPU' if s['engine'] == 'gpu' else 'en el CPU'}"
     )
 
 
@@ -123,9 +133,9 @@ def reveal_tables(settings: dict) -> tuple[tuple, tuple]:
     ev_mul = float(2.0 ** s["ev"]) if s["ev"] != 0.0 else 1.0
     lift = float(s["shadow_lift"])
     floats = (
-        _channel_curve(s["gain_r"], ev_mul, curve_b, inv_log, lift),
+        _channel_curve(s["gain_r"] * _CAM_WB_R, ev_mul, curve_b, inv_log, lift),
         _channel_curve(1.0, ev_mul, curve_b, inv_log, lift),
-        _channel_curve(s["gain_b"], ev_mul, curve_b, inv_log, lift),
+        _channel_curve(s["gain_b"] * _CAM_WB_B, ev_mul, curve_b, inv_log, lift),
     )
     packed = tuple(_quantize_curve(curve) for curve in floats)
     _lut_cache[key] = (floats, packed)

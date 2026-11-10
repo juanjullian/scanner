@@ -992,6 +992,7 @@ class MainWindow(QMainWindow):
                 "shadow_b": 12.0,
                 "shadow_lift": 0.0,
                 "midtone": 0.0,
+                "engine": "cpu",
             },
         }
 
@@ -2599,6 +2600,10 @@ class MainWindow(QMainWindow):
             "--sharp", sharp,
             "--mode", mode,
         ]
+        ext_map = {
+            "prores": ".mov", "prores_hq": ".mov", "prores_xq": ".mov", "ffv1": ".mkv",
+            "h264": ".mp4", "hevc": ".mp4", "hevc_nvenc": ".mp4", "cineform": ".mov", "av1": ".mp4",
+        }
         if output_name:
             dest = output_dir / output_name
         elif effective_fmt == "dng":
@@ -2608,12 +2613,10 @@ class MainWindow(QMainWindow):
         elif effective_fmt == "tiff_seq":
             dest = output_dir / f"{nf.stem}_TIFF_SEQ"
         else:
-            ext_map = {
-                "prores": ".mov", "prores_hq": ".mov", "prores_xq": ".mov", "ffv1": ".mkv",
-                "h264": ".mp4", "hevc": ".mp4", "hevc_nvenc": ".mp4", "cineform": ".mov", "av1": ".mp4",
-            }
             ext = ext_map.get(effective_fmt, ".mp4")
             dest = output_dir / f"{nf.stem}_{effective_fmt}{ext}"
+        if effective_fmt in ext_map and dest.suffix.lower() != ext_map[effective_fmt]:
+            dest = dest.with_suffix(ext_map[effective_fmt])
         cmd.extend(["--output", str(dest)])
         self.current_video_output = dest
 

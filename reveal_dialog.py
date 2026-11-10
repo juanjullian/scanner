@@ -77,9 +77,30 @@ class RevealDialog(QDialog):
         self.lbl_note.setStyleSheet("color: #888; font-size: 9pt;")
         side.addWidget(self.lbl_note)
 
+        side.addWidget(QLabel("Dónde revelar"))
+        self.combo_engine = QComboBox()
+        self.combo_engine.addItem("CPU", "cpu")
+        self.combo_engine.addItem("GPU", "gpu")
+        self.combo_engine.setToolTip(
+            "CPU: edge-aware y ProRes en el procesador. "
+            "GPU: NPP, curva y ProRes en la tarjeta."
+        )
+        self.combo_engine.currentIndexChanged.connect(self._refresh_engine_note)
+        side.addWidget(self.combo_engine)
+        self.lbl_engine = QLabel("")
+        self.lbl_engine.setWordWrap(True)
+        self.lbl_engine.setStyleSheet("color: #888; font-size: 9pt;")
+        side.addWidget(self.lbl_engine)
+
         self._rows = {}
-        self._add_slider(side, "gain_r", "Ganancia rojo", 50, 250, 100, "Multiplica el rojo. El verde queda en 1.")
-        self._add_slider(side, "gain_b", "Ganancia azul", 50, 250, 100, "Multiplica el azul. El verde queda en 1.")
+        self._add_slider(
+            side, "gain_r", "Ganancia rojo", 50, 250, 100,
+            "1,00 es el balance de la cámara (rojo ×1,92). El verde queda en 1.",
+        )
+        self._add_slider(
+            side, "gain_b", "Ganancia azul", 50, 250, 100,
+            "1,00 es el balance de la cámara (azul ×2,32). El verde queda en 1.",
+        )
         self._add_slider(side, "ev", "Exposición (EV)", -200, 200, 100, "Pasos de diafragma, antes de la curva.")
         self._add_slider(side, "shadow_b", "Sombras", 10, 400, 10, "Un número más alto abre las sombras. El blanco del sensor sigue en el blanco.")
         self._add_slider(side, "shadow_lift", "Levante de negro", 0, 200, 1000, "Sube el negro sin mover el blanco.")
@@ -135,7 +156,25 @@ class RevealDialog(QDialog):
             slider.blockSignals(True)
             slider.setValue(int(round(self._settings[key] * scale)))
             slider.blockSignals(False)
+        engine = self._settings.get("engine", "cpu")
+        self.combo_engine.blockSignals(True)
+        self.combo_engine.setCurrentIndex(1 if engine == "gpu" else 0)
+        self.combo_engine.blockSignals(False)
         self._refresh_labels()
+        self._refresh_engine_note()
+
+    def _refresh_engine_note(self, *_args):
+        if self.combo_engine.currentData() == "gpu":
+            self.lbl_engine.setText(
+                "NPP, curva y detalle en la tarjeta. El cuadro empaquetado sube tal cual. "
+                "El ProRes 4444 XQ lo escribe la tarjeta y el ancho pasa al múltiplo de 16. "
+                "El HEVC lossless revela en la tarjeta y codifica con NVENC. Esta vista sigue en el CPU."
+            )
+        else:
+            self.lbl_engine.setText(
+                "Edge-aware en el CPU. El ProRes lo codifica el CPU. "
+                "El HEVC lossless codifica con NVENC."
+            )
 
     def _refresh_labels(self):
         values = self._collect()
@@ -152,6 +191,7 @@ class RevealDialog(QDialog):
         raw = {}
         for key, (slider, _lbl, scale) in self._rows.items():
             raw[key] = slider.value() / float(scale)
+        raw["engine"] = self.combo_engine.currentData() or "cpu"
         return reveal_pipeline.coerce_reveal(raw)
 
     def _schedule(self, *_args):
