@@ -1,6 +1,7 @@
 import os
 os.environ.setdefault("OPENCV_IO_ENABLE_OPENEXR", "1")
 
+import base64
 import subprocess
 import struct
 import numpy as np
@@ -312,12 +313,18 @@ def _save_exr_half(rgb_lin, path):
     Path(path).write_bytes(buf.tobytes())
 
 
-def process_prores_xq_frame(raw_data, is_rgb, width, height, mode, grade=None, is_bayer=False):
+def process_prores_xq_frame(raw_data, is_rgb, width, height, mode, grade=None, is_bayer=False, index=0):
     """Bayer → edge-aware → tabla de revelado → rgb48. El YUV de NVENC se arma después."""
     from reveal_pipeline import debayer_codes, reveal_codes_rgb48
     codes = debayer_codes(raw_data, width, height)
     settings = getattr(process_prores_xq_frame, "settings", None)
-    return reveal_codes_rgb48(codes, settings, mode)
+    data = reveal_codes_rgb48(codes, settings, mode)
+    finish = getattr(process_prores_xq_frame, "finish", None)
+    if finish is None or not finish.active:
+        return data
+    image = np.frombuffer(data, dtype=np.uint16).reshape(height, width, 3)
+    out = finish.apply_u16(image, int(index), finish.output_size(width, height))
+    return np.ascontiguousarray(out).tobytes()
 
 
 def _save_dng_task(img_16bit, out_path, width, height):
@@ -389,7 +396,7 @@ def process_video_frame_graded(raw_data, is_rgb, is_bayer, width, height, mode, 
     return _finalize_export_frame(img_rgb8, grade, width, height, is_rgb, is_bayer)
 
 
-def process_video_frame(raw_data, is_rgb, width, height, mode, grade=None, is_bayer=False):
+def process_video_frame(raw_data, is_rgb, width, height, mode, grade=None, is_bayer=False, index=0):
     """
     Procesa un frame y devuelve bytes listos para FFmpeg (rgb24 o rgb48le).
     Sin grade → passthrough ISP / debayer base. Con grade → cadena de gradación.
@@ -527,12 +534,12 @@ def _skip_raw_frames(
         return
     print(f"INFO|Omitiendo primeros {skip_count} cuadros...")
     if glitch_filter:
-        for _ in range(skip_count):
+        for index in range(skip_count):
             raw_data = raw_file.read(frame_bytes)
             if len(raw_data) < frame_bytes:
                 return
             raw_data, is_magenta = _unpack_detect_magenta(raw_data, w, h)
-            for _chunk in glitch_filter.feed(raw_data, is_magenta):
+            for _chunk in glitch_filter.feed((index, raw_data), is_magenta):
                 pass
     else:
         raw_file.seek(skip_count * frame_bytes, os.SEEK_CUR)
@@ -570,18 +577,65 @@ class FfmpegStdinWriter:
             raise self._err
 
 
-def _log_export_progress(current: int, total: int, start_time: float):
+def _thumb_due(state: dict, current: int, total: int) -> bool:
+    """True la primera vez que el avance entra en un punto porcentual nuevo."""
+    if total <= 0:
+        return False
+    percent = min(100, int(current * 100 / total))
+    if percent <= state.get("pct", -1):
+        return False
+    state["pct"] = percent
+    return True
+
+
+def _jpeg_rgb8(rgb: np.ndarray) -> bytes | None:
+    try:
+        if rgb is None or rgb.size == 0:
+            return None
+        frame = np.ascontiguousarray(rgb)
+        if frame.dtype != np.uint8:
+            frame = np.clip(frame, 0, 255).astype(np.uint8)
+        ok, buf = cv2.imencode(
+            ".jpg", cv2.cvtColor(frame, cv2.COLOR_RGB2BGR),
+            [int(cv2.IMWRITE_JPEG_QUALITY), 72],
+        )
+        if not ok:
+            return None
+        return buf.tobytes()
+    except Exception:
+        return None
+
+
+def _jpeg_rgb48(data: bytes, width: int, height: int) -> bytes | None:
+    need = int(width) * int(height) * 6
+    if width < 2 or height < 2 or len(data) != need:
+        return None
+    img = np.frombuffer(data, dtype=np.uint16).reshape(height, width, 3)
+    step = max(1, int(max(width, height) / 160))
+    small = (np.ascontiguousarray(img[::step, ::step]) >> 8).astype(np.uint8)
+    return _jpeg_rgb8(small)
+
+
+def _log_export_progress(current: int, total: int, start_time: float, thumb: bytes | None = None):
     elapsed = time.time() - start_time
     fps_proc = current / elapsed if elapsed > 0 else 0
     print(f"PROG|{current}|{total}")
     pct = (current / total * 100) if total else 0
     print(f"INFO|Frame: {current}/{total} ({pct:.1f}%) | Vel: {fps_proc:.2f} fps")
+    if thumb:
+        print("THUMB|" + base64.b64encode(thumb).decode("ascii"))
     sys.stdout.flush()
 
 
 def _unpack_detect_magenta(raw_data, w, h):
     img = unpack_12bit_packed_manual(raw_data, w, h)
     return raw_data, es_glitch_magenta(img)
+
+
+def _detect_indexed(item, w, h):
+    index, raw_data = item
+    raw_data, is_magenta = _unpack_detect_magenta(raw_data, w, h)
+    return index, raw_data, is_magenta
 
 
 def _export_video_ordered(
@@ -634,22 +688,33 @@ def _export_video_ordered(
     submit_idx = 0
     read_count = 0
     detect_queue: deque = deque()
+    thumb_state = {"pct": -1}
+    finish = getattr(frame_fn, "finish", None)
+    thumb_wh = None
+    if frame_fn is process_prores_xq_frame:
+        thumb_wh = finish.output_size(w, h) if finish is not None and finish.active else (w, h)
 
     def drain_completed():
         nonlocal next_to_write
         while next_to_write in future_map and future_map[next_to_write].done():
-            writer.submit(future_map[next_to_write].result())
+            data = future_map[next_to_write].result()
+            done = next_to_write + 1
+            if thumb_wh is not None and _thumb_due(thumb_state, done, num_frames):
+                jpg = _jpeg_rgb48(data, thumb_wh[0], thumb_wh[1])
+                if jpg:
+                    _log_export_progress(done, num_frames, start_time, jpg)
+            writer.submit(data)
             del future_map[next_to_write]
             next_to_write += 1
 
-    def submit_raw(raw_data: bytes):
+    def submit_raw(raw_data: bytes, index: int = 0):
         nonlocal submit_idx
         while len(future_map) >= process_depth:
             wait(list(future_map.values()), return_when=FIRST_COMPLETED)
             drain_completed()
         future_map[submit_idx] = executor.submit(
             frame_fn,
-            raw_data, is_rgb, w, h, args.mode, grade_settings, not is_rgb,
+            raw_data, is_rgb, w, h, args.mode, grade_settings, not is_rgb, index,
         )
         submit_idx += 1
         drain_completed()
@@ -661,7 +726,7 @@ def _export_video_ordered(
             if len(raw_data) < frame_bytes:
                 break
             detect_queue.append(
-                detect_pool.submit(_unpack_detect_magenta, raw_data, w, h)
+                detect_pool.submit(_detect_indexed, (skip_frames + read_count, raw_data), w, h)
             )
             read_count += 1
 
@@ -671,11 +736,11 @@ def _export_video_ordered(
             fill_detect()
             processed = 0
             while detect_queue:
-                raw_data, is_magenta = detect_queue.popleft().result()
+                index, raw_data, is_magenta = detect_queue.popleft().result()
                 fill_detect()
                 processed += 1
-                for chunk in glitch_filter.feed(raw_data, is_magenta):
-                    submit_raw(chunk)
+                for chunk in glitch_filter.feed((index, raw_data), is_magenta):
+                    submit_raw(chunk[1], chunk[0])
                 drain_completed()
                 if processed % 10 == 0:
                     _log_export_progress(processed, num_frames, start_time)
@@ -689,7 +754,7 @@ def _export_video_ordered(
                 if i + 1 < num_frames:
                     next_raw = raw_file.read(frame_bytes)
                 read_count = i + 1
-                submit_raw(raw_data)
+                submit_raw(raw_data, skip_frames + i)
                 if (i + 1) % 10 == 0:
                     _log_export_progress(i + 1, num_frames, start_time)
 
@@ -1088,11 +1153,14 @@ def _gpu_encoder(codec, output_file, out_w, out_h, fps):
     return _open_hevc_from_yuv(output_file, out_w, out_h, fps)
 
 
-def _start_gpu_reveal(codec, w, h, mode):
+def _start_gpu_reveal(codec, w, h, mode, finish=None):
     from reveal_gpu import GpuReveal, prores_nv_size
 
     settings = process_prores_xq_frame.settings
-    if codec == "prores_xq":
+    if finish is not None and finish.active:
+        out_w, out_h = finish.output_size(w, h)
+        shift = 0 if codec == "prores_xq" else 6
+    elif codec == "prores_xq":
         out_w, out_h = prores_nv_size(w, h)
         shift = 0
     else:
@@ -1100,10 +1168,13 @@ def _start_gpu_reveal(codec, w, h, mode):
         shift = 6
     if (out_w, out_h) != (w, h):
         print(
-            f"INFO|prores_nv pide ancho múltiplo de 16 y alto múltiplo de 8. "
-            f"El cuadro pasa de {w}x{h} a {out_w}x{out_h}, repitiendo el borde."
+            f"INFO|Salida {out_w}x{out_h} desde {w}x{h}. "
+            "El borde que falta se repite para el codec."
         )
-    gpu = GpuReveal(settings, w, h, mode=mode, shift=shift, out_w=out_w, out_h=out_h)
+    gpu = GpuReveal(
+        settings, w, h, mode=mode, shift=shift, out_w=out_w, out_h=out_h,
+        finish=finish if finish is not None and finish.active else None,
+    )
     return gpu, out_w, out_h
 
 
@@ -1148,10 +1219,10 @@ def _export_dng_frames_on_gpu(frames, w, h, out, fps, codec, mode):
 
 def _export_reveal_on_gpu(
     raw_file, num_frames, frame_bytes, w, h, mode, output_file, fps, codec,
-    glitch_filter, start_time, skip_frames,
+    glitch_filter, start_time, skip_frames, finish=None,
 ):
     """Un proceso: el filtro magenta mira el CPU. El cuadro empaquetado sube y NPP, la curva y el YUV se quedan en la tarjeta."""
-    gpu, out_w, out_h = _start_gpu_reveal(codec, w, h, mode)
+    gpu, out_w, out_h = _start_gpu_reveal(codec, w, h, mode, finish)
     proc = _gpu_encoder(codec, output_file, out_w, out_h, fps)
     detect_pool = (
         ThreadPoolExecutor(max_workers=DETECT_PREFETCH_WORKERS) if glitch_filter else None
@@ -1159,12 +1230,24 @@ def _export_reveal_on_gpu(
     detect_depth = max(8, DETECT_PREFETCH_WORKERS + 4) if glitch_filter else 0
     detect_queue: deque = deque()
     read_count = 0
+    thumb_state = {"pct": -1}
+
+    def log(done: int):
+        thumb = None
+        if _thumb_due(thumb_state, done, num_frames):
+            try:
+                thumb = _jpeg_rgb8(gpu.preview_rgb())
+            except Exception:
+                thumb = None
+        if thumb is not None or done % 10 == 0 or done == num_frames:
+            _log_export_progress(done, num_frames, start_time, thumb)
+
     try:
         _skip_raw_frames(raw_file, skip_frames, frame_bytes, w, h, glitch_filter)
 
-        def emit(raw_data: bytes):
+        def emit(raw_data: bytes, index: int):
             try:
-                proc.stdin.write(gpu.frame_raw(raw_data))
+                proc.stdin.write(gpu.frame_raw(raw_data, index))
             except OSError as exc:
                 raise RuntimeError("FFmpeg cerró la entrada antes de terminar el revelado.") from exc
 
@@ -1176,30 +1259,29 @@ def _export_reveal_on_gpu(
                     if len(raw_data) < frame_bytes:
                         break
                     detect_queue.append(
-                        detect_pool.submit(_unpack_detect_magenta, raw_data, w, h)
+                        detect_pool.submit(
+                            _detect_indexed, (skip_frames + read_count, raw_data), w, h,
+                        )
                     )
                     read_count += 1
 
             fill_detect()
             processed = 0
             while detect_queue:
-                raw_data, is_magenta = detect_queue.popleft().result()
+                index, raw_data, is_magenta = detect_queue.popleft().result()
                 fill_detect()
                 processed += 1
-                for chunk in glitch_filter.feed(raw_data, is_magenta):
-                    emit(chunk)
-                if processed % 10 == 0 or processed == num_frames:
-                    _log_export_progress(processed, num_frames, start_time)
+                for chunk in glitch_filter.feed((index, raw_data), is_magenta):
+                    emit(chunk[1], chunk[0])
+                log(processed)
             glitch_filter.finalize()
         else:
             for i in range(num_frames):
                 raw_data = raw_file.read(frame_bytes)
                 if len(raw_data) < frame_bytes:
                     break
-                emit(raw_data)
-                done = i + 1
-                if done % 10 == 0 or done == num_frames:
-                    _log_export_progress(done, num_frames, start_time)
+                emit(raw_data, skip_frames + i)
+                log(i + 1)
         if glitch_filter and glitch_filter.discarded_count:
             print(
                 f"INFO|Glitches magenta descartados del video: {glitch_filter.discarded_count} frames "
@@ -1284,6 +1366,7 @@ def main():
             except json.JSONDecodeError as e:
                 print(f"WARN|No se pudo leer --reveal: {e}")
         process_prores_xq_frame.settings = coerce_reveal(parsed_reveal)
+        process_prores_xq_frame.finish = None
         reveal_tables(process_prores_xq_frame.settings)
         cv2.setNumThreads(1)
         reveal_gpu = process_prores_xq_frame.settings.get("engine") == "gpu"
@@ -1433,6 +1516,14 @@ def main():
         else:
             input_pix_fmt = 'rgb24' if is_processed_src else 'rgb48le'
         export_w, export_h = w, h
+        finish = getattr(process_prores_xq_frame, "finish", None)
+        if is_reveal_mode:
+            from film_finish import Finish
+            finish = Finish(input_path, gpu=reveal_gpu, codec=codec)
+            process_prores_xq_frame.finish = finish
+            if finish.active:
+                export_w, export_h = finish.output_size(w, h)
+                print(f"INFO|Ajustes de archivo: salida {export_w}x{export_h}")
         if grade_settings and grade_settings.get("enabled"):
             from export_grade import export_frame_size
             export_w, export_h = export_frame_size(grade_settings, w, h)
@@ -1645,6 +1736,7 @@ def main():
                             f, num_frames, frame_bytes, w, h, args.mode,
                             video_ctx["output_file"], args.fps, codec,
                             glitch_filter, start_time, skip_frames,
+                            getattr(process_prores_xq_frame, "finish", None),
                         )
                 else:
                     writer = _create_video_frame_writer(video_ctx, args)

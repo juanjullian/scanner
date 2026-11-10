@@ -43,6 +43,11 @@ def test_thumb_is_color():
     assert odd.shape[0] % 2 == 0 and odd.shape[1] % 2 == 0
 
 
+def test_speed_keeps_the_velocity_after_the_second_bar():
+    body = "INFO|Frame: 40/2000 (2.0%) | Vel: 12,50 fps".split("|", 1)[1]
+    assert parse_export_speed(body) == (40, 2000, 12.5)
+
+
 def test_speed_and_groups():
     parsed = parse_export_speed("Frame: 40/2000 (2.0%) | Vel: 12.50 fps")
     assert parsed == (40, 2000, 12.5)
@@ -123,8 +128,22 @@ def test_draft_roundtrip_across_formats():
     assert isinstance(dialog.combo_fmt, QComboBox)
 
 
+def test_thumb_marks_each_percent():
+    from raw2video import _jpeg_rgb8, _thumb_due
+    state = {"pct": -1}
+    assert _thumb_due(state, 1, 200)
+    assert not _thumb_due(state, 1, 200)
+    assert _thumb_due(state, 3, 200)
+    rgb = np.zeros((8, 8, 3), np.uint8)
+    rgb[..., 0] = 180
+    jpg = _jpeg_rgb8(rgb)
+    assert jpg is not None and jpg[:2] == b"\xff\xd8"
+
+
 if __name__ == "__main__":
     test_thumb_is_color()
+    test_speed_keeps_the_velocity_after_the_second_bar()
     test_speed_and_groups()
+    test_thumb_marks_each_percent()
     test_draft_roundtrip_across_formats()
     print("ok")

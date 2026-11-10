@@ -35,12 +35,19 @@ _YUV = r"""
 extern "C" __global__
 void rgb01_to_yuv10(const float* __restrict__ rgb, unsigned short* __restrict__ y,
                     unsigned short* __restrict__ u, unsigned short* __restrict__ v,
-                    int width, int height, int out_w, int out_h, int shift) {
+                    int width, int height, int out_w, int out_h, int shift,
+                    int crop_x, int crop_y, int crop_w, int crop_h) {
     int x = blockIdx.x * blockDim.x + threadIdx.x;
     int yy = blockIdx.y * blockDim.y + threadIdx.y;
     if (x >= out_w || yy >= out_h) return;
-    int sx = x < width ? x : width - 1;
-    int sy = yy < height ? yy : height - 1;
+    int sx = crop_x + x;
+    int sy = crop_y + yy;
+    if (x >= crop_w) sx = crop_x + crop_w - 1;
+    if (yy >= crop_h) sy = crop_y + crop_h - 1;
+    if (sx < 0) sx = 0;
+    if (sy < 0) sy = 0;
+    if (sx >= width) sx = width - 1;
+    if (sy >= height) sy = height - 1;
     int i = (sy * width + sx) * 3;
     float R = rgb[i];
     float G = rgb[i + 1];
@@ -111,6 +118,103 @@ void apply_ratio(float* __restrict__ img, const float* __restrict__ y,
     img[b] = r < 0.f ? 0.f : (r > 1.f ? 1.f : r);
     img[b + 1] = g < 0.f ? 0.f : (g > 1.f ? 1.f : g);
     img[b + 2] = bl < 0.f ? 0.f : (bl > 1.f ? 1.f : bl);
+}
+"""
+
+_GAMMA = r"""
+extern "C" __global__
+void apply_gamma(float* img, int n, int scale,
+                 float rmin, float rmax, float gmin, float gmax, float bmin, float bmax,
+                 float smin, float smax, float gr, float gg, float gb,
+                 float strength, float omin, float omax, float dark, float high) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    int b = i * 3;
+    float los[3] = {rmin, gmin, bmin};
+    float his[3] = {rmax, gmax, bmax};
+    float gs[3] = {gr, gg, gb};
+    const float feather = 16.f / 255.f;
+    for (int c = 0; c < 3; ++c) {
+        float value = img[b + c];
+        float sample = value;
+        if (scale == 1) {
+            float span = smax - smin;
+            if (span < 1e-6f) span = 1e-6f;
+            sample = (value - smin) / span;
+        } else if (scale == 2) {
+            float span = his[c] - los[c];
+            if (span < 1e-6f) span = 1e-6f;
+            sample = (value - los[c]) / span;
+        }
+        if (sample < 0.f) sample = 0.f;
+        else if (sample > 1.f) sample = 1.f;
+        float graded = omin + powf(sample, gs[c]) * (omax - omin);
+        float w = strength;
+        if (dark >= 0.f) {
+            float t = (value - dark) / feather;
+            if (t < 0.f) t = 0.f;
+            else if (t > 1.f) t = 1.f;
+            w *= t;
+        }
+        if (high >= 0.f) {
+            float t = (high - value) / feather;
+            if (t < 0.f) t = 0.f;
+            else if (t > 1.f) t = 1.f;
+            w *= t;
+        }
+        img[b + c] = value * (1.f - w) + graded * w;
+    }
+}
+"""
+
+_SAT = r"""
+extern "C" __global__
+void apply_sat(float* img, int n, float sat) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    int b = i * 3;
+    float r = img[b];
+    float g = img[b + 1];
+    float bl = img[b + 2];
+    float y = 0.2126f * r + 0.7152f * g + 0.0722f * bl;
+    img[b] = y + (r - y) * sat;
+    img[b + 1] = y + (g - y) * sat;
+    img[b + 2] = y + (bl - y) * sat;
+}
+"""
+
+_WARP = r"""
+extern "C" __global__
+void sample_rgb(const float* __restrict__ src, float* __restrict__ dst,
+                 int w, int h, float a, float b, float c, float d, float e, float f) {
+    int x = blockIdx.x * blockDim.x + threadIdx.x;
+    int y = blockIdx.y * blockDim.y + threadIdx.y;
+    if (x >= w || y >= h) return;
+    float fx = a * x + b * y + c;
+    float fy = d * x + e * y + f;
+    int o = (y * w + x) * 3;
+    if (fx < 0.f || fy < 0.f || fx > w - 1.0001f || fy > h - 1.0001f) {
+        dst[o] = 0.f; dst[o + 1] = 0.f; dst[o + 2] = 0.f;
+        return;
+    }
+    int x0 = (int)fx;
+    int y0 = (int)fy;
+    float ax = fx - x0;
+    float ay = fy - y0;
+    int x1 = x0 + 1 < w ? x0 + 1 : x0;
+    int y1 = y0 + 1 < h ? y0 + 1 : y0;
+    int i00 = (y0 * w + x0) * 3;
+    int i10 = (y0 * w + x1) * 3;
+    int i01 = (y1 * w + x0) * 3;
+    int i11 = (y1 * w + x1) * 3;
+    float w00 = (1.f - ax) * (1.f - ay);
+    float w10 = ax * (1.f - ay);
+    float w01 = (1.f - ax) * ay;
+    float w11 = ax * ay;
+    for (int c = 0; c < 3; ++c) {
+        dst[o + c] = src[i00 + c] * w00 + src[i10 + c] * w10
+                   + src[i01 + c] * w01 + src[i11 + c] * w11;
+    }
 }
 """
 
@@ -227,7 +331,8 @@ class GpuReveal:
     """Cuadro Bayer empaquetado o mosaico 0–4095 → YUV de 10 bits. El RGB no baja."""
 
     def __init__(self, settings: dict, width: int, height: int, mode: str = "COLOR",
-                 shift: int = 0, out_w: int | None = None, out_h: int | None = None):
+                 shift: int = 0, out_w: int | None = None, out_h: int | None = None,
+                 finish=None):
         cp = prepare()
         from cupyx.scipy.ndimage import gaussian_filter
 
@@ -243,6 +348,7 @@ class GpuReveal:
         self.out_h = int(out_h or self.height)
         self.shift = int(shift)
         self.bw = mode == "BW"
+        self.finish = finish
         self.amount = float(settings["midtone"])
         luts = reveal_luts(settings)
         self.lr = cp.asarray(luts[0])
@@ -256,6 +362,10 @@ class GpuReveal:
         self.lut = cp.RawKernel(_LUT, "apply_lut")
         self.ratio = cp.RawKernel(_MID, "apply_ratio")
         self.yuv = cp.RawKernel(_YUV, "rgb01_to_yuv10")
+        self.gamma_k = cp.RawKernel(_GAMMA, "apply_gamma")
+        self.sat_k = cp.RawKernel(_SAT, "apply_sat")
+        self.warp_k = cp.RawKernel(_WARP, "sample_rgb")
+        self.warped = None
         self.packed = cp.empty(self.width * self.height * 3 // 2, dtype=cp.uint8)
         self.src = cp.empty((self.height, self.width), dtype=cp.uint16)
         self.codes = cp.empty((self.height, self.width, 3), dtype=cp.uint16)
@@ -272,21 +382,21 @@ class GpuReveal:
         self.n = self.width * self.height
         self.even = True
 
-    def frame_raw(self, packed: bytes) -> bytes:
+    def frame_raw(self, packed: bytes, index: int = 0) -> bytes:
         """BayerRG12p empaquetado. El desempaque ocurre en la tarjeta."""
         self.packed.set(np.frombuffer(packed, dtype=np.uint8))
         self.unpack(
             ((self.pairs + 255) // 256,), (256,),
             (self.packed, self.src, np.int32(self.pairs)),
         )
-        return self._after_mosaic()
+        return self._after_mosaic(index)
 
-    def frame(self, mosaic: np.ndarray) -> bytes:
+    def frame(self, mosaic: np.ndarray, index: int = 0) -> bytes:
         """Mosaico uint16 ya desempaquetado, códigos 0–4095."""
         self.src.set(np.ascontiguousarray(mosaic, dtype=np.uint16))
-        return self._after_mosaic()
+        return self._after_mosaic(index)
 
-    def _after_mosaic(self) -> bytes:
+    def _after_mosaic(self, index: int = 0) -> bytes:
         cp = self.cp
         status = self.npp(
             self.src.data.ptr, self.width * 2, self.npp_size, self.npp_roi,
@@ -331,12 +441,16 @@ class GpuReveal:
             self.img[:, :, 0] = yb
             self.img[:, :, 1] = yb
             self.img[:, :, 2] = yb
+        src = self._finish_on_device(index)
+        self._view = src
+        crop_x, crop_y, crop_w, crop_h = self._crop_args()
         self.yuv(
             ((self.out_w + 15) // 16, (self.out_h + 15) // 16), (16, 16),
             (
-                self.img, self.yp, self.up, self.vp,
+                src, self.yp, self.up, self.vp,
                 np.int32(self.width), np.int32(self.height),
                 np.int32(self.out_w), np.int32(self.out_h), np.int32(self.shift),
+                np.int32(crop_x), np.int32(crop_y), np.int32(crop_w), np.int32(crop_h),
             ),
         )
         n = self.out_w * self.out_h
@@ -344,3 +458,73 @@ class GpuReveal:
         self.host[n:n * 2] = cp.asnumpy(self.up)
         self.host[n * 2:] = cp.asnumpy(self.vp)
         return self.host.tobytes()
+
+    def preview_rgb(self) -> np.ndarray | None:
+        """El cuadro ya revelado, chico, para la miniatura de la exportación."""
+        view = getattr(self, "_view", None)
+        if view is None:
+            return None
+        cp = self.cp
+        x, y, width, height = self._crop_args()
+        limit_h, limit_w = int(view.shape[0]), int(view.shape[1])
+        x = max(0, min(int(x), limit_w - 1))
+        y = max(0, min(int(y), limit_h - 1))
+        width = max(1, min(int(width), limit_w - x))
+        height = max(1, min(int(height), limit_h - y))
+        step = max(1, int(max(width, height) / 160))
+        small = view[y:y + height:step, x:x + width:step]
+        return cp.asnumpy(cp.clip(small * cp.float32(255.0) + cp.float32(0.5), 0, 255).astype(cp.uint8))
+
+    def _crop_args(self) -> tuple[int, int, int, int]:
+        if self.finish is not None:
+            box = self.finish.crop_box(self.width, self.height)
+            if box is not None:
+                return box
+        return 0, 0, self.width, self.height
+
+    def _finish_on_device(self, index: int):
+        src = self.img
+        if self.finish is None:
+            return src
+        recipe = None if self.finish.grade_mode == "bw" else self.finish.recipe_at(index)
+        if recipe:
+            mins = recipe["mins"]
+            maxs = recipe["maxs"]
+            gammas = recipe["gammas"]
+            self.gamma_k(
+                ((self.n + 255) // 256,), (256,),
+                (
+                    self.img, np.int32(self.n), np.int32(int(recipe.get("scale", 2))),
+                    np.float32(mins[0]), np.float32(maxs[0]),
+                    np.float32(mins[1]), np.float32(maxs[1]),
+                    np.float32(mins[2]), np.float32(maxs[2]),
+                    np.float32(recipe.get("shared_min", 0.0)),
+                    np.float32(recipe.get("shared_max", 1.0)),
+                    np.float32(gammas[0]), np.float32(gammas[1]), np.float32(gammas[2]),
+                    np.float32(recipe.get("strength", 1.0)),
+                    np.float32(recipe.get("omin", 0.0)),
+                    np.float32(recipe.get("omax", 1.0)),
+                    np.float32(-1.0 if recipe.get("dark") is None else recipe["dark"]),
+                    np.float32(-1.0 if recipe.get("high") is None else recipe["high"]),
+                ),
+            )
+        sat = float(getattr(self.finish, "grade_sat", 1.0))
+        if sat < 0.999:
+            self.sat_k(
+                ((self.n + 255) // 256,), (256,),
+                (self.img, np.int32(self.n), np.float32(sat)),
+            )
+        matrix = None if self.finish is None else self.finish.sampling(index, self.width, self.height)
+        if matrix is not None:
+            if self.warped is None:
+                self.warped = self.cp.empty_like(self.img)
+            self.warp_k(
+                ((self.width + 15) // 16, (self.height + 15) // 16), (16, 16),
+                (
+                    self.img, self.warped, np.int32(self.width), np.int32(self.height),
+                    np.float32(matrix[0, 0]), np.float32(matrix[0, 1]), np.float32(matrix[0, 2]),
+                    np.float32(matrix[1, 0]), np.float32(matrix[1, 1]), np.float32(matrix[1, 2]),
+                ),
+            )
+            src = self.warped
+        return src

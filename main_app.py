@@ -1,5 +1,6 @@
 import sys
 import os
+import base64
 import ctypes
 import queue
 import struct
@@ -697,6 +698,8 @@ class MainWindow(QMainWindow):
         self.raw_width = 2840
         self.raw_height = 2200
         
+        from adjust_jobs import AdjustJobs
+        self.adjust_jobs = AdjustJobs(self)
         self.init_ui()
         self.refresh_collections()
         self.update_disk_space()
@@ -926,6 +929,13 @@ class MainWindow(QMainWindow):
             if items:
                 self.col_list.setCurrentItem(items[0])
             self.refresh_file_list(coll)
+        self._resume_perfo()
+
+    def _resume_perfo(self):
+        if not self.active_collection or not getattr(self, "adjust_jobs", None):
+            return
+        folder = Path(self.root_folder) / self.active_collection
+        self.adjust_jobs.resume_folder(folder)
 
     def _apply_persist_to_camera(self):
         if not self.camera_worker or not self._camera_connected:
@@ -1406,6 +1416,7 @@ class MainWindow(QMainWindow):
             self.btn_record.setStyleSheet("background-color: #555; font-size: 14pt; color: #aaa;")
         self.tabs.setCurrentIndex(0)
         self.schedule_save_config()
+        self._resume_perfo()
 
     def _collection_for_file_panel(self):
         it = self.col_list.currentItem()
@@ -2411,6 +2422,9 @@ class MainWindow(QMainWindow):
             self.worker.info_signal.connect(
                 lambda text, file_name=name, host=session: host.note_info(file_name, text)
             )
+            self.worker.thumb_signal.connect(
+                lambda data, file_name=name, host=session: host.note_thumb(file_name, data)
+            )
         else:
             self.worker.progress_signal.connect(self.pd.setValue)
             self.worker.info_signal.connect(self.pd.setLabelText)
@@ -2757,6 +2771,7 @@ class DngRevealDialog(QDialog):
 class UniversalExportWorker(QThread):
     progress_signal = pyqtSignal(int)
     info_signal = pyqtSignal(str)
+    thumb_signal = pyqtSignal(bytes)
     finished_signal = pyqtSignal(bool, str)
 
     def __init__(self, cmd):
@@ -2828,9 +2843,15 @@ class UniversalExportWorker(QThread):
                                 self.progress_signal.emit(percent)
                         except: pass
                             
+                    elif line.startswith("THUMB|"):
+                        try:
+                            self.thumb_signal.emit(base64.b64decode(line.split("|", 1)[1]))
+                        except Exception:
+                            pass
+
                     elif line.startswith("INFO|"):
-                        msg = line.split("|")[1]
-                        self.info_signal.emit(msg)
+                        # La velocidad va después de otro "|". split("|")[1] la tiraba.
+                        self.info_signal.emit(line.split("|", 1)[1])
                         
                     elif line.startswith("ERROR|"):
                         print(f"Error Script: {line}")

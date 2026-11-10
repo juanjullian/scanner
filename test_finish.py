@@ -1,0 +1,281 @@
+"""GamMac y perforación sobre imágenes chicas, sin la cámara ni la GPU."""
+import numpy as np
+
+import gammac
+import perfo_lock
+
+
+def test_gammac_locks_green():
+    ramp = np.linspace(0.15, 0.85, 60, dtype=np.float32)
+    image = np.zeros((80, 100, 3), np.float32)
+    image[20:60, 20:80, 0] = 0.55
+    image[20:60, 20:80, 1] = 0.35
+    image[20:60, 20:80, 2] = 0.28
+    image[20:60, 20:80, :] *= ramp[None, :, None]
+    recipe = gammac.measure(image, (24, 24, 40, 28), lock=1, scale=2)
+    assert recipe["ok"] and not recipe["limited"]
+    corrected = gammac.apply(image, recipe)
+    area = corrected[24:52, 24:64]
+    means = [float(area[..., c].mean()) for c in range(3)]
+    assert abs(means[0] - means[1]) < 0.04
+    assert abs(means[2] - means[1]) < 0.04
+
+
+def test_gammac_ignores_border():
+    ramp = np.linspace(0.2, 0.9, 100, dtype=np.float32)
+    image = np.zeros((80, 100, 3), np.float32)
+    image[:, :, 0] = 0.45 * ramp
+    image[:, :, 1] = 0.45 * ramp
+    image[:, :, 2] = 0.25 * ramp
+    image[:8, :, :] = 0
+    image[:, :8, :] = 1
+    inside = gammac.measure(image, (16, 16, 60, 50), lock=1, scale=2)
+    whole = gammac.measure(image, (0, 0, 100, 80), lock=1, scale=2)
+    assert abs(inside["gammas"][2] - whole["gammas"][2]) > 0.05
+
+
+def test_strength_and_black_floor():
+    image = np.zeros((8, 8, 3), np.float32)
+    image[..., 0] = 0.55
+    image[..., 1] = 0.40
+    image[..., 2] = 0.25
+    recipe = {
+        "ok": True,
+        "limited": False,
+        "scale": 0,
+        "gammas": [0.45, 0.45, 0.45],
+        "strength": 0.0,
+        "omin": 0.0,
+        "omax": 1.0,
+    }
+    assert np.allclose(gammac.apply(image, recipe), image)
+
+    recipe["strength"] = 1.0
+    recipe["gammas"] = [1.0, 1.0, 1.0]
+    recipe["omin"] = 8 / 255
+    recipe["omax"] = 240 / 255
+    black = np.zeros_like(image)
+    white = np.ones_like(image)
+    assert abs(float(gammac.apply(black, recipe)[0, 0, 0]) - 8 / 255) < 1e-5
+    assert abs(float(gammac.apply(white, recipe)[0, 0, 0]) - 240 / 255) < 1e-5
+
+    shadow = np.full_like(image, 0.02)
+    recipe["dark"] = 0.20
+    recipe["gammas"] = [0.4, 0.4, 0.4]
+    assert np.allclose(gammac.apply(shadow, recipe), shadow, atol=1e-5)
+
+
+def test_turn_spins_clockwise_inside_the_crop():
+    import cv2
+    import film_finish
+    image = np.zeros((40, 60, 3), np.float32)
+    image[20, 36] = 1.0
+    matrix = film_finish.sampling_matrix(0, 0, 90, (20, 20))
+    spun = cv2.warpAffine(
+        image, matrix, (60, 40),
+        flags=cv2.INTER_NEAREST | cv2.WARP_INVERSE_MAP,
+        borderMode=cv2.BORDER_CONSTANT,
+    )
+    spot = np.argwhere(spun[..., 0] > 0.5)
+    assert len(spot) == 1
+    y, x = (int(v) for v in spot[0])
+    assert abs(x - 20) <= 1 and abs(y - 36) <= 1
+    same = film_finish.sampling_matrix(4, 0, 0, (20, 20))
+    assert np.allclose(same, [[1, 0, 4], [0, 1, 0]])
+
+
+def test_crop_snaps_for_prores_nv():
+    import film_finish
+    snapped = film_finish.snap_crop((10, 20, 100, 50), 2840, 2200)
+    assert snapped == (10, 20, 96, 48)
+    full = film_finish.snap_crop((0, 0, 2840, 2200), 2840, 2200)
+    assert full == (0, 0, 2832, 2200)
+    assert full[2] % 16 == 0 and full[3] % 8 == 0
+    edge = film_finish.snap_crop((2830, 2190, 20, 20), 2840, 2200)
+    assert edge[2] % 16 == 0 and edge[3] % 8 == 0
+    assert edge[0] + edge[2] <= 2840 and edge[1] + edge[3] <= 2200
+
+
+def test_copy_adjust_skips_motion():
+    import json
+    from pathlib import Path
+    import tempfile
+    import film_finish
+    with tempfile.TemporaryDirectory() as folder:
+        root = Path(folder)
+        src = root / "a.raw"
+        dst = root / "b.raw"
+        src.write_bytes(b"")
+        dst.write_bytes(b"")
+        film_finish.save(src, {
+            "segments": [{"in": 0, "out": 3, "recipe": {"ok": True, "gammas": [1, 1, 1]}}],
+            "crop": [0, 0, 2832, 2200],
+            "perfo": {"enabled": True, "roi": [10, 20, 80, 120]},
+        })
+        film_finish.perfo_path(src).write_text('{"tx":[1]}', encoding="utf-8")
+        assert film_finish.copy_adjust(src, dst)
+        copied = json.loads(film_finish.adjust_path(dst).read_text(encoding="utf-8"))
+        assert copied["crop"][2] == 2832
+        assert copied["perfo"]["roi"][0] == 10
+        assert not film_finish.perfo_path(dst).is_file()
+        empty = root / "c.raw"
+        empty.write_bytes(b"")
+        film_finish.save(empty, film_finish.empty())
+        assert film_finish.copy_adjust(empty, dst) is False
+
+
+def test_perfo_skips_what_is_done_and_can_resume():
+    import tempfile
+    from pathlib import Path
+    import film_finish
+    import perfo_lock
+    rows = [(0.0, 0.0, 1.0, 0)] * 10
+    rows[3] = None
+    rows[4] = None
+    rows[8] = None
+    assert perfo_lock._pending_spans(rows, 48) == [(3, 5), (8, 9)]
+    with tempfile.TemporaryDirectory() as folder:
+        raw = Path(folder) / "rollo.raw"
+        raw.write_bytes(b"\x00" * (2840 * 2200 * 3 // 2))
+        film_finish.write_perfo_status(
+            raw, "done", "Lista",
+            {"tx": [0.0], "ty": [0.0], "roi": [1, 2, 3, 4]},
+        )
+        assert film_finish.perfo_is_done(raw, [1, 2, 3, 4]) is True
+        assert film_finish.perfo_is_done(raw, [9, 9, 9, 9]) is False
+        film_finish.write_perfo_status(
+            raw, "running", "2/4",
+            partial=[[0.1, 0.2, 0.9, 0], None, [0.0, 0.0, 0.8, 0], None],
+            roi=[4, 5, 30, 40], ref=7,
+        )
+        loaded, ref = perfo_lock._load_resume(raw, (4, 5, 30, 40), 4)
+        assert ref == 7
+        assert loaded[0][0] == 0.1 and loaded[1] is None and loaded[2][2] == 0.8
+        assert perfo_lock._load_resume(raw, (0, 0, 8, 8), 4)[1] is None
+
+
+def test_quarter_preview_keeps_bayer_phase():
+    import reveal_pipeline
+    width, height = 2840, 2200
+    mosaic = np.empty((height, width), np.uint16)
+    mosaic[0::2, 0::2] = 1000
+    mosaic[0::2, 1::2] = 2000
+    mosaic[1::2, 0::2] = 1800
+    mosaic[1::2, 1::2] = 3000
+    flat = mosaic.reshape(-1)
+    p0 = flat[0::2]
+    p1 = flat[1::2]
+    packed = np.empty((p0.size, 3), np.uint8)
+    packed[:, 0] = p0 & 0xFF
+    packed[:, 1] = ((p0 >> 8) & 0x0F) | ((p1 & 0x0F) << 4)
+    packed[:, 2] = (p1 >> 4) & 0xFF
+    rgb = reveal_pipeline.debayer_quarter(packed.tobytes(), width, height)
+    assert rgb.shape == (height // 4, width // 4, 3)
+    pixel = rgb[20, 20]
+    assert abs(float(pixel[0]) - 1000 / 4095) < 0.02
+    assert abs(float(pixel[1]) - 1900 / 4095) < 0.05
+    assert abs(float(pixel[2]) - 3000 / 4095) < 0.02
+    play = reveal_pipeline.debayer_playback(packed.tobytes(), width, height)
+    assert play.shape == ((height // 6) * 2, (width // 6) * 2, 3)
+    pixel = play[20, 20]
+    assert abs(float(pixel[0]) - 1000 / 4095) < 0.02
+    assert abs(float(pixel[1]) - 1900 / 4095) < 0.05
+    assert abs(float(pixel[2]) - 3000 / 4095) < 0.02
+
+
+def test_saturation_goes_gray():
+    image = np.zeros((4, 4, 3), np.float32)
+    image[..., 0] = 0.8
+    image[..., 1] = 0.2
+    image[..., 2] = 0.1
+    same = gammac.saturate(image, 1)
+    assert same is image
+    gray = gammac.saturate(image, 0)
+    assert np.allclose(gray[..., 0], gray[..., 1])
+    assert np.allclose(gray[..., 1], gray[..., 2])
+    assert float(gray[0, 0, 0]) > 0.2
+
+
+def test_segment_lookup():
+    segments = [
+        {"in": 10, "out": 20, "recipe": {"ok": True, "gammas": [1, 1, 1], "scale": 0, "mins": [0, 0, 0], "maxs": [1, 1, 1], "shared_min": 0, "shared_max": 1, "limited": False}},
+        {"in": 30, "out": 40, "recipe": {"ok": True, "limited": True}},
+    ]
+    assert gammac.recipe_at(segments, 15)["scale"] == 0
+    assert gammac.recipe_at(segments, 25) is None
+    assert gammac.recipe_at(segments, 35)["limited"]
+
+
+def test_review_badges():
+    import tempfile
+    from pathlib import Path
+    import film_finish
+    with tempfile.TemporaryDirectory() as folder:
+        raw = Path(folder) / "a.raw"
+        raw.write_bytes(b"\x00" * (2840 * 2200 * 3 // 2))
+        film_finish.save(raw, film_finish.empty())
+        state = film_finish.review_state(raw)
+        assert state["reviewed"] is False
+        assert state["stab"] == "sin_zona"
+        assert "Color" in [item[0] for item in film_finish.review_badges(state)]
+        data = film_finish.load(raw)
+        data["crop"] = [0, 0, 2832, 2192]
+        data["grade"] = {"mode": "bw", "sat": 0.0}
+        data["perfo"] = {"enabled": True, "roi": [1, 2, 30, 40]}
+        film_finish.save(raw, data)
+        state = film_finish.review_state(raw)
+        assert state["reviewed"] is True and state["color_kind"] == "bw"
+        assert state["stab"] == "por_correr"
+        labels = [item[0] for item in film_finish.review_badges(state)]
+        assert "Revisado" in labels and "Por correr" in labels
+        data["grade"] = {"mode": "color", "sat": 1.0}
+        data["segments"] = [{
+            "in": 0, "out": 1,
+            "recipe": {"ok": True, "limited": True, "gammas": [1, 1, 1]},
+        }]
+        film_finish.save(raw, data)
+        assert film_finish.review_state(raw)["color"] is False
+        data["segments"][0]["recipe"]["limited"] = False
+        film_finish.save(raw, data)
+        assert film_finish.review_state(raw)["color_kind"] == "gammac"
+        film_finish.write_perfo_status(raw, "running", "25/100", roi=[1, 2, 30, 40], partial=[], ref=0)
+        state = film_finish.review_state(raw)
+        assert state["stab"] == "corriendo" and state["percent"] == 25
+        film_finish.write_perfo_status(
+            raw, "done", "Lista",
+            {"tx": [0.0], "ty": [0.0], "roi": [1, 2, 30, 40]},
+        )
+        assert film_finish.review_state(raw)["stab"] == "listo"
+
+
+def test_perfo_follows_a_hole():
+    frames = []
+    shifts = [(0, 0), (4, -2), (-3, 5), (1, 1), (6, 0), (-4, -3)]
+    for dx, dy in shifts:
+        gray = np.full((180, 240), 30, np.uint8)
+        x = 40 + dx
+        y = 50 + dy
+        gray[y:y + 36, x:x + 28] = 230
+        frames.append(gray)
+    result = perfo_lock.analyze_grays(frames, (30, 40, 56, 64), ref_index=0)
+    assert abs(result["tx"][0]) < 0.8 and abs(result["ty"][0]) < 0.8
+    assert abs(result["tx"][1] - 4) < 0.8
+    assert abs(result["ty"][1] + 2) < 0.8
+    assert abs(result["tx"][2] + 3) < 0.8
+    assert abs(result["ty"][2] - 5) < 0.8
+
+
+if __name__ == "__main__":
+    test_gammac_locks_green()
+    test_gammac_ignores_border()
+    test_strength_and_black_floor()
+    test_turn_spins_clockwise_inside_the_crop()
+    test_crop_snaps_for_prores_nv()
+    test_copy_adjust_skips_motion()
+    test_perfo_skips_what_is_done_and_can_resume()
+    test_review_badges()
+    test_saturation_goes_gray()
+    test_quarter_preview_keeps_bayer_phase()
+    test_segment_lookup()
+    test_perfo_follows_a_hole()
+    print("ok")

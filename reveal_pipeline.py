@@ -97,6 +97,52 @@ def debayer_linear(packed: bytes, width: int, height: int) -> np.ndarray:
     return rgb16.astype(np.float32) * (np.float32(1.0) / np.float32(RAW12_MAX))
 
 
+def debayer_quarter(packed: bytes, width: int, height: int) -> np.ndarray:
+    """RGB lineal a un cuarto de lado. De cada 8×8 se queda el primer 2×2."""
+    return _debayer_subsample(packed, width, height, 8)
+
+
+def debayer_playback(packed: bytes, width: int, height: int) -> np.ndarray:
+    """RGB lineal para reproducir: un tercio de lado, mosaico RGGB, bilineal."""
+    return _debayer_subsample(packed, width, height, 6)
+
+
+def _debayer_subsample(packed: bytes, width: int, height: int, step: int) -> np.ndarray:
+    """De cada bloque par se queda el primer 2×2, así el mosaico sigue siendo RGGB."""
+    if step < 2 or step % 2:
+        raise ValueError("El paso tiene que ser par.")
+    stride = width * 3 // 2
+    raw = np.frombuffer(packed, dtype=np.uint8)
+    if raw.size < stride * height:
+        raise ValueError("El cuadro quedó corto.")
+    mosaic = raw[: stride * height].reshape(height, stride)
+    out_h = (height // step) * 2
+    out_w = (width // step) * 2
+    if out_h < 2 or out_w < 2:
+        raise ValueError("El cuadro es demasiado chico para la vista rápida.")
+    bayer = np.empty((out_h, out_w), dtype=np.uint16)
+    bayer[0::2] = _subsample_rows(mosaic[0::step], width, out_h // 2, out_w, step)
+    bayer[1::2] = _subsample_rows(mosaic[1::step], width, out_h // 2, out_w, step)
+    rgb16 = cv2.cvtColor(np.ascontiguousarray(bayer), cv2.COLOR_BayerBG2RGB)
+    return rgb16.astype(np.float32) * (np.float32(1.0) / np.float32(RAW12_MAX))
+
+
+def _subsample_rows(rows: np.ndarray, width: int, count: int, out_w: int, step: int) -> np.ndarray:
+    """Pares de píxeles al inicio de cada bloque, en las filas pedidas."""
+    pair_step = step // 2
+    picked = np.ascontiguousarray(rows[:count]).reshape(count, width // 2, 3)
+    pairs = picked[:, : (out_w // 2) * pair_step : pair_step]
+    b0 = pairs[..., 0].astype(np.uint16)
+    b1 = pairs[..., 1].astype(np.uint16)
+    b2 = pairs[..., 2].astype(np.uint16)
+    p0 = b0 | ((b1 & np.uint16(0x0F)) << np.uint16(8))
+    p1 = (b1 >> np.uint16(4)) | (b2 << np.uint16(4))
+    line = np.empty((count, out_w // 2, 2), dtype=np.uint16)
+    line[..., 0] = p0
+    line[..., 1] = p1
+    return line.reshape(count, out_w)
+
+
 _LUT_LEN = 65536
 _lut_cache: dict[tuple, tuple] = {}
 

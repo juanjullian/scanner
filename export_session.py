@@ -7,10 +7,10 @@ import tempfile
 from pathlib import Path
 
 from PyQt6.QtCore import Qt, QTimer
-from PyQt6.QtGui import QColor, QImage, QPainter, QPen
+from PyQt6.QtGui import QBrush, QColor, QImage, QPainter, QPen, QPixmap
 from PyQt6.QtWidgets import (
-    QAbstractItemView, QCheckBox, QComboBox, QDialog, QFileDialog, QHBoxLayout,
-    QHeaderView, QLabel, QLineEdit, QMessageBox, QProgressBar, QPushButton,
+    QAbstractItemView, QCheckBox, QComboBox, QDialog, QFileDialog, QFrame, QHBoxLayout,
+    QHeaderView, QLabel, QLineEdit, QMenu, QMessageBox, QProgressBar, QPushButton,
     QSpinBox, QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget,
 )
 
@@ -198,18 +198,23 @@ def _dialog_stylesheet() -> str:
     check = _check_image_url()
     return f"""
         QDialog {{
-            background: #f6f6f6;
-            color: #1c1c1c;
+            background: #161616;
+            color: #e8e8e8;
         }}
         QLabel {{
-            color: #1c1c1c;
+            color: #e8e8e8;
             font-size: 10pt;
             background: transparent;
         }}
+        QFrame#options {{
+            background: #1e1e1e;
+            border: 1px solid #333;
+            border-radius: 6px;
+        }}
         QLineEdit, QSpinBox, QComboBox {{
-            background: #ffffff;
-            color: #1c1c1c;
-            border: 1px solid #b5b5b5;
+            background: #2a2a2a;
+            color: #f2f2f2;
+            border: 1px solid #4a4a4a;
             border-radius: 4px;
             padding: 4px 8px;
             min-height: 22px;
@@ -217,27 +222,37 @@ def _dialog_stylesheet() -> str:
         QLineEdit:focus, QSpinBox:focus, QComboBox:focus {{
             border: 1px solid #0078d7;
         }}
+        QSpinBox::up-button, QSpinBox::down-button {{
+            background: #3a3a3a;
+            border: none;
+            width: 16px;
+        }}
+        QComboBox::drop-down {{
+            border: none;
+            width: 22px;
+        }}
         QComboBox QAbstractItemView {{
-            background: #ffffff;
-            color: #1c1c1c;
-            selection-background-color: #d6e9f8;
-            selection-color: #1c1c1c;
+            background: #2a2a2a;
+            color: #f2f2f2;
+            selection-background-color: #0078d7;
+            selection-color: #ffffff;
+            outline: none;
         }}
         QCheckBox {{
             spacing: 8px;
-            color: #1c1c1c;
+            color: #e8e8e8;
             font-size: 10pt;
             background: transparent;
         }}
         QCheckBox::indicator, QTableWidget::indicator, QTableView::indicator {{
             width: 22px;
             height: 22px;
-            border: 2px solid #5c5c5c;
+            border: 2px solid #9a9a9a;
             border-radius: 4px;
-            background: #ffffff;
+            background: #1a1a1a;
         }}
         QCheckBox::indicator:hover, QTableWidget::indicator:hover, QTableView::indicator:hover {{
-            border-color: #0078d7;
+            border-color: #6eb5ff;
         }}
         QCheckBox::indicator:checked, QTableWidget::indicator:checked, QTableView::indicator:checked {{
             background: #0078d7;
@@ -245,28 +260,28 @@ def _dialog_stylesheet() -> str:
             image: url("{check}");
         }}
         QTableWidget {{
-            background: #ffffff;
-            color: #1c1c1c;
-            gridline-color: #e6e6e6;
-            border: 1px solid #d0d0d0;
-            alternate-background-color: #fafafa;
-            selection-background-color: #e8f3fc;
-            selection-color: #1c1c1c;
+            background: #141414;
+            color: #f0f0f0;
+            gridline-color: #2e2e2e;
+            border: 1px solid #333;
+            alternate-background-color: #1b1b1b;
+            selection-background-color: #1d3a52;
+            selection-color: #f0f0f0;
         }}
         QHeaderView::section {{
-            background: #eeeeee;
-            color: #1c1c1c;
+            background: #222;
+            color: #ddd;
             border: none;
-            border-bottom: 1px solid #d0d0d0;
-            border-right: 1px solid #e6e6e6;
+            border-bottom: 1px solid #333;
+            border-right: 1px solid #2a2a2a;
             padding: 8px 6px;
             font-weight: 600;
         }}
         QProgressBar {{
-            border: 1px solid #d0d0d0;
+            border: 1px solid #333;
             border-radius: 3px;
-            background: #ececec;
-            color: #1c1c1c;
+            background: #2a2a2a;
+            color: #f0f0f0;
             text-align: center;
             font-size: 8pt;
         }}
@@ -275,19 +290,19 @@ def _dialog_stylesheet() -> str:
             border-radius: 2px;
         }}
         QPushButton {{
-            background: #ffffff;
-            color: #1c1c1c;
-            border: 1px solid #b5b5b5;
+            background: #2a2a2a;
+            color: #f0f0f0;
+            border: 1px solid #4a4a4a;
             border-radius: 4px;
             padding: 6px 14px;
         }}
         QPushButton:hover {{
-            background: #f0f7fc;
+            background: #333;
             border-color: #0078d7;
         }}
         QPushButton:disabled {{
-            color: #8a8a8a;
-            background: #f3f3f3;
+            color: #777;
+            background: #222;
         }}
     """
 
@@ -298,6 +313,7 @@ def _fill_format_combo(combo: QComboBox, groups) -> None:
         combo.addItem(title)
         header = combo.model().item(combo.count() - 1)
         header.setEnabled(False)
+        header.setForeground(QBrush(QColor("#8ab4f8")))
         font = header.font()
         font.setBold(True)
         header.setFont(font)
@@ -359,21 +375,27 @@ class ExportSessionDialog(QDialog):
         self._save_timer.timeout.connect(self._flush)
 
         layout = QVBoxLayout(self)
+        layout.setSpacing(10)
         if self.source_is_processed:
             banner = QLabel("Fuente: RGB procesado por el ISP de la cámara (ya tiene balance, gamma y nitidez).")
             banner.setStyleSheet("background: #1a237e; color: #90caf9; padding: 6px; border-radius: 4px;")
             layout.addWidget(banner)
 
-        layout.addWidget(QLabel("Formato de salida"))
+        options = QFrame()
+        options.setObjectName("options")
+        options_lay = QVBoxLayout(options)
+        options_lay.setContentsMargins(12, 10, 12, 12)
+        options_lay.setSpacing(8)
+        options_lay.addWidget(QLabel("Formato de salida"))
         self.combo_fmt = QComboBox()
         groups = ISP_GROUPS if self.source_is_processed else BAYER_GROUPS
         _fill_format_combo(self.combo_fmt, groups)
-        layout.addWidget(self.combo_fmt)
+        options_lay.addWidget(self.combo_fmt)
 
         self.lbl_hint = QLabel("")
         self.lbl_hint.setWordWrap(True)
-        self.lbl_hint.setStyleSheet("color: #333; font-size: 10pt;")
-        layout.addWidget(self.lbl_hint)
+        self.lbl_hint.setStyleSheet("color: #aaa; font-size: 10pt;")
+        options_lay.addWidget(self.lbl_hint)
 
         self.sharp_row = QWidget()
         sharp_lay = QHBoxLayout(self.sharp_row)
@@ -383,7 +405,7 @@ class ExportSessionDialog(QDialog):
         for value, label in SHARP_CHOICES:
             self.combo_sharp.addItem(label, value)
         sharp_lay.addWidget(self.combo_sharp, 1)
-        layout.addWidget(self.sharp_row)
+        options_lay.addWidget(self.sharp_row)
 
         self.reveal_row = QWidget()
         reveal_lay = QVBoxLayout(self.reveal_row)
@@ -391,11 +413,14 @@ class ExportSessionDialog(QDialog):
         self.lbl_reveal = QLabel("")
         self.lbl_reveal.setWordWrap(True)
         reveal_lay.addWidget(self.lbl_reveal)
-        reveal_note = QLabel("El revelado es uno solo para todos los archivos. Ábrelo en cada uno para revisarlo.")
+        reveal_note = QLabel(
+            "El revelado es uno para todos los archivos. "
+            "El color, la perforación y el recorte son de cada uno."
+        )
         reveal_note.setWordWrap(True)
-        reveal_note.setStyleSheet("color: #444; font-size: 10pt;")
+        reveal_note.setStyleSheet("color: #999; font-size: 10pt;")
         reveal_lay.addWidget(reveal_note)
-        layout.addWidget(self.reveal_row)
+        options_lay.addWidget(self.reveal_row)
         self._refresh_reveal_label()
 
         self._default_output_dir = self.root / self.collection
@@ -410,15 +435,23 @@ class ExportSessionDialog(QDialog):
         dir_row.addWidget(self.lbl_output_dir, 1)
         dir_row.addWidget(self.btn_dir)
         dir_row.addWidget(self.btn_dir_reset)
-        layout.addLayout(dir_row)
+        options_lay.addLayout(dir_row)
+        layout.addWidget(options)
 
         pick_row = QHBoxLayout()
         self.btn_all = QPushButton("Marcar todos")
         self.btn_all.clicked.connect(lambda: self._set_all(True))
         self.btn_none = QPushButton("Desmarcar todos")
         self.btn_none.clicked.connect(lambda: self._set_all(False))
+        self.btn_analyze = QPushButton("Analizar estabilización")
+        self.btn_analyze.setToolTip(
+            "Corre el análisis solo en los archivos marcados para exportar. "
+            "Avisa si alguno no tiene el recuadro."
+        )
+        self.btn_analyze.clicked.connect(self._analyze_selected)
         pick_row.addWidget(self.btn_all)
         pick_row.addWidget(self.btn_none)
+        pick_row.addWidget(self.btn_analyze)
         pick_row.addStretch()
         layout.addLayout(pick_row)
 
@@ -435,27 +468,32 @@ class ExportSessionDialog(QDialog):
         hdr.setSectionResizeMode(6, QHeaderView.ResizeMode.Fixed)
         self.table.setColumnWidth(0, 176)
         self.table.setColumnWidth(3, 72)
-        self.table.setColumnWidth(4, 150)
+        self.table.setColumnWidth(4, 230)
         self.table.setColumnWidth(5, 88)
         self.table.setAlternatingRowColors(True)
         self.table.setColumnWidth(6, 110)
         self.table.verticalHeader().setVisible(False)
         self.table.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
         self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.table.customContextMenuRequested.connect(self._table_menu)
 
         self._edits: dict[str, QLineEdit] = {}
         self._fps: dict[str, QSpinBox] = {}
         self._tests: dict[str, QCheckBox] = {}
         self._grade_labels: dict[str, QLabel] = {}
+        self._badge_lay: dict[str, QVBoxLayout] = {}
+        self._badge_host: dict[str, QWidget] = {}
         self._grade_btns: dict[str, QPushButton] = {}
         self._reveal_btns: dict[str, QPushButton] = {}
         self._bars: dict[str, QProgressBar] = {}
+        self._thumbs: dict[str, QLabel] = {}
         self._times: dict[str, QLabel] = {}
         self._rows: dict[str, int] = {}
 
         for row, fn in enumerate(self.filenames):
             self._rows[fn] = row
-            self.table.setRowHeight(row, 158)
+            self.table.setRowHeight(row, 168)
             path = self.root / self.collection / fn
             pixel_fmt = file_pixel_format(fn, self.collection_meta)
             try:
@@ -466,6 +504,7 @@ class ExportSessionDialog(QDialog):
 
             src = QTableWidgetItem(fn)
             src.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsUserCheckable)
+            src.setForeground(QBrush(QColor("#f0f0f0")))
             src.setCheckState(Qt.CheckState.Checked)
             self.table.setItem(row, 1, src)
 
@@ -496,9 +535,13 @@ class ExportSessionDialog(QDialog):
 
             time_lbl = QLabel(self._frames_text(fn))
             time_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            time_lbl.setStyleSheet("color: #1c1c1c; font-size: 10pt; background: transparent;")
+            time_lbl.setStyleSheet("color: #e8e8e8; font-size: 10pt; background: transparent;")
             self._times[fn] = time_lbl
             self.table.setCellWidget(row, 6, time_lbl)
+            for col in range(self.table.columnCount()):
+                cell = self.table.cellWidget(row, col)
+                if cell is not None:
+                    self._bind_row_menu(cell, fn)
 
         layout.addWidget(self.table, 1)
 
@@ -514,7 +557,7 @@ class ExportSessionDialog(QDialog):
 
         self.lbl_status = QLabel("Tiempo total: —")
         self.lbl_status.setWordWrap(True)
-        self.lbl_status.setStyleSheet("color: #1c1c1c; font-size: 11pt; font-weight: 600;")
+        self.lbl_status.setStyleSheet("color: #f0f0f0; font-size: 11pt; font-weight: 600;")
         layout.addWidget(self.lbl_status)
 
         btn_row = QHBoxLayout()
@@ -540,6 +583,10 @@ class ExportSessionDialog(QDialog):
         self._apply_format()
         self._applying = False
         self.combo_fmt.currentIndexChanged.connect(self._on_format)
+        jobs = getattr(parent, "adjust_jobs", None)
+        if jobs is not None:
+            jobs.progress.connect(self._on_adjust_progress)
+            jobs.settled.connect(self._on_adjust_settled)
 
     def _wrap(self, widget, center=False) -> QWidget:
         box = QWidget()
@@ -573,6 +620,7 @@ class ExportSessionDialog(QDialog):
         bar.setFixedHeight(14)
         bar.setFormat("%p%")
         self._bars[filename] = bar
+        self._thumbs[filename] = image
         lay.addWidget(image)
         lay.addWidget(bar)
         return box
@@ -583,16 +631,24 @@ class ExportSessionDialog(QDialog):
         lay.setContentsMargins(2, 4, 2, 4)
         lay.setSpacing(2)
         grade_lbl = QLabel("Sin ajustes")
-        grade_lbl.setStyleSheet("color: #333; font-size: 9pt; background: transparent;")
+        grade_lbl.setStyleSheet("color: #bbb; font-size: 9pt; background: transparent;")
         grade_lbl.setWordWrap(True)
+        badge_host = QWidget()
+        badge_host.setFixedHeight(22)
+        badge_lay = QHBoxLayout(badge_host)
+        badge_lay.setContentsMargins(0, 0, 0, 0)
+        badge_lay.setSpacing(4)
+        self._badge_lay[filename] = badge_lay
+        self._badge_host[filename] = badge_host
         btn_grade = QPushButton("Ajustar gradación…")
         btn_grade.clicked.connect(lambda _checked=False, name=filename: self._open_grade(name))
-        btn_reveal = QPushButton("Ajustes de revelado…")
+        btn_reveal = QPushButton("Ajustes…")
         btn_reveal.clicked.connect(lambda _checked=False, name=filename: self._open_reveal(name))
         self._grade_labels[filename] = grade_lbl
         self._grade_btns[filename] = btn_grade
         self._reveal_btns[filename] = btn_reveal
         lay.addWidget(grade_lbl)
+        lay.addWidget(badge_host)
         lay.addWidget(btn_grade)
         lay.addWidget(btn_reveal)
         return box
@@ -677,8 +733,9 @@ class ExportSessionDialog(QDialog):
         self.table.setColumnHidden(5, not opts["test"])
         self.chk_copy_grade.setVisible(opts["grade"])
         self.chk_copy_test.setVisible(opts["test"])
+        self.btn_analyze.setVisible(opts["reveal"])
         if opts["reveal"]:
-            self.table.horizontalHeaderItem(4).setText("Revelado")
+            self.table.horizontalHeaderItem(4).setText("Ajustes")
         elif opts["grade"]:
             self.table.horizontalHeaderItem(4).setText("Gradación")
         was = self._applying
@@ -692,8 +749,14 @@ class ExportSessionDialog(QDialog):
                 draft = self._draft(fmt, filename)
                 self._edits[filename].setText(draft["output_name"])
                 self._tests[filename].setChecked(bool(draft.get("test_export")))
-                self._grade_labels[filename].setText(_grade_status_text(draft["grade"]))
-                self._grade_labels[filename].setVisible(opts["grade"])
+                if opts["reveal"]:
+                    self._grade_labels[filename].setVisible(False)
+                    self._badge_host[filename].setVisible(True)
+                    self._paint_file_badges(filename)
+                else:
+                    self._badge_host[filename].setVisible(False)
+                    self._grade_labels[filename].setText(_grade_status_text(draft["grade"]))
+                    self._grade_labels[filename].setVisible(opts["grade"])
                 self._grade_btns[filename].setVisible(opts["grade"])
                 self._reveal_btns[filename].setVisible(opts["reveal"])
                 self._times[filename].setText(self._frames_text(filename))
@@ -760,13 +823,62 @@ class ExportSessionDialog(QDialog):
         self._grade_labels[filename].setText(_grade_status_text(grade))
         self._mark(filename)
 
+    def _bind_row_menu(self, widget, filename: str):
+        targets = [widget, *widget.findChildren(QWidget)]
+        for target in targets:
+            target.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+            target.customContextMenuRequested.connect(
+                lambda pos, name=filename, host=target: self._show_adjust_menu(name, host.mapToGlobal(pos))
+            )
+
+    def _table_menu(self, pos):
+        row = self.table.rowAt(pos.y())
+        item = self.table.item(row, 1) if row >= 0 else None
+        if item is None:
+            return
+        self._show_adjust_menu(item.text(), self.table.viewport().mapToGlobal(pos))
+
+    def _show_adjust_menu(self, filename: str, global_pos):
+        others = [name for name in self.filenames if name != filename]
+        menu = QMenu(self)
+        action = menu.addAction("Copiar estos ajustes a los demás clips")
+        action.setEnabled(bool(others))
+        chosen = menu.exec(global_pos)
+        if chosen is action:
+            self._copy_adjust_to_others(filename, others)
+
+    def _copy_adjust_to_others(self, filename: str, others: list[str]):
+        from film_finish import copy_adjust, has_adjust, load
+        src = self.root / self.collection / filename
+        if not has_adjust(load(src)):
+            QMessageBox.information(
+                self, "Sin ajustes",
+                "Este clip no tiene color, recorte ni zona de perforación para copiar.",
+            )
+            return
+        answer = QMessageBox.question(
+            self, "Copiar ajustes",
+            f"Se copian el color, el recorte y la zona de perforación de {filename} "
+            f"a los otros {len(others)} clips. El desplazamiento ya medido de cada uno no se toca.",
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        copied = 0
+        for name in others:
+            if copy_adjust(src, self.root / self.collection / name):
+                copied += 1
+        self._refresh_finish_labels()
+        self.lbl_status.setText(f"Ajustes copiados a {copied} clips.")
+
     def _open_reveal(self, filename: str):
         from reveal_dialog import RevealDialog
         dialog = RevealDialog(
             self, self.root / self.collection, self.filenames,
             self.collection_meta, self._reveal, filename,
         )
-        if not dialog.exec():
+        accepted = bool(dialog.exec())
+        self._refresh_finish_labels()
+        if not accepted:
             return
         self._reveal = dialog.settings()
         reference = dialog.reference_name()
@@ -782,6 +894,34 @@ class ExportSessionDialog(QDialog):
     def _refresh_reveal_label(self):
         from reveal_pipeline import summary_line
         self.lbl_reveal.setText(summary_line(self._reveal))
+
+    def _refresh_finish_labels(self):
+        if not format_options(self._fmt, self.source_is_processed)["reveal"]:
+            return
+        for filename in self.filenames:
+            self._paint_file_badges(filename)
+
+    def _paint_file_badges(self, filename: str, percent=None):
+        layout = self._badge_lay.get(filename)
+        if layout is None:
+            return
+        import film_finish
+        from reveal_dialog import _paint_badges
+        state = film_finish.review_state(self.root / self.collection / filename)
+        if percent is not None and state.get("stab") != "listo":
+            state["stab"] = "corriendo"
+            state["percent"] = int(percent)
+        _paint_badges(layout, film_finish.review_badges(state))
+
+    def _on_adjust_progress(self, name: str, done: int, total: int, _state: str):
+        if name not in self._badge_lay or not total:
+            return
+        self._paint_file_badges(name, int(round(100 * done / total)))
+
+    def _on_adjust_settled(self, name: str, _ok: bool, _message: str):
+        if name not in self._badge_lay:
+            return
+        self._paint_file_badges(name)
 
     def _set_all(self, checked: bool):
         state = Qt.CheckState.Checked if checked else Qt.CheckState.Unchecked
@@ -819,11 +959,128 @@ class ExportSessionDialog(QDialog):
     def _reset_output_dir(self):
         self._set_output_dir(self._default_output_dir)
 
+    def _perfo_gaps(self, selected: list[str]):
+        import film_finish
+        missing = []
+        pending = []
+        ready = []
+        for name in selected:
+            raw = self.root / self.collection / name
+            roi = (film_finish.load(raw).get("perfo") or {}).get("roi")
+            if not roi:
+                missing.append(name)
+                continue
+            if film_finish.perfo_is_done(raw, roi):
+                ready.append(name)
+            else:
+                pending.append((name, [int(v) for v in roi]))
+        return pending, missing, ready
+
+    def _queue_perfo(self, pending) -> str:
+        host = self.parent()
+        jobs = getattr(host, "adjust_jobs", None) if host is not None else None
+        if jobs is None:
+            QMessageBox.warning(self, "Sin cola", "No pude encolar el análisis.")
+            return "No pude encolar el análisis."
+        import film_finish
+        queued = 0
+        busy = 0
+        for name, roi in pending:
+            raw = self.root / self.collection / name
+            data = film_finish.load(raw)
+            data["perfo"] = {"enabled": True, "roi": list(roi)}
+            film_finish.save(raw, data)
+            side = film_finish.read_perfo(raw) or {}
+            ref = int(side.get("ref") or 0)
+            if jobs.enqueue(raw, roi, ref_frame=ref):
+                queued += 1
+                self._paint_file_badges(name, 0)
+            else:
+                busy += 1
+        if queued and busy:
+            return f"Encolé {queued} análisis. {busy} ya estaban en curso."
+        if queued:
+            return f"Encolé {queued} análisis de estabilización."
+        if busy:
+            return "El análisis ya está en curso."
+        return "No encolé ningún análisis."
+
+    @staticmethod
+    def _name_block(names: list[str]) -> str:
+        shown = list(names[:8])
+        text = "\n".join(shown)
+        extra = len(names) - len(shown)
+        if extra > 0:
+            text += f"\n…y {extra} más"
+        return text
+
+    def _analyze_selected(self):
+        selected = self.checked_filenames()
+        if not selected:
+            QMessageBox.warning(self, "Sin archivos", "Marca al menos un archivo.")
+            return
+        pending, missing, ready = self._perfo_gaps(selected)
+        if missing:
+            box = QMessageBox(self)
+            box.setIcon(QMessageBox.Icon.Warning)
+            box.setWindowTitle("Sin recuadro")
+            box.setText("Estos archivos no tienen el recuadro de estabilización:\n\n" + self._name_block(missing))
+            if not pending:
+                box.setInformativeText("Márcalo en Ajustes. Sin recuadro no hay análisis.")
+                box.exec()
+                return
+            box.setInformativeText("Esos se saltan. Puedo analizar los que sí tienen recuadro.")
+            go = box.addButton("Analizar el resto", QMessageBox.ButtonRole.AcceptRole)
+            box.addButton("Cancelar", QMessageBox.ButtonRole.RejectRole)
+            box.exec()
+            if box.clickedButton() is not go:
+                return
+        if not pending:
+            QMessageBox.information(
+                self, "Estabilización",
+                "Los archivos marcados ya tienen el análisis listo." if ready else "No hay nada que analizar.",
+            )
+            return
+        self.lbl_status.setText(self._queue_perfo(pending))
+
+    def _confirm_stabilization(self, selected: list[str]) -> bool:
+        if not format_options(self._fmt, self.source_is_processed)["reveal"]:
+            return True
+        pending, missing, _ready = self._perfo_gaps(selected)
+        if not pending and not missing:
+            return True
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Question)
+        box.setWindowTitle("Estabilización")
+        lines = []
+        if pending:
+            lines.append("Falta el análisis de estabilización en:\n\n" + self._name_block([name for name, _roi in pending]))
+        if missing:
+            lines.append("Sin recuadro, no se puede analizar:\n\n" + self._name_block(missing))
+        box.setText("\n\n".join(lines))
+        volver = box.addButton("Volver", QMessageBox.ButtonRole.RejectRole)
+        go = box.addButton("Exportar igual", QMessageBox.ButtonRole.AcceptRole)
+        analyze = None
+        if pending:
+            box.setInformativeText("Puedo correr el análisis antes, o exportar con lo que hay.")
+            analyze = box.addButton("Analizar primero", QMessageBox.ButtonRole.ActionRole)
+            box.setDefaultButton(analyze)
+        else:
+            box.setInformativeText("Puedes volver a marcar el recuadro, o exportar igual.")
+            box.setDefaultButton(volver)
+        box.exec()
+        chosen = box.clickedButton()
+        if analyze is not None and chosen is analyze:
+            note = self._queue_perfo(pending)
+            self.lbl_status.setText(note + " Cuando terminen, vuelve a exportar.")
+            return False
+        return chosen is go
+
     def _confirm_seen(self, selected: list[str]) -> bool:
         opts = format_options(self._fmt, self.source_is_processed)
         if opts["reveal"]:
             missing = [name for name in selected if name not in self._reveal_seen]
-            what = "los ajustes de revelado"
+            what = "los ajustes"
         elif opts["grade"]:
             missing = [name for name in selected if name not in self._grade_seen]
             what = "la gradación"
@@ -869,6 +1126,7 @@ class ExportSessionDialog(QDialog):
         self.btn_dir_reset.setEnabled(not locked)
         self.btn_all.setEnabled(not locked)
         self.btn_none.setEnabled(not locked)
+        self.btn_analyze.setEnabled(not locked)
         self.chk_copy_grade.setEnabled(not locked)
         self.chk_copy_test.setEnabled(not locked)
         for filename in self.filenames:
@@ -896,6 +1154,8 @@ class ExportSessionDialog(QDialog):
                     self, "Nombre vacío", f"Indica un nombre de salida para «{filename}».",
                 )
                 return
+        if not self._confirm_stabilization(selected):
+            return
         if not self._confirm_seen(selected):
             return
         self._flush()
@@ -932,6 +1192,21 @@ class ExportSessionDialog(QDialog):
         bar = self._bars.get(filename)
         if bar is not None:
             bar.setValue(max(0, min(100, int(percent))))
+
+    def note_thumb(self, filename: str, data: bytes):
+        if not self._exporting:
+            return
+        label = self._thumbs.get(filename)
+        if label is None or not data:
+            return
+        image = QImage.fromData(data, "JPG")
+        if image.isNull():
+            return
+        label.setPixmap(QPixmap.fromImage(image).scaled(
+            label.width(), label.height(),
+            Qt.AspectRatioMode.KeepAspectRatio,
+            Qt.TransformationMode.SmoothTransformation,
+        ))
 
     def note_info(self, filename: str, text: str):
         if not self._exporting:

@@ -1,5 +1,25 @@
 # Bitácora — Lucid Scanner
 
+## 2026-11-10 — Color, estabilización y recorte por archivo
+
+### Por qué
+El revelado es uno para toda la colección, pero cada rollo necesita su gamma, su perforación y su encuadre. Medir el desierto y dejar esa gamma en el mar no sirve. La reproducción de ajustes iba más rápido que los FPS del archivo y no mostraba juntos el color, el desplazamiento y el corte. Al exportar, el tiempo no aparecía: la velocidad venía en la misma línea que el cuadro, separada por otro `|`, y el lector se quedaba solo con el porcentaje.
+
+### Cómo
+- Cada raw guarda al lado un `adjust.json` (tramos GamMac, blanco y negro, saturación, recorte, giro y zona de perforación) y un `perfo.json` con el desplazamiento. La cola vive en la ventana principal, de a un archivo, y retoma si el programa se cierra a medias.
+- Color: interruptor Color / Blanco y negro. En blanco y negro queda la saturación. En color, GamMac más una saturación global. Mover un slider vuelve a medir el cuadro y guarda la receta. El tramo sigue congelado: otra escena pide otra entrada, otra salida y otra medición.
+- Estabilización: el método de `perfo-lock`, con media resolución solo si el agujero es grande, y como máximo 8 hilos. En Exportar, «Analizar estabilización» corre los marcados y avisa los que no tienen recuadro. Si falta el análisis, Exportar pregunta si se corre antes.
+- Chips chicos, en línea, en Ajustes y en la tabla: Revisado cuando hay recorte, color y recuadro; y el estado de la estabilización (por correr, porcentaje o lista).
+- Reproducir es un círculo sobre la imagen, aparece al pasar el mouse y se va al salir. Corre a los FPS del archivo, a un tercio de lado. En Color suma la estabilización si ya está medida. En Recorte suma color, estabilización y el corte.
+- El giro está en Recorte, de a 0,1°. El rectángulo no se mueve: gira la imagen detrás, a la derecha si el valor es positivo, con el centro en el recorte. Entra en la exportación, en CPU y en la tarjeta, junto con el desplazamiento.
+- La exportación vuelve a leer la velocidad completa, así que aparecen el tiempo del archivo y el total. Cada 1 % la miniatura pasa a ser un JPEG del cuadro ya revelado, con gamma, saturación, estabilización y recorte.
+
+### Hecho
+- El color, la perforación y el recorte quedan por archivo, y se ven en la tabla antes de exportar.
+- La reproducción respeta los FPS y acumula los ajustes de las pestañas anteriores.
+- El giro endereza el cuadro sin mover el recorte.
+- El tiempo estimado y la miniatura del resultado vuelven a salir durante la exportación. Hay que reabrir el programa para que esta exportación en curso los tome.
+
 ## 2026-11-10 — Exportación en una sola tabla
 
 ### Por qué
@@ -12,7 +32,7 @@ Exportar video pasaba por tres ventanas: el formato y el perfil, después la con
 - Si al exportar falta abrir el revelado o la gradación de algún archivo marcado, avisa. Se puede volver o exportar igual.
 - La cola corre en la misma tabla. La barra queda bajo la miniatura. El tiempo del archivo y el total salen de los cuadros que faltan y de la velocidad que ya informa el proceso.
 - La miniatura Bayer debayerea un recorte par, con la curva del visor HQ, y después se achica.
-- Los checkbox miden 22 px, con borde gris y palomita blanca sobre azul. La tabla y los campos quedaron en claro para que el texto se lea.
+- Los checkbox miden 22 px, con borde gris y palomita blanca sobre azul. El diálogo sigue en negro: el formato y la carpeta van en un bloque, y la tabla debajo.
 - «Exportar secuencia TIF» y «Revelar secuencias DNG» siguen en sus ventanas.
 
 ### Hecho
