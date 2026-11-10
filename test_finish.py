@@ -152,6 +152,10 @@ def test_perfo_skips_what_is_done_and_can_resume():
         assert ref == 7
         assert loaded[0][0] == 0.1 and loaded[1] is None and loaded[2][2] == 0.8
         assert perfo_lock._load_resume(raw, (0, 0, 8, 8), 4)[1] is None
+        film_finish.write_perfo_status(raw, "error", "tropiezo")
+        kept = film_finish.read_perfo(raw)
+        assert kept["status"] == "error"
+        assert kept["partial"][0][0] == 0.1 and kept["ref"] == 7
 
 
 def test_quarter_preview_keeps_bayer_phase():

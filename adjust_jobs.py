@@ -57,10 +57,13 @@ class _Run(QThread):
                 None if row is None else [round(float(row[0]), 3), round(float(row[1]), 3), round(float(row[2]), 3), int(row[3])]
                 for row in rows
             ]
-        film_finish.write_perfo_status(
-            self.raw, "running", f"{done}/{total}",
-            partial=partial, roi=ident or self.roi, ref=self.ref_frame if ref is None else ref,
-        )
+        try:
+            film_finish.write_perfo_status(
+                self.raw, "running", f"{done}/{total}",
+                partial=partial, roi=ident or self.roi, ref=self.ref_frame if ref is None else ref,
+            )
+        except OSError:
+            pass
         self.progressed.emit(done, total)
 
 

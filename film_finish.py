@@ -264,9 +264,29 @@ def write_perfo_status(
             payload["ref"] = kept_ref
         if kept_partial is not None:
             payload["partial"] = kept_partial
+    elif status == "error":
+        for key in ("roi", "ref", "partial"):
+            if existing.get(key) is not None:
+                payload[key] = existing[key]
     tmp = path.with_suffix(path.suffix + ".tmp")
     tmp.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
-    tmp.replace(path)
+    _replace_file(tmp, path)
+
+
+def _replace_file(tmp: Path, path: Path) -> None:
+    """En Windows el reemplazo falla si la ventana está leyendo el mismo archivo."""
+    delay = 0.02
+    last = None
+    for _attempt in range(20):
+        try:
+            tmp.replace(path)
+            return
+        except PermissionError as exc:
+            last = exc
+            time.sleep(delay)
+            delay = min(0.25, delay * 1.5)
+    if last is not None:
+        raise last
 
 
 def _read_perfo(path: Path) -> dict | None:

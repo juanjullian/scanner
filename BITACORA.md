@@ -1,5 +1,19 @@
 # Bitácora — Lucid Scanner
 
+## 2026-11-10 — No perder el avance si Windows niega el archivo
+
+### Por qué
+Durante el análisis de perforación la ventana lee `perfo.json` para mostrar el avance, y el hilo lo reemplaza a cada tramo. En Windows ese reemplazo devuelve Acceso denegado si el archivo está abierto. El programa lo tomaba como fallo y, al anotarlo, borraba los cuadros ya medidos. Pasó con F8_091, F8_095 y F8_097: el sidecar quedó solo con el mensaje de error.
+
+### Cómo
+- El reemplazo reintenta unos dos segundos cuando Windows niega el acceso.
+- Si un guardado de avance igual falla, la medición sigue. El próximo tramo vuelve a escribir.
+- Si al final queda en error, se conservan la zona, el cuadro de referencia y lo ya medido, para poder retomar.
+
+### Hecho
+- Un tropiezo al guardar ya no corta el análisis ni borra el avance.
+- F8_091, F8_095 y F8_097 igual hay que medirlos de nuevo: ese avance ya se había pisado antes del arreglo.
+
 ## 2026-11-10 — Color, estabilización y recorte por archivo
 
 ### Por qué
