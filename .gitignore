@@ -18,3 +18,6 @@ models/*.pth
 
 # Volcados de texto de los manuales de Lucid. Los PDF siguen en el repo.
 docs/*.txt
+
+# Paquete de Lucid Arena. Se instala aparte; no va en el repo.
+arena_api/

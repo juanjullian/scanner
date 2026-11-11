@@ -1,5 +1,21 @@
 # Bitácora — Lucid Scanner
 
+## 2026-11-11 — Eje horizontal, videos ya revelados y demosaico del SDK
+
+### Por qué
+El registro de la perforación a veces mete un vaivén de lado que la película no tenía. Apagar ese eje no puede obligar a medir de nuevo, y un salto grande del rollo sigue siendo el `tx` ya guardado. Los videos ya revelados necesitaban el mismo acabado (perforación, color, recorte) sin pasar por la cámara. En CPU, el demosaico del visor no era el de la interpolación direccional del SDK.
+
+### Cómo
+- Casilla «Eje horizontal» en Estabilización, activada si el archivo no trae la clave. Desactivada, al aplicar se usa solo `ty`. `tx` queda en el sidecar. La vista previa, la reproducción y la exportación leen la misma opción.
+- La zona recuerda el cuadro en que se dibujó. El recorte se puede voltear en horizontal. La búsqueda de la perforación parte en coordenadas pares.
+- `video_finish.py` abre una herramienta aparte para `.mov`, `.mp4` y `.mkv`. El acabado se guarda al lado del video y se exporta con el codec elegido.
+- El demosaico de CPU llama al SDK por `sdk_demosaic.py`. El paquete `arena_api` no entra al repositorio: se instala aparte. En GPU sigue el NPP.
+
+### Hecho
+- El eje de lado se prende y se apaga sin volver a analizar. Con la casilla activa, un movimiento grande del film se sigue corrigiendo.
+- Hay una ventana para acabar videos ya revelados.
+- El revelado en CPU usa la interpolación direccional del fabricante cuando Arena está instalado.
+
 ## 2026-11-10 — No perder el avance si Windows niega el archivo
 
 ### Por qué

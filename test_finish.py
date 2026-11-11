@@ -84,6 +84,32 @@ def test_turn_spins_clockwise_inside_the_crop():
     assert np.allclose(same, [[1, 0, 4], [0, 1, 0]])
 
 
+def test_flip_mirrors_after_the_crop():
+    import tempfile
+    from pathlib import Path
+    import film_finish
+    with tempfile.TemporaryDirectory() as folder:
+        raw = Path(folder) / "a.raw"
+        raw.write_bytes(b"")
+        film_finish.save(raw, {
+            "crop": [0, 0, 32, 40],
+            "flip_h": True,
+            "turn": 0,
+            "segments": [],
+            "perfo": {"enabled": False, "roi": None},
+            "grade": {"mode": "color", "sat": 1},
+        })
+        finish = film_finish.Finish(raw, gpu=False, codec="prores_4444")
+        image = np.zeros((40, 80, 3), np.float32)
+        image[:, 0, 0] = 1
+        out = finish.apply_float(image, 0, finish.output_size(80, 40))
+        assert out.shape[1] == 32
+        assert out[0, -1, 0] > 0.5
+        assert out[0, 0, 0] < 0.1
+        assert film_finish.load(raw)["crop"][0] == 0
+        assert film_finish.mirror_x((0, 0, 32, 40), 80) == (48, 0, 32, 40)
+
+
 def test_crop_snaps_for_prores_nv():
     import film_finish
     snapped = film_finish.snap_crop((10, 20, 100, 50), 2840, 2200)
@@ -110,13 +136,14 @@ def test_copy_adjust_skips_motion():
         film_finish.save(src, {
             "segments": [{"in": 0, "out": 3, "recipe": {"ok": True, "gammas": [1, 1, 1]}}],
             "crop": [0, 0, 2832, 2200],
-            "perfo": {"enabled": True, "roi": [10, 20, 80, 120]},
+            "perfo": {"enabled": True, "roi": [10, 20, 80, 120], "ref": 40},
         })
         film_finish.perfo_path(src).write_text('{"tx":[1]}', encoding="utf-8")
         assert film_finish.copy_adjust(src, dst)
         copied = json.loads(film_finish.adjust_path(dst).read_text(encoding="utf-8"))
         assert copied["crop"][2] == 2832
         assert copied["perfo"]["roi"][0] == 10
+        assert copied["perfo"]["ref"] == 40
         assert not film_finish.perfo_path(dst).is_file()
         empty = root / "c.raw"
         empty.write_bytes(b"")
@@ -143,6 +170,10 @@ def test_perfo_skips_what_is_done_and_can_resume():
         )
         assert film_finish.perfo_is_done(raw, [1, 2, 3, 4]) is True
         assert film_finish.perfo_is_done(raw, [9, 9, 9, 9]) is False
+        adjust = film_finish.load(raw)
+        adjust["perfo"] = {"enabled": True, "roi": [1, 2, 3, 4], "ref": 9}
+        film_finish.save(raw, adjust)
+        assert film_finish.perfo_is_done(raw, [1, 2, 3, 4]) is False
         film_finish.write_perfo_status(
             raw, "running", "2/4",
             partial=[[0.1, 0.2, 0.9, 0], None, [0.0, 0.0, 0.8, 0], None],
@@ -252,6 +283,47 @@ def test_review_badges():
         assert film_finish.review_state(raw)["stab"] == "listo"
 
 
+def test_horizontal_off_keeps_only_the_vertical():
+    import tempfile
+    from pathlib import Path
+    import film_finish
+    assert film_finish.perfo_horizontal({}) is True
+    assert film_finish.perfo_horizontal({"horizontal": "false"}) is False
+    with tempfile.TemporaryDirectory() as folder:
+        raw = Path(folder) / "rollo.raw"
+        raw.write_bytes(b"")
+        film_finish.save(raw, {"perfo": {"enabled": True, "roi": [1, 2, 30, 40]}, "segments": []})
+        assert film_finish.load(raw)["perfo"]["horizontal"] is True
+        film_finish.save(raw, {
+            "perfo": {"enabled": True, "roi": [1, 2, 30, 40], "horizontal": False},
+            "segments": [],
+        })
+        film_finish.write_perfo_status(
+            raw, "done", "Lista",
+            {"tx": [4.0], "ty": [-2.0], "roi": [1, 2, 30, 40]},
+        )
+        finish = film_finish.Finish(raw, gpu=False, codec="prores_4444")
+        assert finish.shift_at(0) == (0.0, -2.0)
+        assert np.allclose(finish.sampling(0, 60, 40), [[1, 0, 0], [0, 1, -2]])
+    from PyQt6.QtWidgets import QApplication
+    from reveal_dialog import RevealDialog
+    app = QApplication.instance() or QApplication([])
+    dialog = RevealDialog(None, Path("."), [], {}, {}, None)
+    dialog._set_task(1)
+    assert dialog.chk_horizontal.isChecked()
+    dialog._shifts = ([4.0], [-2.0])
+    image = np.zeros((20, 40, 3), np.float32)
+    image[8, 20] = 1.0
+    dialog.chk_horizontal.setChecked(False)
+    warped = dialog._warp_preview(image)
+    spot = np.argwhere(warped[..., 0] > 0.5)
+    assert len(spot) == 1
+    y, x = (int(v) for v in spot[0])
+    assert abs(x - 20) <= 1 and abs(y - 10) <= 1
+    dialog.close()
+    assert app is not None
+
+
 def test_perfo_follows_a_hole():
     frames = []
     shifts = [(0, 0), (4, -2), (-3, 5), (1, 1), (6, 0), (-4, -3)]
@@ -274,6 +346,7 @@ if __name__ == "__main__":
     test_gammac_ignores_border()
     test_strength_and_black_floor()
     test_turn_spins_clockwise_inside_the_crop()
+    test_flip_mirrors_after_the_crop()
     test_crop_snaps_for_prores_nv()
     test_copy_adjust_skips_motion()
     test_perfo_skips_what_is_done_and_can_resume()
@@ -281,5 +354,6 @@ if __name__ == "__main__":
     test_saturation_goes_gray()
     test_quarter_preview_keeps_bayer_phase()
     test_segment_lookup()
+    test_horizontal_off_keeps_only_the_vertical()
     test_perfo_follows_a_hole()
     print("ok")

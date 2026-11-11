@@ -1,8 +1,8 @@
-"""Revelado de visionado: Bayer 12-bit lineal → Rec.709.
+"""Revelado de visionado: Bayer 12-bit → el tono del visor ISP.
 
-En CPU el demosaico es el edge-aware de OpenCV. Si el ajuste dice GPU,
-la exportación sube el cuadro empaquetado y hace NPP, la curva, el detalle
-y el YUV en la tarjeta.
+El demosaico es el del SDK (la interpolación direccional del visor de
+captura). La curva de partida es la gamma del slider, en 2,0 como ese visor.
+Ganancia 1,00 y sombras 0 dejan esa imagen.
 """
 from __future__ import annotations
 
@@ -23,9 +23,7 @@ _SIGMA_COARSE = np.float32(4.0)
 _LUMA_R = np.float32(0.2126)
 _LUMA_G = np.float32(0.7152)
 _LUMA_B = np.float32(0.0722)
-# BalanceRatio de la PHX con el automático apagado. 1,00 en el slider es este blanco.
-_CAM_WB_R = 1.9248
-_CAM_WB_B = 2.321
+# 2,0 es la gamma del visor de captura en modo ISP.
 
 
 def default_reveal() -> dict:
@@ -33,7 +31,8 @@ def default_reveal() -> dict:
         "gain_r": 1.0,
         "gain_b": 1.0,
         "ev": 0.0,
-        "shadow_b": 12.0,
+        "gamma": 2.0,
+        "shadow_b": 0.0,
         "shadow_lift": 0.0,
         "midtone": 0.0,
         "engine": "cpu",
@@ -57,7 +56,8 @@ def coerce_reveal(data) -> dict:
     out["gain_r"] = float(np.clip(out["gain_r"], 0.25, 4.0))
     out["gain_b"] = float(np.clip(out["gain_b"], 0.25, 4.0))
     out["ev"] = float(np.clip(out["ev"], -4.0, 4.0))
-    out["shadow_b"] = float(np.clip(out["shadow_b"], 0.5, 64.0))
+    out["gamma"] = float(np.clip(out["gamma"], 0.5, 3.0))
+    out["shadow_b"] = float(np.clip(out["shadow_b"], 0.0, 64.0))
     out["shadow_lift"] = float(np.clip(out["shadow_lift"], 0.0, 0.35))
     out["midtone"] = float(np.clip(out["midtone"], 0.0, 2.0))
     return out
@@ -66,16 +66,24 @@ def coerce_reveal(data) -> dict:
 def summary_line(settings: dict) -> str:
     s = coerce_reveal(settings)
     return (
-        f"Revelado XQ guardado: rojo {s['gain_r']:.2f}, azul {s['gain_b']:.2f}, "
-        f"EV {s['ev']:+.2f}, sombras {s['shadow_b']:.0f}, detalle {s['midtone']:.2f}, "
+        f"Revelado 4444 guardado: rojo {s['gain_r']:.2f}, azul {s['gain_b']:.2f}, "
+        f"EV {s['ev']:+.2f}, gamma {s['gamma']:.2f}, sombras {s['shadow_b']:.0f}, detalle {s['midtone']:.2f}, "
         f"{'en la GPU' if s['engine'] == 'gpu' else 'en el CPU'}"
     )
 
 
 def debayer_codes(packed: bytes, width: int, height: int) -> np.ndarray:
-    """RGB uint16 del edge-aware. El código 4095 es el clip del sensor."""
-    bayer = bayer_render.unpack_12bit_le(packed, width, height)
-    return cv2.cvtColor(np.ascontiguousarray(bayer), _BAYER)
+    """RGB uint16 del demosaico del SDK. El código 4095 es el clip del sensor.
+
+    Si Arena no responde, queda el edge-aware de OpenCV.
+    """
+    try:
+        import sdk_demosaic
+
+        return sdk_demosaic.demosaic_codes(packed, width, height)
+    except Exception:
+        bayer = bayer_render.unpack_12bit_le(packed, width, height)
+        return cv2.cvtColor(np.ascontiguousarray(bayer), _BAYER)
 
 
 def debayer_dng_mosaic(mosaic: np.ndarray) -> np.ndarray:
@@ -91,9 +99,17 @@ def debayer_dng_mosaic(mosaic: np.ndarray) -> np.ndarray:
     return cv2.cvtColor(img, _BAYER)
 
 
-def debayer_linear(packed: bytes, width: int, height: int) -> np.ndarray:
-    """RGB lineal float32. 1.0 = código 4095."""
-    rgb16 = debayer_codes(packed, width, height)
+def debayer_linear(packed: bytes, width: int, height: int, engine: str = "cpu") -> np.ndarray:
+    """RGB lineal float32. 1.0 = código 4095.
+
+    En GPU es el NPP de la exportación. En CPU es el demosaico del SDK.
+    """
+    if str(engine).strip().lower() == "gpu":
+        from reveal_gpu import npp_demosaic_codes
+
+        rgb16 = npp_demosaic_codes(packed, width, height)
+    else:
+        rgb16 = debayer_codes(packed, width, height)
     return rgb16.astype(np.float32) * (np.float32(1.0) / np.float32(RAW12_MAX))
 
 
@@ -151,12 +167,21 @@ def _luma(img: np.ndarray) -> np.ndarray:
     return img[..., 0] * _LUMA_R + img[..., 1] * _LUMA_G + img[..., 2] * _LUMA_B
 
 
-def _channel_curve(gain: float, ev_mul: float, curve_b: np.float32, inv_log: np.float32, lift: float) -> np.ndarray:
-    """Curva de un canal para cada código uint16. 1.0 = código 4095."""
+def _channel_curve(gain: float, ev_mul: float, gamma: float, curve_b: float, lift: float) -> np.ndarray:
+    """Gamma del slider, para cada código uint16. 1.0 = código 4095.
+
+    La gamma siempre se aplica, como en el visor. Las sombras abren el
+    valor lineal antes: en 0 no cambian nada y desde 24 dejan la curva
+    logarítmica, con la gamma encima.
+    """
     code = np.arange(_LUT_LEN, dtype=np.float32)
     x = np.minimum(code, np.float32(RAW12_MAX)) * (np.float32(1.0) / np.float32(RAW12_MAX))
-    x = x * np.float32(gain) * np.float32(ev_mul)
-    y = np.log1p(curve_b * np.maximum(x, np.float32(0))) * inv_log
+    x = np.maximum(x * np.float32(gain) * np.float32(ev_mul), np.float32(0))
+    if curve_b > 1e-3:
+        opened = np.log1p(np.float32(curve_b) * x) * (np.float32(1.0) / np.log1p(np.float32(curve_b)))
+        mix = np.float32(min(curve_b / 24.0, 1.0))
+        x = x * (np.float32(1.0) - mix) + opened * mix
+    y = np.power(x, np.float32(1.0 / max(gamma, 0.05)))
     if lift > 0.0:
         under = np.clip(np.float32(1.0) - y, 0.0, 1.0)
         y = y + np.float32(lift) * under * under
@@ -170,18 +195,18 @@ def _quantize_curve(curve: np.ndarray) -> np.ndarray:
 def reveal_tables(settings: dict) -> tuple[tuple, tuple]:
     """Curvas float (preview y detalle) y uint16 (exportación directa a rgb48)."""
     s = coerce_reveal(settings)
-    key = (s["gain_r"], s["gain_b"], s["ev"], s["shadow_b"], s["shadow_lift"])
+    key = (s["gain_r"], s["gain_b"], s["ev"], s["gamma"], s["shadow_b"], s["shadow_lift"])
     cached = _lut_cache.get(key)
     if cached is not None:
         return cached
-    curve_b = np.float32(max(float(s["shadow_b"]), 1e-3))
-    inv_log = np.float32(1.0) / np.float32(np.log1p(curve_b))
+    curve_b = float(s["shadow_b"])
+    gamma = float(s["gamma"])
     ev_mul = float(2.0 ** s["ev"]) if s["ev"] != 0.0 else 1.0
     lift = float(s["shadow_lift"])
     floats = (
-        _channel_curve(s["gain_r"] * _CAM_WB_R, ev_mul, curve_b, inv_log, lift),
-        _channel_curve(1.0, ev_mul, curve_b, inv_log, lift),
-        _channel_curve(s["gain_b"] * _CAM_WB_B, ev_mul, curve_b, inv_log, lift),
+        _channel_curve(s["gain_r"], ev_mul, gamma, curve_b, lift),
+        _channel_curve(1.0, ev_mul, gamma, curve_b, lift),
+        _channel_curve(s["gain_b"], ev_mul, gamma, curve_b, lift),
     )
     packed = tuple(_quantize_curve(curve) for curve in floats)
     _lut_cache[key] = (floats, packed)

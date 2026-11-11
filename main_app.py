@@ -760,7 +760,8 @@ class MainWindow(QMainWindow):
                 "gain_r": 1.0,
                 "gain_b": 1.0,
                 "ev": 0.0,
-                "shadow_b": 12.0,
+                "gamma": 2.0,
+                "shadow_b": 0.0,
                 "shadow_lift": 0.0,
                 "midtone": 0.0,
                 "engine": "cpu",
@@ -1008,10 +1009,14 @@ class MainWindow(QMainWindow):
         btn_change_root = QPushButton("📂 Directorio Datos"); btn_change_root.clicked.connect(self.change_root_folder)
         btn_dng_reveal = QPushButton("Revelar secuencias DNG…")
         btn_dng_reveal.clicked.connect(self.open_dng_reveal)
+        btn_video = QPushButton("Tratar videos…")
+        btn_video.setToolTip("Color, estabilización y recorte de videos ya revelados. Se abre aparte, sin cortar la captura.")
+        btn_video.clicked.connect(self.open_video_finish)
         
         bg_layout.addWidget(btn_refresh)
         bg_layout.addWidget(btn_change_root)
         bg_layout.addWidget(btn_dng_reveal)
+        bg_layout.addWidget(btn_video)
         btn_group.setLayout(bg_layout)
         
         left_layout.addWidget(btn_group)
@@ -2251,6 +2256,11 @@ class MainWindow(QMainWindow):
         )
         dlg.exec()
 
+    def open_video_finish(self):
+        """Herramienta aparte. No usa la cámara ni la cola de exportación."""
+        script = Path(__file__).resolve().parent / "video_finish.py"
+        subprocess.Popen([sys.executable, str(script)], cwd=str(script.parent))
+
     def open_dng_reveal(self):
         if self.is_exporting_batch:
             QMessageBox.information(self, "Ocupado", "Hay una exportación en curso.")
@@ -2346,12 +2356,12 @@ class MainWindow(QMainWindow):
                 f"\"{nf.name}\" fue capturado en RGB procesado por la cámara.\n"
                 f"No es posible exportarlo como DNG RAW, se usará TIFF 8-bit Sequence en su lugar."
             )
-        if effective_fmt in ("exr", "prores_xq", "hevc_nvenc") and pixel_fmt in ("rgb", "qoi_rgb"):
+        if effective_fmt in ("exr", "prores_4444", "hevc_nvenc") and pixel_fmt in ("rgb", "qoi_rgb"):
             QMessageBox.information(
                 ui_parent,
                 "Aviso de formato",
                 f"\"{nf.name}\" fue capturado en RGB ya revelado.\n"
-                "EXR lineal, ProRes 4444 XQ y HEVC lossless solo salen de un RAW Bayer.",
+                "EXR lineal, ProRes 4444 y HEVC lossless solo salen de un RAW Bayer.",
             )
             if session is not None:
                 session.note_file_finished(nf.name, False, "Este archivo no es RAW Bayer.")
@@ -2379,7 +2389,7 @@ class MainWindow(QMainWindow):
             "--mode", mode,
         ]
         ext_map = {
-            "prores": ".mov", "prores_hq": ".mov", "prores_xq": ".mov", "ffv1": ".mkv",
+            "prores": ".mov", "prores_hq": ".mov", "prores_4444": ".mov", "ffv1": ".mkv",
             "h264": ".mp4", "hevc": ".mp4", "hevc_nvenc": ".mp4", "cineform": ".mov", "av1": ".mp4",
         }
         if output_name:
@@ -2400,10 +2410,10 @@ class MainWindow(QMainWindow):
 
         grade = (settings or {}).get("grade")
         if grade and grade.get("enabled") and effective_fmt not in (
-            "dng", "exr", "tiff_seq", "tif", "prores_xq", "hevc_nvenc",
+            "dng", "exr", "tiff_seq", "tif", "prores_4444", "hevc_nvenc",
         ):
             cmd.extend(["--grade", json.dumps(grade)])
-        if effective_fmt in ("prores_xq", "hevc_nvenc"):
+        if effective_fmt in ("prores_4444", "hevc_nvenc"):
             from reveal_pipeline import coerce_reveal
             cmd.extend(["--reveal", json.dumps(coerce_reveal(self._persist.get("reveal")))])
 
@@ -2602,7 +2612,7 @@ class MainWindow(QMainWindow):
         e.accept()
 
 class DngRevealDialog(QDialog):
-    """Carpetas de secuencia DNG → ProRes 4444 XQ o HEVC, con el revelado guardado."""
+    """Carpetas de secuencia DNG → ProRes 4444 o HEVC, con el revelado guardado."""
 
     def __init__(self, host):
         super().__init__(host)
@@ -2633,7 +2643,7 @@ class DngRevealDialog(QDialog):
         form = QHBoxLayout()
         form.addWidget(QLabel("Codec"))
         self.codec = QComboBox()
-        self.codec.addItem("ProRes 4444 XQ", "prores_xq")
+        self.codec.addItem("ProRes 4444", "prores_4444")
         self.codec.addItem("HEVC 4:4:4 lossless NVENC", "hevc_nvenc")
         form.addWidget(self.codec, 1)
         form.addWidget(QLabel("FPS"))

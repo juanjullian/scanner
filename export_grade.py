@@ -29,7 +29,7 @@ RAW12_MAX = 4095
 _EXT_MAP = {
     "prores": ".mov",
     "prores_hq": ".mov",
-    "prores_xq": ".mov",
+    "prores_4444": ".mov",
     "cineform": ".mov",
     "hevc": ".mp4",
     "hevc_nvenc": ".mp4",
@@ -1209,8 +1209,8 @@ class ExportConfirmDialog(QDialog):
         self._grade_settings: dict[str, dict] = {}
         self._grade_labels: dict[str, QLabel] = {}
         self._test_checks: dict[str, QCheckBox] = {}
-        self._show_grade = fmt not in ("tiff_seq", "dng", "tif", "exr", "prores_xq", "hevc_nvenc")
-        self._show_test = self._show_grade or fmt in ("exr", "prores_xq", "hevc_nvenc")
+        self._show_grade = fmt not in ("tiff_seq", "dng", "tif", "exr", "prores_4444", "hevc_nvenc")
+        self._show_test = self._show_grade or fmt in ("exr", "prores_4444", "hevc_nvenc")
 
         self.setWindowTitle("Confirmar exportación")
         self.setMinimumSize(920, 480)
@@ -1225,16 +1225,16 @@ class ExportConfirmDialog(QDialog):
                 "En Resolve o Nuke, interpreta el EXR como lineal. "
                 "Marca Prueba para exportar solo un tramo."
             )
-        elif fmt == "prores_xq":
+        elif fmt == "prores_4444":
             info_text = (
-                "ProRes 4444 XQ con el revelado guardado. La imagen ya queda en Rec.709. "
+                "ProRes 4444 con el revelado guardado. La imagen ya queda en Rec.709. "
                 "Los cuadros rosados cortos se descartan. "
-                "Este FFmpeg escribe el perfil XQ en 10 bits 4:4:4. "
+                "Este FFmpeg escribe el perfil 4444 en 10 bits 4:4:4. "
                 "Marca Prueba para exportar solo un tramo."
             )
         elif fmt == "hevc_nvenc":
             info_text = (
-                "HEVC 4:4:4 lossless por la GPU, con el mismo revelado guardado del ProRes XQ. "
+                "HEVC 4:4:4 lossless por la GPU, con el mismo revelado guardado del ProRes 4444. "
                 "La imagen queda en Rec.709, 10 bits, sin pérdida en el codec. "
                 "Los cuadros rosados cortos se descartan. "
                 "Marca Prueba para exportar solo un tramo."

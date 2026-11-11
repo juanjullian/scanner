@@ -32,7 +32,7 @@ BAYER_GROUPS = [
     ("RAW", [("dng", "DNG Raw Sequence (16-bit)")]),
     ("Secuencia de imágenes", [("exr", "EXR lineal (half)")]),
     ("Revelado Rec.709", [
-        ("prores_xq", "ProRes 4444 XQ"),
+        ("prores_4444", "ProRes 4444"),
         ("hevc_nvenc", "HEVC 4:4:4 lossless NVENC"),
     ]),
     ("Video con gamma", [
@@ -58,7 +58,7 @@ ISP_GROUPS = [
     ]),
 ]
 
-REVEAL_FORMATS = frozenset({"prores_xq", "hevc_nvenc"})
+REVEAL_FORMATS = frozenset({"prores_4444", "hevc_nvenc"})
 SHARP_FORMATS = frozenset({"prores", "cineform", "prores_hq", "hevc", "av1", "h264"})
 SEQUENCE_FORMATS = frozenset({"dng", "exr", "tiff_seq", "tif"})
 SHARP_CHOICES = [
@@ -80,12 +80,12 @@ _HINTS = {
         "Mismo debayer que el visor HQ, sin gamma ni gradación."
     ),
     "tiff_seq": "TIFF de 8 bits, fiel al ISP de la cámara. Sin revelado ni gradación.",
-    "prores_xq": (
-        "ProRes 4444 XQ con el revelado Rec.709. "
+    "prores_4444": (
+        "ProRes 4444 con el revelado Rec.709. "
         "Abre los ajustes en cada archivo antes de exportar."
     ),
     "hevc_nvenc": (
-        "HEVC 4:4:4 lossless por la GPU, con el mismo revelado del ProRes XQ. "
+        "HEVC 4:4:4 lossless por la GPU, con el mismo revelado del ProRes 4444. "
         "Abre los ajustes en cada archivo antes de exportar."
     ),
 }
@@ -95,7 +95,7 @@ def format_options(fmt: str, source_is_processed: bool) -> dict:
     reveal = fmt in REVEAL_FORMATS and not source_is_processed
     sharp = fmt in SHARP_FORMATS and not source_is_processed
     grade = fmt in SHARP_FORMATS
-    test = grade or fmt in {"exr", "prores_xq", "hevc_nvenc"}
+    test = grade or fmt in {"exr", "prores_4444", "hevc_nvenc"}
     fps = fmt not in SEQUENCE_FORMATS
     return {"reveal": reveal, "sharp": sharp, "grade": grade, "test": test, "fps": fps}
 
@@ -577,6 +577,8 @@ class ExportSessionDialog(QDialog):
         preferred = None
         if host is not None and hasattr(host, "_persist"):
             preferred = host._persist.get("export_format")
+            if preferred == "prores_xq":
+                preferred = "prores_4444"
         self._applying = True
         self.combo_fmt.setCurrentIndex(self._index_for(preferred))
         self._fmt = self.combo_fmt.currentData() or self._fmt
@@ -988,10 +990,21 @@ class ExportSessionDialog(QDialog):
         for name, roi in pending:
             raw = self.root / self.collection / name
             data = film_finish.load(raw)
-            data["perfo"] = {"enabled": True, "roi": list(roi)}
+            perfo = data.get("perfo") or {}
+            ref = film_finish.perfo_ref(perfo)
+            if ref is None:
+                side = film_finish.read_perfo(raw) or {}
+                if side.get("status") == "done":
+                    ref = film_finish.perfo_ref(side)
+            if ref is None:
+                ref = 0
+            data["perfo"] = {
+                "enabled": True,
+                "roi": list(roi),
+                "ref": film_finish.perfo_ref(perfo),
+                "horizontal": film_finish.perfo_horizontal(perfo),
+            }
             film_finish.save(raw, data)
-            side = film_finish.read_perfo(raw) or {}
-            ref = int(side.get("ref") or 0)
             if jobs.enqueue(raw, roi, ref_frame=ref):
                 queued += 1
                 self._paint_file_badges(name, 0)

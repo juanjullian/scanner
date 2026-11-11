@@ -30,9 +30,10 @@ def empty() -> dict:
     return {
         "segments": [],
         "crop": None,
-        "perfo": {"enabled": False, "roi": None},
+        "perfo": {"enabled": False, "roi": None, "ref": None, "horizontal": True},
         "grade": {"mode": "color", "sat": 1.0},
         "turn": 0.0,
+        "flip_h": False,
     }
 
 
@@ -42,6 +43,14 @@ def _turn(data) -> float:
     except (TypeError, ValueError):
         value = 0.0
     return max(-180.0, min(180.0, round(value, 1)))
+
+
+def mirror_x(rect, width: int):
+    """El mismo recuadro, visto en la imagen volteada en horizontal."""
+    if not rect or len(rect) != 4:
+        return None
+    x, y, rect_w, rect_h = (int(v) for v in rect)
+    return int(width) - x - rect_w, y, rect_w, rect_h
 
 
 def sampling_matrix(tx: float, ty: float, degrees: float, center: tuple[float, float]) -> np.ndarray:
@@ -85,9 +94,12 @@ def load(raw: Path) -> dict:
         base["perfo"] = {
             "enabled": bool(perfo.get("enabled")),
             "roi": perfo.get("roi"),
+            "ref": perfo_ref(perfo),
+            "horizontal": perfo_horizontal(perfo),
         }
         base["grade"] = _grade(data)
         base["turn"] = _turn(data)
+        base["flip_h"] = bool(data.get("flip_h"))
     return base
 
 
@@ -104,6 +116,8 @@ def has_adjust(data: dict) -> bool:
         return True
     if abs(_turn(data)) >= 0.05:
         return True
+    if data.get("flip_h"):
+        return True
     return bool(data.get("segments"))
 
 
@@ -116,7 +130,7 @@ def copy_adjust(src: Path, dst: Path) -> bool:
     return True
 
 
-def review_state(raw: Path) -> dict:
+def review_state(raw: Path, frames: int | None = None) -> dict:
     """Qué tiene el archivo para darse por revisado, y en qué va la estabilización."""
     data = load(raw)
     side = read_perfo(raw) or {}
@@ -133,7 +147,7 @@ def review_state(raw: Path) -> dict:
         color, color_kind = False, ""
     roi = (data.get("perfo") or {}).get("roi")
     status = side.get("status")
-    if roi and perfo_is_done(raw, roi):
+    if roi and perfo_is_done(raw, roi, frames):
         stab = "listo"
     elif status == "running":
         stab = "corriendo"
@@ -219,23 +233,59 @@ def read_perfo(raw: Path) -> dict | None:
     return _read_perfo(perfo_path(raw))
 
 
-def perfo_is_done(raw: Path, roi) -> bool:
-    """Ya hay un desplazamiento completo para esta zona. No hace falta medirlo de nuevo."""
+def perfo_horizontal(perfo) -> bool:
+    """El eje de lado. Un archivo de antes, sin la clave, sigue corrigiendo los dos ejes."""
+    if not isinstance(perfo, dict) or "horizontal" not in perfo:
+        return True
+    value = perfo.get("horizontal")
+    if isinstance(value, str):
+        return value.strip().lower() != "false"
+    return value is not False
+
+
+def perfo_ref(perfo) -> int | None:
+    """Cuadro en el que se dibujó la zona. None si todavía no quedó guardado."""
+    if not isinstance(perfo, dict):
+        return None
+    value = perfo.get("ref")
+    if value is None or value is False:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def perfo_is_done(raw: Path, roi, frames: int | None = None) -> bool:
+    """Ya hay un desplazamiento completo para esta zona. No hace falta medirlo de nuevo.
+
+    `frames` es la cantidad de cuadros cuando el archivo no es un raw Bayer.
+    """
     data = read_perfo(raw)
     if not data or data.get("status") != "done":
         return False
     tx = data.get("tx") or []
     if not tx:
         return False
-    try:
-        count = Path(raw).stat().st_size // (FULL_W * FULL_H * 3 // 2)
-    except OSError:
-        return False
+    if frames is None:
+        try:
+            count = Path(raw).stat().st_size // (FULL_W * FULL_H * 3 // 2)
+        except OSError:
+            return False
+    else:
+        count = max(0, int(frames))
     if count and len(tx) != count:
         return False
     saved = data.get("roi")
     if roi and saved and tuple(int(v) for v in saved) != tuple(int(v) for v in roi):
         return False
+    wanted = perfo_ref(load(raw).get("perfo") or {})
+    if wanted is not None:
+        try:
+            if int(data.get("ref")) != wanted:
+                return False
+        except (TypeError, ValueError):
+            return False
     return True
 
 
@@ -334,12 +384,14 @@ class Finish:
         self.grade_mode = grade["mode"]
         self.grade_sat = grade["sat"]
         self.turn = _turn(self.data)
+        self.flip_h = bool(self.data.get("flip_h"))
+        self.horizontal = perfo_horizontal(self.data.get("perfo"))
 
     @property
     def active(self) -> bool:
         graded = self.grade_mode == "bw" or self.grade_sat < 0.999
         turned = abs(self.turn) >= 0.05
-        return bool(self.segments or self.tx or self.crop or graded or turned)
+        return bool(self.segments or self.tx or self.crop or graded or turned or self.flip_h)
 
     def sampling(self, index: int, width: int, height: int):
         tx, ty = self.shift_at(index)
@@ -355,7 +407,7 @@ class Finish:
     def output_size(self, width: int = FULL_W, height: int = FULL_H) -> tuple[int, int]:
         box = self.crop_box(width, height)
         cw, ch = (box[2], box[3]) if box else (width, height)
-        if self.gpu and self.codec == "prores_xq":
+        if self.gpu and self.codec == "prores_4444":
             from reveal_gpu import prores_nv_size
             return prores_nv_size(cw, ch)
         even_w = max(2, cw - (cw % 2))
@@ -371,7 +423,10 @@ class Finish:
     def shift_at(self, index: int) -> tuple[float, float]:
         if not self.tx or index < 0 or index >= len(self.tx):
             return 0.0, 0.0
-        return float(self.tx[index]), float(self.ty[index])
+        tx = float(self.tx[index])
+        if not self.horizontal:
+            tx = 0.0
+        return tx, float(self.ty[index])
 
     def apply_u16(self, image: np.ndarray, index: int, out_wh: tuple[int, int]) -> np.ndarray:
         work = image.astype(np.float32) * np.float32(1.0 / 65535.0)
@@ -391,8 +446,12 @@ class Finish:
                 borderValue=0,
             )
         if out_wh is None:
-            return work
-        return _crop_pad(work, self.crop_box(work.shape[1], work.shape[0]), out_wh)
+            cropped = work
+        else:
+            cropped = _crop_pad(work, self.crop_box(work.shape[1], work.shape[0]), out_wh)
+        if self.flip_h:
+            cropped = np.ascontiguousarray(cropped[:, ::-1])
+        return cropped
 
 
 def snap_crop(crop, width: int = FULL_W, height: int = FULL_H):

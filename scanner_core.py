@@ -240,14 +240,17 @@ class PreviewWorker(QThread):
         return self._bayer_algorithm
 
     def _convert_to_bgr8(self, arena_buffer):
-        try:
-            if BayerAlgorithm is not None:
-                return BufferFactory.convert(
-                    arena_buffer, PixelFormat.BGR8, BayerAlgorithm(int(self._bayer_algorithm))
-                )
-        except Exception:
-            pass
-        return BufferFactory.convert(arena_buffer, PixelFormat.BGR8)
+        from sdk_demosaic import arena_lock
+
+        with arena_lock:
+            try:
+                if BayerAlgorithm is not None:
+                    return BufferFactory.convert(
+                        arena_buffer, PixelFormat.BGR8, BayerAlgorithm(int(self._bayer_algorithm))
+                    )
+            except Exception:
+                pass
+            return BufferFactory.convert(arena_buffer, PixelFormat.BGR8)
 
     def set_preview_mode(self, mode):
         if mode in ("isp", "isp_full", "raw", "bw", "hq", "hq_half"):

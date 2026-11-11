@@ -20,9 +20,9 @@ from collections import deque
 
 FFMPEG_STDIN_BUFSIZE = 4 * 1024 * 1024  # buffer tubería stdin → FFmpeg
 RESERVE_CORES_FOR_OS = 2  # cores libres para el SO (p. ej. E-cores en i7 híbrido)
-XQ_REVEAL_WORKERS = 4  # revelado XQ: el resto de los núcleos queda para prores_ks
+REVEAL_WORKERS = 4  # revelado 4444: el resto de los núcleos queda para prores_ks
 # Mismos ajustes de revelado, otro contenedor.
-REVEAL_CODECS = frozenset({"prores_xq", "hevc_nvenc"})
+REVEAL_CODECS = frozenset({"prores_4444", "hevc_nvenc"})
 # El encoder corre en la GPU. AV1 ya iba por NVENC; HEVC lossless también.
 HW_ENCODER_CODECS = frozenset({"hevc_nvenc", "av1"})
 DETECT_PREFETCH_WORKERS = 2  # detección glitch: pocos hilos, el resto va al procesado
@@ -313,13 +313,13 @@ def _save_exr_half(rgb_lin, path):
     Path(path).write_bytes(buf.tobytes())
 
 
-def process_prores_xq_frame(raw_data, is_rgb, width, height, mode, grade=None, is_bayer=False, index=0):
-    """Bayer → edge-aware → tabla de revelado → rgb48. El YUV de NVENC se arma después."""
+def process_prores_4444_frame(raw_data, is_rgb, width, height, mode, grade=None, is_bayer=False, index=0):
+    """Bayer → demosaico del SDK → tabla de revelado → rgb48. El YUV de NVENC se arma después."""
     from reveal_pipeline import debayer_codes, reveal_codes_rgb48
     codes = debayer_codes(raw_data, width, height)
-    settings = getattr(process_prores_xq_frame, "settings", None)
+    settings = getattr(process_prores_4444_frame, "settings", None)
     data = reveal_codes_rgb48(codes, settings, mode)
-    finish = getattr(process_prores_xq_frame, "finish", None)
+    finish = getattr(process_prores_4444_frame, "finish", None)
     if finish is None or not finish.active:
         return data
     image = np.frombuffer(data, dtype=np.uint16).reshape(height, width, 3)
@@ -450,11 +450,11 @@ def _append_ffmpeg_codec_args(cmd: list, codec: str) -> str:
     if codec == 'prores':
         cmd += ['-c:v', 'prores_ks', '-profile:v', '4', '-vendor', 'apl0', '-qscale:v', '5', '-pix_fmt', 'yuv444p10le']
         return ".mov"
-    if codec == 'prores_xq':
-        # Perfil XQ. Este FFmpeg escribe 10 bits 4:4:4; la curva ya es Rec.709.
+    if codec == 'prores_4444':
+        # Perfil 4444. Este FFmpeg escribe 10 bits 4:4:4; la curva ya es Rec.709.
         cmd += [
-            '-c:v', 'prores_ks', '-profile:v', '5', '-vendor', 'apl0',
-            '-qscale:v', '4', '-pix_fmt', 'yuv444p10le',
+            '-c:v', 'prores_ks', '-profile:v', '4', '-vendor', 'apl0',
+            '-qscale:v', '5', '-pix_fmt', 'yuv444p10le',
             '-colorspace', 'bt709', '-color_primaries', 'bt709', '-color_trc', 'bt709',
             '-metadata', 'comment=Revelado Rec.709. Debayer edge-aware. Blanco del sensor = 1.',
         ]
@@ -691,7 +691,7 @@ def _export_video_ordered(
     thumb_state = {"pct": -1}
     finish = getattr(frame_fn, "finish", None)
     thumb_wh = None
-    if frame_fn is process_prores_xq_frame:
+    if frame_fn is process_prores_4444_frame:
         thumb_wh = finish.output_size(w, h) if finish is not None and finish.active else (w, h)
 
     def drain_completed():
@@ -1030,7 +1030,7 @@ def _reveal_dng_path(path, mode):
         raise RuntimeError(f"DNG sin mosaico de un canal: {path.name}")
     from reveal_pipeline import debayer_dng_mosaic, reveal_codes_rgb48
     codes = debayer_dng_mosaic(mosaic)
-    return reveal_codes_rgb48(codes, process_prores_xq_frame.settings, mode)
+    return reveal_codes_rgb48(codes, process_prores_4444_frame.settings, mode)
 
 
 def _dng_output_file(folder: Path, codec_name: str, output) -> Path:
@@ -1046,7 +1046,7 @@ def _dng_output_file(folder: Path, codec_name: str, output) -> Path:
 
 
 def _export_dng_directory(args, codec_name: str):
-    """Secuencia DNG ya filtrada → el revelado guardado → ProRes XQ o HEVC."""
+    """Secuencia DNG ya filtrada → el revelado guardado → ProRes 4444 o HEVC."""
     if not HAS_TIFFFILE:
         print("ERROR|Falta tifffile para leer los DNG.")
         return
@@ -1065,11 +1065,11 @@ def _export_dng_directory(args, codec_name: str):
     h, w = int(sample.shape[0]), int(sample.shape[1])
     out = _dng_output_file(folder, codec_name, args.output)
     out.parent.mkdir(parents=True, exist_ok=True)
-    workers = _hw_reveal_workers() if codec_name in HW_ENCODER_CODECS else XQ_REVEAL_WORKERS
+    workers = _hw_reveal_workers() if codec_name in HW_ENCODER_CODECS else REVEAL_WORKERS
     mode = args.mode or "COLOR"
     print(f"INFO|Secuencia DNG: {folder.name} | {len(frames)} cuadros | {w}x{h} | {codec_name}")
     print(f"INFO|Salida: {out}")
-    if process_prores_xq_frame.settings.get("engine") == "gpu":
+    if process_prores_4444_frame.settings.get("engine") == "gpu":
         _export_dng_frames_on_gpu(frames, w, h, out, args.fps, codec_name, mode)
         return
     input_pix = "yuv444p10msble" if codec_name == "hevc_nvenc" else "rgb48le"
@@ -1147,7 +1147,7 @@ def _open_hevc_from_yuv(output_file, width, height, fps):
 
 
 def _gpu_encoder(codec, output_file, out_w, out_h, fps):
-    if codec == "prores_xq":
+    if codec == "prores_4444":
         from reveal_gpu import open_prores_nv
         return open_prores_nv(output_file, out_w, out_h, int(float(fps)))
     return _open_hevc_from_yuv(output_file, out_w, out_h, fps)
@@ -1156,11 +1156,11 @@ def _gpu_encoder(codec, output_file, out_w, out_h, fps):
 def _start_gpu_reveal(codec, w, h, mode, finish=None):
     from reveal_gpu import GpuReveal, prores_nv_size
 
-    settings = process_prores_xq_frame.settings
+    settings = process_prores_4444_frame.settings
     if finish is not None and finish.active:
         out_w, out_h = finish.output_size(w, h)
-        shift = 0 if codec == "prores_xq" else 6
-    elif codec == "prores_xq":
+        shift = 0 if codec == "prores_4444" else 6
+    elif codec == "prores_4444":
         out_w, out_h = prores_nv_size(w, h)
         shift = 0
     else:
@@ -1221,7 +1221,7 @@ def _export_reveal_on_gpu(
     raw_file, num_frames, frame_bytes, w, h, mode, output_file, fps, codec,
     glitch_filter, start_time, skip_frames, finish=None,
 ):
-    """Un proceso: el filtro magenta mira el CPU. El cuadro empaquetado sube y NPP, la curva y el YUV se quedan en la tarjeta."""
+    """Un proceso. El demosaico es NPP en la tarjeta, el promedio de vecinos del SDK. La curva y el YUV no bajan."""
     gpu, out_w, out_h = _start_gpu_reveal(codec, w, h, mode, finish)
     proc = _gpu_encoder(codec, output_file, out_w, out_h, fps)
     detect_pool = (
@@ -1315,7 +1315,7 @@ def main():
     parser.add_argument("--mode", default="COLOR")
     parser.add_argument("--output", default=None, help="Nombre de archivo o carpeta de salida (relativo al directorio del .raw)")
     parser.add_argument("--grade", default=None, help="JSON con ajustes de gradación (export_grade.DEFAULT_GRADE)")
-    parser.add_argument("--reveal", default=None, help="JSON del revelado Rec.709 para ProRes 4444 XQ")
+    parser.add_argument("--reveal", default=None, help="JSON del revelado Rec.709 para ProRes 4444")
     parser.add_argument(
         "--max-frames", type=int, default=None,
         help="Cantidad maxima de cuadros a exportar (despues de --skip-frames)",
@@ -1365,15 +1365,15 @@ def main():
                 parsed_reveal = json.loads(args.reveal)
             except json.JSONDecodeError as e:
                 print(f"WARN|No se pudo leer --reveal: {e}")
-        process_prores_xq_frame.settings = coerce_reveal(parsed_reveal)
-        process_prores_xq_frame.finish = None
-        reveal_tables(process_prores_xq_frame.settings)
+        process_prores_4444_frame.settings = coerce_reveal(parsed_reveal)
+        process_prores_4444_frame.finish = None
+        reveal_tables(process_prores_4444_frame.settings)
         cv2.setNumThreads(1)
-        reveal_gpu = process_prores_xq_frame.settings.get("engine") == "gpu"
+        reveal_gpu = process_prores_4444_frame.settings.get("engine") == "gpu"
         reveal_workers = 1 if reveal_gpu else (
-            _hw_reveal_workers() if codec_name in HW_ENCODER_CODECS else XQ_REVEAL_WORKERS
+            _hw_reveal_workers() if codec_name in HW_ENCODER_CODECS else REVEAL_WORKERS
         )
-        print(f"INFO|{summary_line(process_prores_xq_frame.settings)}")
+        print(f"INFO|{summary_line(process_prores_4444_frame.settings)}")
         if reveal_gpu:
             print(
                 "INFO|Revelado en un solo proceso, en la tarjeta. "
@@ -1391,12 +1391,12 @@ def main():
             )
     if codec_name in ("exr",) or codec_name in REVEAL_CODECS:
         if grade_settings and grade_settings.get("enabled"):
-            print("INFO|La gradación del video no se aplica a EXR, ProRes 4444 XQ ni HEVC lossless.")
+            print("INFO|La gradación del video no se aplica a EXR, ProRes 4444 ni HEVC lossless.")
         grade_settings = None
 
     if args.dng_dir:
         if codec_name not in REVEAL_CODECS:
-            print("ERROR|Una secuencia DNG solo se revela a ProRes 4444 XQ o HEVC lossless.")
+            print("ERROR|Una secuencia DNG solo se revela a ProRes 4444 o HEVC lossless.")
             sys.exit(1)
         try:
             _export_dng_directory(args, codec_name)
@@ -1479,7 +1479,7 @@ def main():
     if is_hw_mode:
         hw_workers = _hw_reveal_workers()
     elif is_reveal_mode:
-        hw_workers = XQ_REVEAL_WORKERS
+        hw_workers = REVEAL_WORKERS
     else:
         hw_workers = None
     is_tiff_seq_mode = codec == 'tiff_seq'
@@ -1516,11 +1516,11 @@ def main():
         else:
             input_pix_fmt = 'rgb24' if is_processed_src else 'rgb48le'
         export_w, export_h = w, h
-        finish = getattr(process_prores_xq_frame, "finish", None)
+        finish = getattr(process_prores_4444_frame, "finish", None)
         if is_reveal_mode:
             from film_finish import Finish
             finish = Finish(input_path, gpu=reveal_gpu, codec=codec)
-            process_prores_xq_frame.finish = finish
+            process_prores_4444_frame.finish = finish
             if finish.active:
                 export_w, export_h = finish.output_size(w, h)
                 print(f"INFO|Ajustes de archivo: salida {export_w}x{export_h}")
@@ -1532,14 +1532,14 @@ def main():
             f"Modo Video: {args.codec} | Fuente: {'RGB8 ISP' if is_processed_src else 'Bayer'} | "
             f"pix_fmt: {input_pix_fmt}"
         )
-        if codec == "prores_xq" and reveal_gpu:
+        if codec == "prores_4444" and reveal_gpu:
             print(
-                "INFO|ProRes 4444 XQ en la tarjeta: NPP, revelado y codificador prores_nv."
+                "INFO|ProRes 4444 en la tarjeta: NPP, revelado y codificador prores_nv."
             )
-        elif codec == "prores_xq":
+        elif codec == "prores_4444":
             print(
-                "INFO|ProRes 4444 XQ en Rec.709, 10 bits 4:4:4. "
-                "Demosaico edge-aware y revelado en el CPU. Pipe directo a FFmpeg."
+                "INFO|ProRes 4444 en Rec.709, 10 bits 4:4:4. "
+                "Demosaico del SDK y revelado en el CPU. Pipe directo a FFmpeg."
             )
         elif codec == "hevc_nvenc" and reveal_gpu:
             print(
@@ -1736,7 +1736,7 @@ def main():
                             f, num_frames, frame_bytes, w, h, args.mode,
                             video_ctx["output_file"], args.fps, codec,
                             glitch_filter, start_time, skip_frames,
-                            getattr(process_prores_xq_frame, "finish", None),
+                            getattr(process_prores_4444_frame, "finish", None),
                         )
                 else:
                     writer = _create_video_frame_writer(video_ctx, args)
@@ -1746,7 +1746,7 @@ def main():
                                 f, num_frames, frame_bytes, writer,
                                 w, h, is_rgb, args, grade_settings,
                                 glitch_filter, start_time, skip_frames,
-                                frame_fn=process_prores_xq_frame if is_reveal_mode else None,
+                                frame_fn=process_prores_4444_frame if is_reveal_mode else None,
                                 workers=hw_workers,
                             )
                     finally:

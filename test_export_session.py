@@ -63,7 +63,7 @@ def test_speed_and_groups():
     assert not any(dng.values())
     exr = format_options("exr", False)
     assert exr == {"reveal": False, "sharp": False, "grade": False, "test": True, "fps": False}
-    reveal = format_options("prores_xq", False)
+    reveal = format_options("prores_4444", False)
     assert reveal["reveal"] and reveal["fps"] and reveal["test"]
     assert not reveal["grade"] and not reveal["sharp"]
     video = format_options("h264", False)
@@ -107,8 +107,8 @@ def test_draft_roundtrip_across_formats():
                 return
         raise AssertionError(fmt)
 
-    choose("prores_xq")
-    assert dialog._fmt == "prores_xq"
+    choose("prores_4444")
+    assert dialog._fmt == "prores_4444"
     assert dialog._edits["toma.raw"].text().endswith(".mov")
     assert not dialog.table.isColumnHidden(3)
     assert not dialog.reveal_row.isHidden()
@@ -119,7 +119,7 @@ def test_draft_roundtrip_across_formats():
     dialog._edits["toma.raw"].setText("mi_xq.mov")
     choose("dng")
     assert dialog._edits["toma.raw"].text() == "mi_dng"
-    choose("prores_xq")
+    choose("prores_4444")
     assert dialog._edits["toma.raw"].text() == "mi_xq.mov"
 
     again = draft_for_file("toma.raw", {"toma.raw": memory.files["toma.raw"]}, "dng")

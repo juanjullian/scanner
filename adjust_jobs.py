@@ -25,11 +25,15 @@ class _Run(QThread):
         existing = film_finish.read_perfo(self.raw) or {}
         saved = existing.get("roi")
         same_zone = bool(saved) and tuple(int(v) for v in saved) == tuple(self.roi)
+        try:
+            same_ref = same_zone and int(existing.get("ref")) == int(self.ref_frame)
+        except (TypeError, ValueError):
+            same_ref = False
         film_finish.write_perfo_status(
             self.raw, "running", "Midiendo perforación",
             roi=self.roi,
-            ref=existing.get("ref") if same_zone and existing.get("ref") is not None else self.ref_frame,
-            partial=existing.get("partial") if same_zone else [],
+            ref=self.ref_frame,
+            partial=existing.get("partial") if same_ref else [],
         )
         try:
             result = perfo_lock.analyze_file(
@@ -110,7 +114,10 @@ class AdjustJobs(QObject):
             roi = (adjust.get("perfo") or {}).get("roi") or data.get("roi")
             if not roi:
                 continue
-            self.enqueue(raw, roi, ref_frame=int(data.get("ref") or 0), force=True)
+            ref = film_finish.perfo_ref(adjust.get("perfo") or {})
+            if ref is None:
+                ref = int(data.get("ref") or 0)
+            self.enqueue(raw, roi, ref_frame=ref, force=True)
 
     def running_name(self) -> str:
         return self._name

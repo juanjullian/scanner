@@ -60,11 +60,10 @@ def analyze_file(
         raise PerfoError("El archivo no tiene cuadros.")
     ident = _clip_rect(rect, width, height)
     search = _search_rect(ident, width, height)
+    ref = int(np.clip(ref_index, 0, count - 1))
     rows, saved_ref = _load_resume(path, ident, count)
-    if saved_ref is None:
-        ref = _pick_ref_file(path, frame_bytes, width, ident, ref_index, count)
-    else:
-        ref = saved_ref
+    if saved_ref != ref:
+        rows = [None] * count
     ref_gray = _read_search(path, frame_bytes, width, ref, search)
     if ref_gray is None:
         raise PerfoError("No se pudo leer el cuadro de referencia.")
@@ -196,13 +195,36 @@ def _clip_rect(rect, width, height):
     return x, y, rect_w, rect_h
 
 
+def _even_span(x, y, rect_w, rect_h, width, height):
+    """Origen y tamaño pares.
+
+    En 4:2:2 ffmpeg achica el lado impar. Si después se lee el tamaño pedido,
+    cada cuadro queda una fila corrido y la perforación no calza con nada.
+    """
+    x = max(0, int(x) - (int(x) % 2))
+    y = max(0, int(y) - (int(y) % 2))
+    limit_x = int(width) - (int(width) % 2)
+    limit_y = int(height) - (int(height) % 2)
+    x1 = min(limit_x, x + int(rect_w))
+    y1 = min(limit_y, y + int(rect_h))
+    if (x1 - x) % 2:
+        x1 -= 1
+    if (y1 - y) % 2:
+        y1 -= 1
+    if x1 - x < 2 and x + 2 <= limit_x:
+        x1 = x + 2
+    if y1 - y < 2 and y + 2 <= limit_y:
+        y1 = y + 2
+    return x, y, max(0, x1 - x), max(0, y1 - y)
+
+
 def _search_rect(ident, width, height):
     margin = int(np.clip(round(0.05 * max(width, height)), 40, 400))
     x = max(0, ident[0] - margin)
     y = max(0, ident[1] - margin)
     x1 = min(width, ident[0] + ident[2] + margin)
     y1 = min(height, ident[1] + ident[3] + margin)
-    return x, y, x1 - x, y1 - y
+    return _even_span(x, y, x1 - x, y1 - y, width, height)
 
 
 def _pick_ref(frames, ident, ref_index):
@@ -217,6 +239,66 @@ def _pick_ref(frames, ident, ref_index):
         if float(crop.std()) >= MIN_STD_CANDIDATO:
             return index
     raise PerfoError("Sin perforación")
+
+
+def analyze_ordered(
+    sample_crop,
+    crops,
+    count: int,
+    rect,
+    width: int,
+    height: int,
+    ref_index: int = 0,
+    on_progress=None,
+) -> dict:
+    """Mide la perforación sobre grises del recuadro de búsqueda, en orden.
+
+    `sample_crop(index)` lee un cuadro suelto. `crops` recorre el video
+    desde el primero, ya recortado a la zona de búsqueda.
+    """
+    if count <= 0:
+        raise PerfoError("El archivo no tiene cuadros.")
+    ident = _clip_rect(rect, width, height)
+    search = _search_rect(ident, width, height)
+    ref = int(np.clip(ref_index, 0, count - 1))
+    ref_gray = sample_crop(ref)
+    if ref_gray is None:
+        raise PerfoError("No se pudo leer el cuadro de referencia.")
+    spec = _spec_from_crop(ref_gray, ident, search)
+    rows = []
+    for index, gray in enumerate(crops):
+        if index >= count:
+            break
+        rows.append(_register(gray, spec) if gray is not None else (0.0, 0.0, 0.0, 0))
+        if on_progress and index % 8 == 7:
+            on_progress(index + 1, count)
+    if not rows:
+        raise PerfoError("No salió ningún cuadro.")
+    if on_progress:
+        on_progress(len(rows), max(count, len(rows)))
+    return _pack(rows, ident, search, ref)
+
+
+def _pick_ref_reader(sample_crop, ident, search, ref_index, count):
+    asked = sample_crop(int(np.clip(ref_index, 0, count - 1)))
+    if asked is not None and _crop_std(asked, ident, search) >= MIN_STD_VISTO:
+        return int(np.clip(ref_index, 0, count - 1))
+    last = count - 1
+    for frac in (0, 0.05, 0.15, 0.35, 0.60, 0.85):
+        index = int(np.clip(round(frac * last), 0, last))
+        gray = sample_crop(index)
+        if gray is not None and _crop_std(gray, ident, search) >= MIN_STD_CANDIDATO:
+            return index
+    raise PerfoError("Sin perforación")
+
+
+def _crop_std(crop, ident, search) -> float:
+    x = ident[0] - search[0]
+    y = ident[1] - search[1]
+    window = crop[y:y + ident[3], x:x + ident[2]]
+    if window.size == 0:
+        return 0.0
+    return float(window.std())
 
 
 def _pick_ref_file(path, frame_bytes, width, ident, ref_index, count):

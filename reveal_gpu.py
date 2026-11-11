@@ -1,4 +1,4 @@
-"""Revelado en la GPU para ProRes 4444 XQ y HEVC lossless.
+"""Revelado en la GPU para ProRes 4444 y HEVC lossless.
 
 El cuadro empaquetado sube tal cual. En la tarjeta se desempaqueta, corre
 el demosaico NPP, la curva, el detalle y el YUV. El ProRes lo escribe
@@ -25,6 +25,8 @@ NPP_BIN = Path(
 )
 FFMPEG_NV = Path(r"C:\Users\juan\src\proresnv-test\dist\ffmpeg.exe")
 _NPPI_BAYER_RGGB = 1
+# NPP exige 0. Es bilineal con correlación de verde: promedia vecinos,
+# la misma familia que la interpolación direccional del SDK.
 _NPPI_INTER_UNDEFINED = 0
 _CUPY_SITE = Path(
     r"C:\Users\juan\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.13_qbz5n2kfra8p0"
@@ -36,13 +38,18 @@ extern "C" __global__
 void rgb01_to_yuv10(const float* __restrict__ rgb, unsigned short* __restrict__ y,
                     unsigned short* __restrict__ u, unsigned short* __restrict__ v,
                     int width, int height, int out_w, int out_h, int shift,
-                    int crop_x, int crop_y, int crop_w, int crop_h) {
+                    int crop_x, int crop_y, int crop_w, int crop_h, int flip) {
     int x = blockIdx.x * blockDim.x + threadIdx.x;
     int yy = blockIdx.y * blockDim.y + threadIdx.y;
     if (x >= out_w || yy >= out_h) return;
-    int sx = crop_x + x;
+    int local = x;
+    if (flip) {
+        local = x < crop_w ? crop_w - 1 - x : 0;
+    } else if (x >= crop_w) {
+        local = crop_w - 1;
+    }
+    int sx = crop_x + local;
     int sy = crop_y + yy;
-    if (x >= crop_w) sx = crop_x + crop_w - 1;
     if (yy >= crop_h) sy = crop_y + crop_h - 1;
     if (sx < 0) sx = 0;
     if (sy < 0) sy = 0;
@@ -65,6 +72,31 @@ void rgb01_to_yuv10(const float* __restrict__ rgb, unsigned short* __restrict__ 
     y[o] = (unsigned short)(Y10 << shift);
     u[o] = (unsigned short)(U10 << shift);
     v[o] = (unsigned short)(V10 << shift);
+}
+"""
+
+_YUV422 = r"""
+extern "C" __global__
+void yuv422_to_rgb(const unsigned short* __restrict__ y, const unsigned short* __restrict__ u,
+                   const unsigned short* __restrict__ v, float* __restrict__ rgb, int w, int h) {
+    int x = blockIdx.x * blockDim.x + threadIdx.x;
+    int yy = blockIdx.y * blockDim.y + threadIdx.y;
+    if (x >= w || yy >= h) return;
+    const float kr = 0.2126f;
+    const float kb = 0.0722f;
+    const float kg = 1.f - kr - kb;
+    float Y = ((float)y[yy * w + x] - 64.f) / 879.f;
+    int cx = x >> 1;
+    int cw = w >> 1;
+    float Cb = ((float)u[yy * cw + cx] - 512.f) / 899.5f;
+    float Cr = ((float)v[yy * cw + cx] - 512.f) / 899.5f;
+    float R = Y + Cr * (2.f * (1.f - kr));
+    float B = Y + Cb * (2.f * (1.f - kb));
+    float G = (Y - kr * R - kb * B) / kg;
+    int o = (yy * w + x) * 3;
+    rgb[o] = R < 0.f ? 0.f : (R > 1.f ? 1.f : R);
+    rgb[o + 1] = G < 0.f ? 0.f : (G > 1.f ? 1.f : G);
+    rgb[o + 2] = B < 0.f ? 0.f : (B > 1.f ? 1.f : B);
 }
 """
 
@@ -306,15 +338,68 @@ def _npp_context(cp) -> _NppStreamContext:
     return ctx
 
 
-def open_prores_nv(dst, out_w: int, out_h: int, fps: int) -> subprocess.Popen:
+class _NppDemosaic:
+    """El mismo desempaque y el mismo NPP de la exportación, sin curva ni YUV."""
+
+    def __init__(self, width: int, height: int):
+        if width % 2 or height % 2:
+            raise RuntimeError(f"NPP pide ancho y alto pares. Este cuadro es {width}x{height}.")
+        self.cp = prepare()
+        self.width = int(width)
+        self.height = int(height)
+        self.npp = _load_npp()
+        self.npp_ctx = _npp_context(self.cp)
+        self.npp_size = _NppiSize(self.width, self.height)
+        self.npp_roi = _NppiRect(0, 0, self.width, self.height)
+        self.unpack = self.cp.RawKernel(_UNPACK, "unpack12")
+        self.pairs = self.width * self.height // 2
+        self.packed = self.cp.empty(self.pairs * 3, dtype=self.cp.uint8)
+        self.src = self.cp.empty((self.height, self.width), dtype=self.cp.uint16)
+        self.codes = self.cp.empty((self.height, self.width, 3), dtype=self.cp.uint16)
+
+    def __call__(self, packed: bytes) -> np.ndarray:
+        expected = self.pairs * 3
+        raw = np.frombuffer(packed, dtype=np.uint8, count=expected)
+        if raw.size < expected:
+            raise ValueError("El cuadro Bayer quedó corto.")
+        self.packed.set(raw)
+        self.unpack(
+            ((self.pairs + 255) // 256,), (256,),
+            (self.packed, self.src, np.int32(self.pairs)),
+        )
+        status = self.npp(
+            self.src.data.ptr, self.width * 2, self.npp_size, self.npp_roi,
+            self.codes.data.ptr, self.width * 6,
+            _NPPI_BAYER_RGGB, _NPPI_INTER_UNDEFINED, self.npp_ctx,
+        )
+        if status != 0:
+            raise RuntimeError(f"NPP devolvió {status}")
+        self.cp.cuda.Stream.null.synchronize()
+        return self.cp.asnumpy(self.codes).copy()
+
+
+_npp_demosaic: dict[tuple[int, int], _NppDemosaic] = {}
+
+
+def npp_demosaic_codes(packed: bytes, width: int, height: int) -> np.ndarray:
+    """RGB uint16 0–4095. Es el demosaico de la exportación en GPU."""
+    key = (int(width), int(height))
+    worker = _npp_demosaic.get(key)
+    if worker is None:
+        worker = _NppDemosaic(*key)
+        _npp_demosaic[key] = worker
+    return worker(packed)
+
+
+def open_prores_nv(dst, out_w: int, out_h: int, fps: int, *, stderr=None, rate=None, creationflags=0) -> subprocess.Popen:
     """FFmpeg aparte, con prores_nv. No reemplaza al ffmpeg del sistema."""
     if not FFMPEG_NV.is_file():
         raise RuntimeError(f"No está el FFmpeg con prores_nv: {FFMPEG_NV}")
     cmd = [
         str(FFMPEG_NV), "-y", "-f", "rawvideo", "-vcodec", "rawvideo",
         "-s", f"{out_w}x{out_h}", "-pix_fmt", "yuv444p10le",
-        "-r", str(int(fps)), "-i", "pipe:0",
-        "-c:v", "prores_nv", "-profile:v", "4444xq", "-q:v", "4",
+        "-r", str(int(fps) if rate is None else rate), "-i", "pipe:0",
+        "-c:v", "prores_nv", "-profile:v", "4444", "-q:v", "5",
         "-pix_fmt", "yuv444p10le",
         str(dst),
     ]
@@ -323,7 +408,8 @@ def open_prores_nv(dst, out_w: int, out_h: int, fps: int) -> subprocess.Popen:
     env["PATH"] = str(CUDA_BIN) + os.pathsep + str(FFMPEG_NV.parent) + os.pathsep + env.get("PATH", "")
     print(f"INFO|FFmpeg cmd (stdin): {' '.join(cmd)}", flush=True)
     return subprocess.Popen(
-        cmd, stdin=subprocess.PIPE, stderr=sys.stderr, bufsize=4 << 20, env=env,
+        cmd, stdin=subprocess.PIPE, stderr=sys.stderr if stderr is None else stderr,
+        bufsize=4 << 20, env=env, creationflags=creationflags,
     )
 
 
@@ -365,6 +451,8 @@ class GpuReveal:
         self.gamma_k = cp.RawKernel(_GAMMA, "apply_gamma")
         self.sat_k = cp.RawKernel(_SAT, "apply_sat")
         self.warp_k = cp.RawKernel(_WARP, "sample_rgb")
+        self._from422 = None
+        self._y16 = None
         self.warped = None
         self.packed = cp.empty(self.width * self.height * 3 // 2, dtype=cp.uint8)
         self.src = cp.empty((self.height, self.width), dtype=cp.uint16)
@@ -396,6 +484,11 @@ class GpuReveal:
         self.src.set(np.ascontiguousarray(mosaic, dtype=np.uint16))
         return self._after_mosaic(index)
 
+    def frame_codes(self, codes: np.ndarray, index: int = 0) -> bytes:
+        """RGB uint16 ya demosaiado, códigos 0–4095. La curva sigue en la tarjeta."""
+        self.codes.set(np.ascontiguousarray(codes, dtype=np.uint16))
+        return self._after_codes(index)
+
     def _after_mosaic(self, index: int = 0) -> bytes:
         cp = self.cp
         status = self.npp(
@@ -406,6 +499,9 @@ class GpuReveal:
         if status != 0:
             raise RuntimeError(f"NPP devolvió {status}")
         cp.cuda.Stream.null.synchronize()
+        return self._after_codes(index)
+
+    def _after_codes(self, index: int = 0) -> bytes:
         self.lut(
             ((self.n + 255) // 256,), (256,),
             (self.codes, self.img, self.lr, self.lg, self.lb, np.int32(self.n)),
@@ -441,6 +537,45 @@ class GpuReveal:
             self.img[:, :, 0] = yb
             self.img[:, :, 1] = yb
             self.img[:, :, 2] = yb
+        return self._encode_yuv(index)
+
+    def frame_rgb(self, image: np.ndarray, index: int = 0) -> bytes:
+        """RGB ya revelado, uint16 o float 0–1. Color, warp, recorte y YUV quedan en la tarjeta."""
+        arr = np.ascontiguousarray(image)
+        if arr.dtype == np.uint16:
+            arr = arr.astype(np.float32) * np.float32(1.0 / 65535.0)
+        elif arr.dtype != np.float32:
+            arr = arr.astype(np.float32)
+        if arr.shape != (self.height, self.width, 3):
+            raise RuntimeError(
+                f"El cuadro es {arr.shape[1]}×{arr.shape[0]} y este video es {self.width}×{self.height}."
+            )
+        self.img.set(arr)
+        return self._encode_yuv(index)
+
+    def frame_yuv422(self, raw: bytes, index: int = 0) -> bytes:
+        """YUV 4:2:2 de 10 bits, el que entrega el ProRes. El paso a RGB ocurre en la tarjeta."""
+        cp = self.cp
+        if self._from422 is None:
+            self._from422 = cp.RawKernel(_YUV422, "yuv422_to_rgb")
+            half = self.width // 2
+            self._y16 = cp.empty((self.height, self.width), dtype=cp.uint16)
+            self._u16 = cp.empty((self.height, half), dtype=cp.uint16)
+            self._v16 = cp.empty((self.height, half), dtype=cp.uint16)
+        y_n = self.width * self.height
+        c_n = (self.width // 2) * self.height
+        plane = np.frombuffer(raw, dtype=np.uint16)
+        self._y16.set(plane[:y_n].reshape(self.height, self.width))
+        self._u16.set(plane[y_n:y_n + c_n].reshape(self.height, self.width // 2))
+        self._v16.set(plane[y_n + c_n:].reshape(self.height, self.width // 2))
+        self._from422(
+            ((self.width + 15) // 16, (self.height + 15) // 16), (16, 16),
+            (self._y16, self._u16, self._v16, self.img, np.int32(self.width), np.int32(self.height)),
+        )
+        return self._encode_yuv(index)
+
+    def _encode_yuv(self, index: int) -> bytes:
+        cp = self.cp
         src = self._finish_on_device(index)
         self._view = src
         crop_x, crop_y, crop_w, crop_h = self._crop_args()
@@ -451,6 +586,7 @@ class GpuReveal:
                 np.int32(self.width), np.int32(self.height),
                 np.int32(self.out_w), np.int32(self.out_h), np.int32(self.shift),
                 np.int32(crop_x), np.int32(crop_y), np.int32(crop_w), np.int32(crop_h),
+                np.int32(1 if self.finish is not None and self.finish.flip_h else 0),
             ),
         )
         n = self.out_w * self.out_h
@@ -473,7 +609,10 @@ class GpuReveal:
         height = max(1, min(int(height), limit_h - y))
         step = max(1, int(max(width, height) / 160))
         small = view[y:y + height:step, x:x + width:step]
-        return cp.asnumpy(cp.clip(small * cp.float32(255.0) + cp.float32(0.5), 0, 255).astype(cp.uint8))
+        rgb = cp.asnumpy(cp.clip(small * cp.float32(255.0) + cp.float32(0.5), 0, 255).astype(cp.uint8))
+        if self.finish is not None and self.finish.flip_h:
+            rgb = np.ascontiguousarray(rgb[:, ::-1])
+        return rgb
 
     def _crop_args(self) -> tuple[int, int, int, int]:
         if self.finish is not None:

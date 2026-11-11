@@ -109,6 +109,10 @@ def _find_jobs(widget):
     return None
 
 
+def _hflip(image: np.ndarray) -> np.ndarray:
+    return np.ascontiguousarray(image[:, ::-1])
+
+
 def _rgb_pixmap(rgb: np.ndarray) -> QPixmap:
     u8 = np.ascontiguousarray(rgb)
     height, width = u8.shape[:2]
@@ -179,6 +183,8 @@ class FrameView(QWidget):
         self._origin = None
         self._draft = None
         self._split = 0
+        self._captions = ()
+        self._empty = "Elige una película Bayer."
         self._play = _PlayButton(self)
         self._play.clicked.connect(self.play_clicked.emit)
         self._play.setToolTip(
@@ -192,25 +198,42 @@ class FrameView(QWidget):
         self._play_fade = QPropertyAnimation(self._play_fx, b"opacity", self)
         self._play_fade.setDuration(180)
 
-    def set_view(self, rgb: np.ndarray, overlay=None, color="#ffcc00", side=None, allow_draw=False):
+    def set_view(self, rgb: np.ndarray, overlay=None, color="#ffcc00", side=None, allow_draw=False, captions=None):
         self._pix = _rgb_pixmap(rgb)
         self._side = _rgb_pixmap(side) if side is not None else QPixmap()
         self._overlay = overlay
         self._color = QColor(color)
         self._allow = allow_draw
+        self._captions = tuple(captions) if captions else ()
         self._draft = None
         self._place_play()
         self.update()
 
+    def set_empty(self, text: str):
+        self._empty = text
+        self.update()
+
+    def clear(self):
+        self._pix = QPixmap()
+        self._side = QPixmap()
+        self._overlay = None
+        self._captions = ()
+        self._allow = False
+        self.update()
+
     def set_playing(self, playing: bool):
         self._play.set_playing(playing)
+        if playing:
+            self._fade_play(1.0)
 
     def enterEvent(self, event):
         self._fade_play(1.0)
         super().enterEvent(event)
 
     def leaveEvent(self, event):
-        if not self.rect().contains(self.mapFromGlobal(QCursor.pos())):
+        if self._play._playing:
+            self._fade_play(1.0)
+        elif not self.rect().contains(self.mapFromGlobal(QCursor.pos())):
             self._fade_play(0.0)
         super().leaveEvent(event)
 
@@ -239,17 +262,34 @@ class FrameView(QWidget):
         self._play.move(x, y)
         self._play.raise_()
 
+    def _caption(self, painter: QPainter, placed: QRect, text: str):
+        if not text or placed is None or placed.width() < 8:
+            return
+        metrics = painter.fontMetrics()
+        width = metrics.horizontalAdvance(text) + 14
+        height = metrics.height() + 8
+        box = QRect(placed.left() + 8, placed.top() + 8, width, height)
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QColor(0, 0, 0, 170))
+        painter.drawRect(box)
+        painter.setPen(QColor("#f4f4f4"))
+        painter.drawText(box, Qt.AlignmentFlag.AlignCenter, text)
+
     def paintEvent(self, _event):
         painter = QPainter(self)
         painter.fillRect(self.rect(), QColor("#111111"))
         if self._pix.isNull():
             painter.setPen(QColor("#aaaaaa"))
-            painter.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, "Elige una película Bayer.")
+            painter.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, self._empty)
             return
         left, right = self._placed()
         painter.drawPixmap(left, self._pix)
         if not self._side.isNull() and right is not None:
             painter.drawPixmap(right, self._side)
+        if self._captions:
+            self._caption(painter, left, self._captions[0])
+            if right is not None and len(self._captions) > 1:
+                self._caption(painter, right, self._captions[1])
         rect = self._draft or self._overlay
         if rect and left.width() > 0:
             painter.setPen(QPen(self._color, 2))
@@ -393,6 +433,7 @@ class RevealDialog(QDialog):
         self._current = None
         self._adjust = film_finish.empty()
         self._roi = None
+        self._roi_ref = None
         self._crop = None
         self._shifts = None
         self._pad = 0
@@ -515,20 +556,22 @@ class RevealDialog(QDialog):
         self.combo_engine.addItem("CPU", "cpu")
         self.combo_engine.addItem("GPU", "gpu")
         self.combo_engine.setToolTip(
-            "CPU: edge-aware y ProRes en el procesador. "
-            "GPU: NPP, curva, color, estabilización y recorte en la tarjeta."
+            "CPU: demosaico del SDK y la curva en el procesador. "
+            "GPU: demosaico NPP en la tarjeta, el promedio de vecinos del SDK. "
+            "La curva, el color, la estabilización y el recorte van también en la tarjeta."
         )
-        self.combo_engine.currentIndexChanged.connect(self._refresh_engine_note)
+        self.combo_engine.currentIndexChanged.connect(self._on_engine)
         layout.addWidget(self.combo_engine)
         self.lbl_engine = QLabel("")
         self.lbl_engine.setWordWrap(True)
         self.lbl_engine.setStyleSheet("color: #888; font-size: 9pt;")
         layout.addWidget(self.lbl_engine)
         self._rows = {}
-        self._add_slider(layout, "gain_r", "Ganancia rojo", 50, 250, 100, "1,00 es el balance de la cámara (rojo ×1,92). El verde queda en 1.")
-        self._add_slider(layout, "gain_b", "Ganancia azul", 50, 250, 100, "1,00 es el balance de la cámara (azul ×2,32). El verde queda en 1.")
-        self._add_slider(layout, "ev", "Exposición (EV)", -200, 200, 100, "Pasos de diafragma, antes de la curva.")
-        self._add_slider(layout, "shadow_b", "Sombras", 10, 400, 10, "Un número más alto abre las sombras. El blanco del sensor sigue en el blanco.")
+        self._add_slider(layout, "gain_r", "Ganancia rojo", 50, 250, 100, "1,00 deja el rojo del visor ISP. El verde queda en 1.")
+        self._add_slider(layout, "gain_b", "Ganancia azul", 50, 250, 100, "1,00 deja el azul del visor ISP. El verde queda en 1.")
+        self._add_slider(layout, "ev", "Exposición (EV)", -200, 200, 100, "Pasos de diafragma, antes de la gamma.")
+        self._add_slider(layout, "gamma", "Gamma", 50, 300, 100, "2,00 es la del visor de captura. Siempre se aplica. Un número más alto aclara.")
+        self._add_slider(layout, "shadow_b", "Sombras", 0, 400, 10, "0 deja solo la gamma. Un número más alto abre las sombras antes de esa gamma.")
         self._add_slider(layout, "shadow_lift", "Levante de negro", 0, 200, 1000, "Sube el negro sin mover el blanco.")
         self._add_slider(layout, "midtone", "Detalle de medios tonos", 0, 150, 100, "Contraste de frecuencias medias, sin afilar el grano fino.")
         layout.addStretch(1)
@@ -539,6 +582,7 @@ class RevealDialog(QDialog):
         layout = QVBoxLayout(page)
         note = QLabel(
             "Dibuja la zona alrededor de una perforación, sin el cuadro. "
+            "El cuadro en el que dibujas queda como referencia de toda la estabilización. "
             "Reproducir muestra cómo quedó el desplazamiento. "
             "El análisis sigue si cierras esta ventana."
         )
@@ -547,6 +591,14 @@ class RevealDialog(QDialog):
         self.chk_perfo = QCheckBox("Aplicar estabilización al exportar")
         self.chk_perfo.toggled.connect(lambda _on: self._save_current())
         layout.addWidget(self.chk_perfo)
+        self.chk_horizontal = QCheckBox("Eje horizontal")
+        self.chk_horizontal.setChecked(True)
+        self.chk_horizontal.setToolTip(
+            "Activado corrige de lado y de arriba abajo. "
+            "Desactivado deja solo el movimiento vertical. No vuelve a analizar."
+        )
+        self.chk_horizontal.toggled.connect(self._on_horizontal)
+        layout.addWidget(self.chk_horizontal)
         self.lbl_perfo = QLabel("Sin zona.")
         self.lbl_perfo.setWordWrap(True)
         layout.addWidget(self.lbl_perfo)
@@ -712,6 +764,13 @@ class RevealDialog(QDialog):
         self.chk_crop = QCheckBox("Aplicar este recorte al exportar")
         self.chk_crop.toggled.connect(self._paint_preview)
         layout.addWidget(self.chk_crop)
+        self.chk_flip = QCheckBox("Voltear horizontal")
+        self.chk_flip.setToolTip(
+            "Primero marcas el recuadro en la imagen. El volteo se aplica después, "
+            "sobre lo que se exporta, y esta vista lo muestra."
+        )
+        self.chk_flip.toggled.connect(self._on_flip)
+        layout.addWidget(self.chk_flip)
         self.lbl_crop = QLabel("Sin recorte.")
         self.lbl_crop.setWordWrap(True)
         layout.addWidget(self.lbl_crop)
@@ -995,15 +1054,22 @@ class RevealDialog(QDialog):
         self._refresh_labels()
         self._refresh_engine_note()
 
+    def _on_engine(self, *_args):
+        self._refresh_engine_note()
+        if self._lin_prev is not None:
+            self._load_frame()
+
     def _refresh_engine_note(self, *_args):
         if self.combo_engine.currentData() == "gpu":
             self.lbl_engine.setText(
-                "NPP, curva, GamMac, traslación y recorte en la tarjeta. "
-                "El ProRes 4444 XQ lo escribe la tarjeta. Esta vista sigue en el CPU."
+                "Esta vista y la exportación usan el mismo NPP: promedia vecinos, como el SDK. "
+                "La curva, GamMac, traslación y recorte van en la tarjeta. "
+                "Al pausar se ve el cuadro de la exportación. Gamma 2,00, ganancia 1,00 y sombras 0 igualan al visor."
             )
         else:
             self.lbl_engine.setText(
-                "Edge-aware en el CPU, con los workers del revelado. "
+                "Demosaico del SDK en el CPU, como el visor ISP. "
+                "Gamma 2,00, ganancia 1,00 y sombras 0 dejan ese tono. "
                 "El HEVC lossless codifica con NVENC."
             )
 
@@ -1031,7 +1097,9 @@ class RevealDialog(QDialog):
         self._timer.start()
 
     def _reset(self):
+        engine = self._collect().get("engine", "cpu")
         self._settings = reveal_pipeline.default_reveal()
+        self._settings["engine"] = engine
         self._load_sliders()
         self._mark_recipes_stale()
         self._paint_preview()
@@ -1097,7 +1165,8 @@ class RevealDialog(QDialog):
                 self._sigma_scale = self._preview_wh[0] / float(FIXED_W)
                 self._lin_prev = lin
             else:
-                lin = reveal_pipeline.debayer_linear(packed, FIXED_W, FIXED_H)
+                engine = self.combo_engine.currentData() or "cpu"
+                lin = reveal_pipeline.debayer_linear(packed, FIXED_W, FIXED_H, engine)
                 preview_w = min(_PREVIEW_W, FIXED_W)
                 self._sigma_scale = preview_w / float(FIXED_W)
                 small_h = max(1, int(round(FIXED_H * self._sigma_scale)))
@@ -1141,14 +1210,18 @@ class RevealDialog(QDialog):
                 if rect and rect[2] > 2 and rect[3] > 2:
                     x, y, width, height = rect
                     shown_img = shown_img[y:y + height, x:x + width]
+                if self._flip_on():
+                    shown_img = _hflip(shown_img)
                 shown = self._to_u8(shown_img)
                 overlay = None
                 side = None
                 allow = False
             else:
-                shown = self._to_u8(shown_img)
-                overlay = self._preview_rect(self._crop)
                 side = self._crop_side(shown_img)
+                overlay = self._preview_rect(self._shown_crop())
+                if self._flip_on():
+                    shown_img = _hflip(shown_img)
+                shown = self._to_u8(shown_img)
                 allow = True
             color = "#4cc9f0"
         else:
@@ -1209,6 +1282,8 @@ class RevealDialog(QDialog):
             if index < len(self._shifts[0]):
                 tx = self._shifts[0][index] * self._sigma_scale
                 ty = self._shifts[1][index] * self._sigma_scale
+        if not self.chk_horizontal.isChecked():
+            tx = 0.0
         degrees = self._turn_degrees()
         if abs(tx) < 1e-3 and abs(ty) < 1e-3 and abs(degrees) < 0.05:
             return image
@@ -1226,7 +1301,10 @@ class RevealDialog(QDialog):
         if not rect:
             return None
         x, y, width, height = rect
-        return self._to_u8(image[y:y + height, x:x + width])
+        crop = image[y:y + height, x:x + width]
+        if self._flip_on():
+            crop = _hflip(crop)
+        return self._to_u8(crop)
 
     def _to_u8(self, image) -> np.ndarray:
         return np.clip(image * np.float32(255.0) + np.float32(0.5), 0, 255).astype(np.uint8)
@@ -1261,9 +1339,16 @@ class RevealDialog(QDialog):
         full = self._full_rect(rect)
         if self._task == 1:
             self._roi = full
+            self._roi_ref = int(self.sld_frame.value())
             self.chk_perfo.setChecked(True)
-            self.lbl_perfo.setText(f"Zona {full[2]}×{full[3]} en {full[0]}, {full[1]}.")
+            self.lbl_perfo.setText(
+                f"Zona {full[2]}×{full[3]} en {full[0]}, {full[1]}."
+                f" Referencia: cuadro {self._roi_ref + 1}."
+            )
+            self._save_current()
         elif self._task == 3:
+            if self._flip_on():
+                full = film_finish.mirror_x(full, FIXED_W)
             self._crop = film_finish.snap_crop(full, FIXED_W, FIXED_H)
             self.chk_crop.setChecked(self._crop is not None)
         elif self._task == 2:
@@ -1281,14 +1366,21 @@ class RevealDialog(QDialog):
         self._adjust = film_finish.load(path) if self._current else film_finish.empty()
         perfo = self._adjust.get("perfo") or {}
         self._roi = tuple(perfo["roi"]) if perfo.get("roi") else None
+        self._roi_ref = film_finish.perfo_ref(perfo)
         self.chk_perfo.blockSignals(True)
         self.chk_perfo.setChecked(bool(perfo.get("enabled")))
         self.chk_perfo.blockSignals(False)
+        self.chk_horizontal.blockSignals(True)
+        self.chk_horizontal.setChecked(film_finish.perfo_horizontal(perfo))
+        self.chk_horizontal.blockSignals(False)
         crop = self._adjust.get("crop")
         self._crop = film_finish.snap_crop(crop, FIXED_W, FIXED_H) if crop else None
         self.chk_crop.blockSignals(True)
         self.chk_crop.setChecked(self._crop is not None)
         self.chk_crop.blockSignals(False)
+        self.chk_flip.blockSignals(True)
+        self.chk_flip.setChecked(bool(self._adjust.get("flip_h")))
+        self.chk_flip.blockSignals(False)
         self._segment = 0 if self._adjust["segments"] else -1
         self._load_shifts()
         self._sync_segment_controls()
@@ -1303,11 +1395,18 @@ class RevealDialog(QDialog):
         self._adjust["perfo"] = {
             "enabled": self.chk_perfo.isChecked() and self._roi is not None,
             "roi": list(self._roi) if self._roi else None,
+            "ref": self._roi_ref,
+            "horizontal": self.chk_horizontal.isChecked(),
         }
         self._adjust["crop"] = list(self._crop) if self.chk_crop.isChecked() and self._crop else None
         self._adjust["turn"] = round(self.sld_turn.value() / 10.0, 1)
+        self._adjust["flip_h"] = self.chk_flip.isChecked()
         film_finish.save(self._folder / self._current, self._adjust)
         self._refresh_review()
+
+    def _on_horizontal(self, _on):
+        self._save_current()
+        self._paint_preview()
 
     def _load_shifts(self):
         self._shifts = None
@@ -1332,14 +1431,15 @@ class RevealDialog(QDialog):
         if self._roi is None:
             self.lbl_perfo.setText("Sin zona.")
             return
+        ref = f" Referencia: cuadro {self._roi_ref + 1}." if self._roi_ref is not None else ""
         if status == "done":
-            text = f"Lista. Margen negro de {self._pad} px."
+            text = f"Lista. Margen negro de {self._pad} px.{ref}"
         elif status == "running":
-            text = f"En curso. {message}"
+            text = f"En curso. {message}{ref}"
         elif status == "error":
-            text = message or "Sin perforación."
+            text = (message or "Sin perforación.") + ref
         else:
-            text = "Zona guardada. Falta analizar."
+            text = f"Zona guardada. Falta analizar.{ref}"
         self.lbl_perfo.setText(text)
 
     def _analyze_one(self):
@@ -1363,6 +1463,20 @@ class RevealDialog(QDialog):
         if queued == 0:
             self.lbl_perfo.setText("No queda nada por medir. Los que ya están listos se dejan.")
 
+    def _saved_ref(self, name: str, data=None):
+        """Cuadro en el que se dibujó el rectángulo. None si ese archivo no lo tiene guardado."""
+        if name == self._current and self._roi_ref is not None:
+            return int(self._roi_ref)
+        if data is None and name:
+            data = film_finish.load(self._folder / name)
+        return film_finish.perfo_ref((data or {}).get("perfo") or {})
+
+    def _job_ref(self, name: str, data=None) -> int:
+        ref = self._saved_ref(name, data)
+        if ref is None and name == self._current:
+            return int(self.sld_frame.value())
+        return 0 if ref is None else int(ref)
+
     def _enqueue(self, name, roi=None, force: bool = False):
         if not name:
             return
@@ -1376,14 +1490,22 @@ class RevealDialog(QDialog):
             self._jobs.progress.connect(self._on_job)
             self._jobs.settled.connect(self._on_job_done)
         if name == self._current:
+            if self._roi_ref is None:
+                self._roi_ref = int(self.sld_frame.value())
             self.chk_perfo.setChecked(True)
             self._save_current()
         else:
             data = film_finish.load(self._folder / name)
-            data["perfo"] = {"enabled": True, "roi": list(zone)}
+            perfo = data.get("perfo") or {}
+            perfo["enabled"] = True
+            perfo["roi"] = list(zone)
+            known = self._saved_ref(name, data)
+            if known is not None:
+                perfo["ref"] = int(known)
+            data["perfo"] = perfo
             film_finish.save(self._folder / name, data)
         queued = self._jobs.enqueue(
-            self._folder / name, zone, int(self.sld_frame.value()), force=force,
+            self._folder / name, zone, self._job_ref(name), force=force,
         )
         if name == self._current:
             if queued:
@@ -1611,7 +1733,8 @@ class RevealDialog(QDialog):
                 packed = handle.read(frame_bytes)
             if len(packed) < frame_bytes:
                 return None
-            lin = reveal_pipeline.debayer_linear(packed, FIXED_W, FIXED_H)
+            engine = self.combo_engine.currentData() or "cpu"
+            lin = reveal_pipeline.debayer_linear(packed, FIXED_W, FIXED_H, engine)
             revealed = reveal_pipeline.apply_reveal(lin, self._collect(), 1.0)
             mode, _sat = self._grade_setting()
             if mode == "bw":
@@ -1637,6 +1760,8 @@ class RevealDialog(QDialog):
             text = "Dibuja el recorte sobre la imagen."
             if abs(turn) >= 0.05:
                 text += " Giro " + f"{turn:.1f}°".replace(".", ",") + "."
+            if self.chk_flip.isChecked():
+                text += " Volteado horizontal."
             self.lbl_crop.setText(text)
             return
         text = (
@@ -1648,7 +1773,21 @@ class RevealDialog(QDialog):
         turn = self.sld_turn.value() / 10.0
         if abs(turn) >= 0.05:
             text += " Giro " + f"{turn:.1f}°".replace(".", ",") + "."
+        if self.chk_flip.isChecked():
+            text += " Volteado horizontal."
         self.lbl_crop.setText(text)
+
+    def _flip_on(self) -> bool:
+        return self.chk_flip.isChecked()
+
+    def _shown_crop(self):
+        if not self._crop or not self._flip_on():
+            return self._crop
+        return film_finish.mirror_x(self._crop, FIXED_W)
+
+    def _on_flip(self, *_args):
+        self._save_current()
+        self._paint_preview()
 
     def _sync_turn(self):
         try:
