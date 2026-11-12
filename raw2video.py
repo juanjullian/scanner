@@ -451,12 +451,12 @@ def _append_ffmpeg_codec_args(cmd: list, codec: str) -> str:
         cmd += ['-c:v', 'prores_ks', '-profile:v', '4', '-vendor', 'apl0', '-qscale:v', '5', '-pix_fmt', 'yuv444p10le']
         return ".mov"
     if codec == 'prores_4444':
-        # Perfil 4444. Este FFmpeg escribe 10 bits 4:4:4; la curva ya es Rec.709.
+        # El revelado ya está horneado: 422 HQ, 10 bits. El id interno sigue siendo prores_4444.
         cmd += [
-            '-c:v', 'prores_ks', '-profile:v', '4', '-vendor', 'apl0',
-            '-qscale:v', '5', '-pix_fmt', 'yuv444p10le',
+            '-c:v', 'prores_ks', '-profile:v', '3', '-vendor', 'apl0',
+            '-qscale:v', '9', '-pix_fmt', 'yuv422p10le',
             '-colorspace', 'bt709', '-color_primaries', 'bt709', '-color_trc', 'bt709',
-            '-metadata', 'comment=Revelado Rec.709. Debayer edge-aware. Blanco del sensor = 1.',
+            '-metadata', 'comment=Revelado Rec.709. Debayer edge-aware. ProRes 422 HQ.',
         ]
         return ".mov"
     if codec == 'prores_hq':
@@ -1174,6 +1174,7 @@ def _start_gpu_reveal(codec, w, h, mode, finish=None):
     gpu = GpuReveal(
         settings, w, h, mode=mode, shift=shift, out_w=out_w, out_h=out_h,
         finish=finish if finish is not None and finish.active else None,
+        chroma422=codec == "prores_4444",
     )
     return gpu, out_w, out_h
 
@@ -1391,12 +1392,12 @@ def main():
             )
     if codec_name in ("exr",) or codec_name in REVEAL_CODECS:
         if grade_settings and grade_settings.get("enabled"):
-            print("INFO|La gradación del video no se aplica a EXR, ProRes 4444 ni HEVC lossless.")
+            print("INFO|La gradación del video no se aplica a EXR, ProRes 422 HQ ni HEVC lossless.")
         grade_settings = None
 
     if args.dng_dir:
         if codec_name not in REVEAL_CODECS:
-            print("ERROR|Una secuencia DNG solo se revela a ProRes 4444 o HEVC lossless.")
+            print("ERROR|Una secuencia DNG solo se revela a ProRes 422 HQ o HEVC lossless.")
             sys.exit(1)
         try:
             _export_dng_directory(args, codec_name)
@@ -1534,11 +1535,11 @@ def main():
         )
         if codec == "prores_4444" and reveal_gpu:
             print(
-                "INFO|ProRes 4444 en la tarjeta: NPP, revelado y codificador prores_nv."
+                "INFO|ProRes 422 HQ en la tarjeta: NPP, revelado y codificador prores_nv."
             )
         elif codec == "prores_4444":
             print(
-                "INFO|ProRes 4444 en Rec.709, 10 bits 4:4:4. "
+                "INFO|ProRes 422 HQ en Rec.709, 10 bits 4:2:2. "
                 "Demosaico del SDK y revelado en el CPU. Pipe directo a FFmpeg."
             )
         elif codec == "hevc_nvenc" and reveal_gpu:

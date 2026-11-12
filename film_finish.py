@@ -1,10 +1,11 @@
-"""Ajustes de un archivo: tramos de GamMac, perforación y recorte.
+"""Ajustes de un archivo: revelado, tramos de GamMac, perforación y recorte.
 
-El revelado sigue siendo uno para toda la exportación. Esto se guarda al lado
-del raw y se aplica al codificar, después del revelado.
+El revelado es de cada raw. Si ese archivo no tiene uno, la exportación usa
+el revelado general. Esto se guarda al lado del raw.
 """
 from __future__ import annotations
 
+import copy
 import json
 import time
 from pathlib import Path
@@ -34,6 +35,8 @@ def empty() -> dict:
         "grade": {"mode": "color", "sat": 1.0},
         "turn": 0.0,
         "flip_h": False,
+        "crop_spans": [],
+        "reveal": None,
     }
 
 
@@ -100,6 +103,10 @@ def load(raw: Path) -> dict:
         base["grade"] = _grade(data)
         base["turn"] = _turn(data)
         base["flip_h"] = bool(data.get("flip_h"))
+        spans = data.get("crop_spans") or []
+        base["crop_spans"] = [item for item in spans if isinstance(item, dict)]
+        reveal = data.get("reveal")
+        base["reveal"] = dict(reveal) if isinstance(reveal, dict) else None
     return base
 
 
@@ -109,7 +116,7 @@ def save(raw: Path, data: dict) -> None:
 
 
 def has_adjust(data: dict) -> bool:
-    """Hay color, recorte o zona de perforación para copiar."""
+    """Hay revelado, color, recorte o zona de perforación para copiar."""
     if data.get("crop"):
         return True
     if (data.get("perfo") or {}).get("roi"):
@@ -118,14 +125,31 @@ def has_adjust(data: dict) -> bool:
         return True
     if data.get("flip_h"):
         return True
+    for span in data.get("crop_spans") or []:
+        if isinstance(span, dict) and (span.get("crop") or span.get("flip_h")):
+            return True
+    if isinstance(data.get("reveal"), dict):
+        return True
     return bool(data.get("segments"))
 
 
+def file_reveal(raw: Path, fallback=None) -> dict:
+    """Revelado de este archivo. Si no tiene, el general que se pasa como respaldo."""
+    from reveal_pipeline import coerce_reveal
+    saved = load(raw).get("reveal")
+    return coerce_reveal(saved if isinstance(saved, dict) else fallback)
+
+
 def copy_adjust(src: Path, dst: Path) -> bool:
-    """Copia color, recorte y zona. No copia el desplazamiento medido de la perforación."""
+    """Copia revelado, color, recorte y zona. No copia el desplazamiento medido.
+
+    Si el origen no tiene revelado propio, el del destino se queda.
+    """
     data = load(src)
     if not has_adjust(data):
         return False
+    if not isinstance(data.get("reveal"), dict):
+        data["reveal"] = load(dst).get("reveal")
     save(dst, json.loads(json.dumps(data)))
     return True
 
@@ -362,6 +386,240 @@ def wait_perfo(raw: Path, timeout_idle: float = 45.0) -> dict | None:
         time.sleep(0.4)
 
 
+def cover(spans: list, count: int, blank) -> list:
+    """Parte el rollo en tramos que lo cubren entero, sin huecos ni superposición."""
+    last = max(0, int(count) - 1)
+    ordered = []
+    for span in spans or []:
+        if not isinstance(span, dict):
+            continue
+        start = max(0, min(int(span.get("in", 0)), last))
+        end = max(start, min(int(span.get("out", start)), last))
+        item = copy.deepcopy(span)
+        item["in"] = start
+        item["out"] = end
+        ordered.append(item)
+    ordered.sort(key=lambda item: int(item["in"]))
+    if not ordered:
+        return [blank(0, last)]
+    out = []
+    cursor = 0
+    for span in ordered:
+        start, end = int(span["in"]), int(span["out"])
+        if start > cursor:
+            out.append(blank(cursor, start - 1))
+        if start < cursor:
+            start = cursor
+            span["in"] = start
+        if start <= end:
+            out.append(span)
+            cursor = end + 1
+        if cursor > last:
+            break
+    if cursor <= last:
+        out.append(blank(cursor, last))
+    return out
+
+
+def retarget(spans: list, ranges: list) -> list:
+    """Arma tramos nuevos copiando el que contiene el cuadro del medio de cada rango."""
+    fresh = []
+    for start, end in ranges:
+        start, end = int(start), int(end)
+        mid = (start + end) // 2
+        source = None
+        for span in spans:
+            if int(span["in"]) <= mid <= int(span["out"]):
+                source = span
+                break
+        if source is None and spans:
+            source = spans[0]
+        item = copy.deepcopy(source) if source is not None else {}
+        item["in"] = start
+        item["out"] = end
+        fresh.append(item)
+    return fresh
+
+
+def split_at(spans: list, head: int, count: int):
+    """Corta el tramo en la cabeza. Las dos mitades salen con la misma copia."""
+    head = int(head)
+    if not spans:
+        return spans, 0, False
+    ranges = []
+    selected = 0
+    changed = False
+    for span in spans:
+        start, end = int(span["in"]), int(span["out"])
+        if start < head <= end:
+            ranges.append((start, head - 1))
+            ranges.append((head, end))
+            selected = len(ranges) - 1
+            changed = True
+        else:
+            ranges.append((start, end))
+            if start <= head <= end:
+                selected = len(ranges) - 1
+    if not changed:
+        return spans, selected, False
+    return retarget(spans, ranges), selected, True
+
+
+def carve(spans: list, start: int, end: int):
+    """Recorta un tramo nuevo dentro del que contiene el cuadro inicial. El resto se queda."""
+    start, end = int(start), int(end)
+    if end < start:
+        start, end = end, start
+    owner = None
+    owner_at = 0
+    for index, span in enumerate(spans):
+        if int(span["in"]) <= start <= int(span["out"]):
+            owner = span
+            owner_at = index
+            break
+    if owner is None:
+        return spans, 0, False
+    left, right = int(owner["in"]), int(owner["out"])
+    start = max(start, left)
+    end = min(end, right)
+    if start <= left and end >= right:
+        return spans, owner_at, False
+    ranges = []
+    selected = 0
+    for index, span in enumerate(spans):
+        if index != owner_at:
+            ranges.append((int(span["in"]), int(span["out"])))
+            continue
+        if start > left:
+            ranges.append((left, start - 1))
+        ranges.append((start, end))
+        selected = len(ranges) - 1
+        if end < right:
+            ranges.append((end + 1, right))
+    return retarget(spans, ranges), selected, True
+
+
+def move_edge(spans: list, edge: int, frame: int):
+    """Corre el borde compartido. Cada lado conserva al menos un cuadro."""
+    edge = int(edge)
+    if edge <= 0 or edge >= len(spans):
+        return spans, False
+    left, right = spans[edge - 1], spans[edge]
+    low = int(left["in"]) + 1
+    high = int(right["out"])
+    frame = max(low, min(int(frame), high))
+    if frame == int(right["in"]):
+        return spans, False
+    left["out"] = frame - 1
+    right["in"] = frame
+    return spans, True
+
+
+def merge_span(spans: list, index: int):
+    """Funde el tramo con el anterior. El anterior conserva su ajuste."""
+    if len(spans) <= 1:
+        return spans, 0, False
+    index = max(0, min(int(index), len(spans) - 1))
+    spans = [copy.deepcopy(item) for item in spans]
+    if index == 0:
+        spans[1]["in"] = int(spans[0]["in"])
+        del spans[0]
+        return spans, 0, True
+    spans[index - 1]["out"] = int(spans[index]["out"])
+    del spans[index]
+    return spans, index - 1, True
+
+
+def fit_aspect(rect, aspect: float, width: int, height: int, minimum: int = 8):
+    """El recuadro más grande con esa proporción que cabe en el gesto y en el cuadro."""
+    if not rect or len(rect) != 4 or aspect <= 0 or width < 2 or height < 2:
+        return None
+    x, y, rect_w, rect_h = (float(v) for v in rect)
+    if rect_w < 1 or rect_h < 1:
+        return None
+    center_x = x + rect_w / 2.0
+    center_y = y + rect_h / 2.0
+    if rect_w / rect_h > aspect:
+        rect_w = rect_h * aspect
+    else:
+        rect_h = rect_w / aspect
+    min_w = min(float(width), max(float(minimum), aspect * max(1.0, minimum / 2.0)))
+    if rect_w < min_w:
+        rect_w = min_w
+        rect_h = rect_w / aspect
+    if rect_w > width:
+        rect_w = float(width)
+        rect_h = rect_w / aspect
+    if rect_h > height:
+        rect_h = float(height)
+        rect_w = rect_h * aspect
+    rect_w = max(1.0, min(rect_w, float(width)))
+    rect_h = max(1.0, min(rect_h, float(height)))
+    rect_h = rect_w / aspect
+    if rect_h > height:
+        rect_h = float(height)
+        rect_w = rect_h * aspect
+    x = min(max(0.0, center_x - rect_w / 2.0), width - rect_w)
+    y = min(max(0.0, center_y - rect_h / 2.0), height - rect_h)
+    snapped_w = max(1, int(round(rect_w)))
+    snapped_h = max(1, int(round(snapped_w / aspect)))
+    if snapped_h > height:
+        snapped_h = int(height)
+        snapped_w = max(1, int(round(snapped_h * aspect)))
+    if snapped_w > width:
+        snapped_w = int(width)
+        snapped_h = max(1, int(round(snapped_w / aspect)))
+    origin_x = min(max(0, int(round(x))), width - snapped_w)
+    origin_y = min(max(0, int(round(y))), height - snapped_h)
+    return origin_x, origin_y, snapped_w, snapped_h
+
+
+def place_box(center_x: float, center_y: float, rect_w: float, rect_h: float, width: int, height: int):
+    rect_w = max(1.0, min(float(rect_w), float(width)))
+    rect_h = max(1.0, min(float(rect_h), float(height)))
+    x = min(max(0.0, center_x - rect_w / 2.0), width - rect_w)
+    y = min(max(0.0, center_y - rect_h / 2.0), height - rect_h)
+    return int(round(x)), int(round(y)), max(1, int(round(rect_w))), max(1, int(round(rect_h)))
+
+
+def refit_crops(spans: list, old, new, width: int, height: int) -> list:
+    """El primer recorte cambia de tamaño. Los demás conservan el centro y la escala."""
+    if not spans or not new:
+        return spans
+    old_w = float(old[2]) if old else float(new[2])
+    spans[0]["crop"] = [int(v) for v in new]
+    for span in spans[1:]:
+        crop = span.get("crop") or old or new
+        scale = (float(crop[2]) / old_w) if old_w else 1.0
+        center_x = float(crop[0]) + float(crop[2]) / 2.0
+        center_y = float(crop[1]) + float(crop[3]) / 2.0
+        span["crop"] = list(place_box(
+            center_x, center_y, float(new[2]) * scale, float(new[3]) * scale, width, height,
+        ))
+    return spans
+
+
+def clip_box(crop, width: int, height: int):
+    """Mete el recuadro en el cuadro sin cambiar la proporción más de lo que pide el borde."""
+    if not crop or len(crop) != 4 or width < 2 or height < 2:
+        return None
+    x, y, rect_w, rect_h = (int(round(v)) for v in crop)
+    if rect_w < 1 or rect_h < 1:
+        return None
+    aspect = rect_w / float(rect_h)
+    if rect_w > width:
+        rect_w = width
+        rect_h = max(1, int(round(rect_w / aspect)))
+    if rect_h > height:
+        rect_h = height
+        rect_w = max(1, int(round(rect_h * aspect)))
+    x = min(max(0, x), width - rect_w)
+    y = min(max(0, y), height - rect_h)
+    if x == 0 and y == 0 and rect_w == width and rect_h == height:
+        return None
+    return int(x), int(y), int(rect_w), int(rect_h)
+
+
 class Finish:
     """Lo que el codificador aplica a cada cuadro ya revelado."""
 
@@ -376,6 +634,10 @@ class Finish:
         self.tx = list((side or {}).get("tx") or []) if side and side.get("status") == "done" else []
         self.ty = list((side or {}).get("ty") or []) if side and side.get("status") == "done" else []
         self.crop = _clip_crop(self.data.get("crop"))
+        self.flip_h = bool(self.data.get("flip_h"))
+        self.crop_spans = _finish_spans(self.data, self.crop, self.flip_h)
+        if self.crop is None and self.crop_spans:
+            self.crop = _clip_crop(self.crop_spans[0].get("crop"))
         self.segments = [
             item for item in self.data["segments"]
             if (item.get("recipe") or {}).get("ok") and not (item.get("recipe") or {}).get("limited")
@@ -384,20 +646,20 @@ class Finish:
         self.grade_mode = grade["mode"]
         self.grade_sat = grade["sat"]
         self.turn = _turn(self.data)
-        self.flip_h = bool(self.data.get("flip_h"))
         self.horizontal = perfo_horizontal(self.data.get("perfo"))
 
     @property
     def active(self) -> bool:
         graded = self.grade_mode == "bw" or self.grade_sat < 0.999
         turned = abs(self.turn) >= 0.05
-        return bool(self.segments or self.tx or self.crop or graded or turned or self.flip_h)
+        flipped = self.flip_h or any(bool(span.get("flip_h")) for span in self.crop_spans)
+        return bool(self.segments or self.tx or self.crop or graded or turned or flipped)
 
     def sampling(self, index: int, width: int, height: int):
         tx, ty = self.shift_at(index)
         if abs(tx) < 1e-4 and abs(ty) < 1e-4 and abs(self.turn) < 0.05:
             return None
-        box = self.crop_box(width, height)
+        box = self.crop_box(width, height, index)
         if box:
             center = (box[0] + box[2] / 2.0, box[1] + box[3] / 2.0)
         else:
@@ -414,8 +676,32 @@ class Finish:
         even_h = max(2, ch - (ch % 2))
         return even_w, even_h
 
-    def crop_box(self, width: int, height: int):
-        return _clip_crop(self.crop, width, height)
+    def _span_at(self, index: int):
+        if not self.crop_spans:
+            return None
+        index = int(index)
+        for span in self.crop_spans:
+            if int(span["in"]) <= index <= int(span["out"]):
+                return span
+        if index > int(self.crop_spans[-1]["out"]):
+            return self.crop_spans[-1]
+        return self.crop_spans[0]
+
+    def flip_at(self, index: int) -> bool:
+        span = self._span_at(index)
+        if span is None:
+            return self.flip_h
+        return bool(span.get("flip_h"))
+
+    def crop_box(self, width: int, height: int, index: int | None = None):
+        if index is None or not self.crop_spans:
+            return _clip_crop(self.crop, width, height)
+        span = self._span_at(index)
+        if span is None:
+            return _clip_crop(self.crop, width, height)
+        if span is self.crop_spans[0]:
+            return _clip_crop(span.get("crop"), width, height)
+        return clip_box(span.get("crop"), width, height)
 
     def recipe_at(self, index: int) -> dict | None:
         return gammac.recipe_at(self.segments, int(index))
@@ -448,10 +734,44 @@ class Finish:
         if out_wh is None:
             cropped = work
         else:
-            cropped = _crop_pad(work, self.crop_box(work.shape[1], work.shape[0]), out_wh)
-        if self.flip_h:
+            master = self.crop_box(width, height)
+            box = self.crop_box(width, height, index)
+            used = box if box is not None else master
+            other_size = (
+                used is not None and master is not None
+                and (used[2], used[3]) != (master[2], master[3])
+            )
+            if other_size:
+                cropped = _crop_scale(work, used, out_wh)
+            else:
+                cropped = _crop_pad(work, used, out_wh)
+        if self.flip_at(index):
             cropped = np.ascontiguousarray(cropped[:, ::-1])
         return cropped
+
+
+def _finish_spans(data: dict, crop, flip_h: bool) -> list:
+    """Sin el recorte de arriba no se exporta ninguno. Un archivo viejo es un solo tramo."""
+    if not crop and not data.get("crop"):
+        return []
+    spans = [item for item in (data.get("crop_spans") or []) if isinstance(item, dict) and item.get("crop")]
+    if spans:
+        return spans
+    if not data.get("crop"):
+        return []
+    return [{"in": 0, "out": 10**12, "crop": data.get("crop"), "flip_h": flip_h}]
+
+
+def _crop_scale(image: np.ndarray, box, out_wh: tuple[int, int]) -> np.ndarray:
+    """Escala el recorte al tamaño único del archivo. La proporción ya es la del primero."""
+    out_w, out_h = out_wh
+    x, y, rect_w, rect_h = box
+    cropped = image[y:y + rect_h, x:x + rect_w]
+    if cropped.shape[1] == out_w and cropped.shape[0] == out_h:
+        return np.ascontiguousarray(cropped)
+    shrink = cropped.shape[1] > out_w or cropped.shape[0] > out_h
+    interp = cv2.INTER_AREA if shrink else cv2.INTER_LINEAR
+    return np.ascontiguousarray(cv2.resize(cropped, (out_w, out_h), interpolation=interp))
 
 
 def snap_crop(crop, width: int = FULL_W, height: int = FULL_H):

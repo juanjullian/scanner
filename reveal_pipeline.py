@@ -66,7 +66,7 @@ def coerce_reveal(data) -> dict:
 def summary_line(settings: dict) -> str:
     s = coerce_reveal(settings)
     return (
-        f"Revelado 4444 guardado: rojo {s['gain_r']:.2f}, azul {s['gain_b']:.2f}, "
+        f"Revelado guardado: rojo {s['gain_r']:.2f}, azul {s['gain_b']:.2f}, "
         f"EV {s['ev']:+.2f}, gamma {s['gamma']:.2f}, sombras {s['shadow_b']:.0f}, detalle {s['midtone']:.2f}, "
         f"{'en la GPU' if s['engine'] == 'gpu' else 'en el CPU'}"
     )

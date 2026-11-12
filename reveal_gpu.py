@@ -1,4 +1,4 @@
-"""Revelado en la GPU para ProRes 4444 y HEVC lossless.
+"""Revelado en la GPU para ProRes 422 HQ y HEVC lossless.
 
 El cuadro empaquetado sube tal cual. En la tarjeta se desempaqueta, corre
 el demosaico NPP, la curva, el detalle y el YUV. El ProRes lo escribe
@@ -34,23 +34,23 @@ _CUPY_SITE = Path(
 )
 
 _YUV = r"""
-extern "C" __global__
-void rgb01_to_yuv10(const float* __restrict__ rgb, unsigned short* __restrict__ y,
-                    unsigned short* __restrict__ u, unsigned short* __restrict__ v,
-                    int width, int height, int out_w, int out_h, int shift,
-                    int crop_x, int crop_y, int crop_w, int crop_h, int flip) {
-    int x = blockIdx.x * blockDim.x + threadIdx.x;
-    int yy = blockIdx.y * blockDim.y + threadIdx.y;
-    if (x >= out_w || yy >= out_h) return;
-    int local = x;
-    if (flip) {
-        local = x < crop_w ? crop_w - 1 - x : 0;
-    } else if (x >= crop_w) {
-        local = crop_w - 1;
-    }
-    int sx = crop_x + local;
-    int sy = crop_y + yy;
-    if (yy >= crop_h) sy = crop_y + crop_h - 1;
+__device__ void sample10(const float* rgb, int width, int height,
+                         int out_w, int out_h, int x, int yy,
+                         int crop_x, int crop_y, int crop_w, int crop_h, int flip,
+                         int* Y10, int* U10, int* V10) {
+    float crop_wf = (float)crop_w;
+    float crop_hf = (float)crop_h;
+    if (crop_wf < 1.f) crop_wf = 1.f;
+    if (crop_hf < 1.f) crop_hf = 1.f;
+    float fx = ((float)x + 0.5f) * crop_wf / (float)out_w - 0.5f;
+    float fy = ((float)yy + 0.5f) * crop_hf / (float)out_h - 0.5f;
+    if (flip) fx = (crop_wf - 1.f) - fx;
+    int sx = crop_x + (int)rintf(fx);
+    int sy = crop_y + (int)rintf(fy);
+    if (sx < crop_x) sx = crop_x;
+    if (sy < crop_y) sy = crop_y;
+    if (sx >= crop_x + crop_w) sx = crop_x + crop_w - 1;
+    if (sy >= crop_y + crop_h) sy = crop_y + crop_h - 1;
     if (sx < 0) sx = 0;
     if (sy < 0) sy = 0;
     if (sx >= width) sx = width - 1;
@@ -62,16 +62,50 @@ void rgb01_to_yuv10(const float* __restrict__ rgb, unsigned short* __restrict__ 
     float Y01 = 0.2126f * R + 0.7152f * G + 0.0722f * B;
     float Cb = (B - Y01) / (2.f * (1.f - 0.0722f));
     float Cr = (R - Y01) / (2.f * (1.f - 0.2126f));
-    int Y10 = (int)rintf(Y01 * 879.f + 64.f);
-    int U10 = (int)rintf(Cb * 899.5f + 512.f);
-    int V10 = (int)rintf(Cr * 899.5f + 512.f);
-    if (Y10 < 0) Y10 = 0; else if (Y10 > 1023) Y10 = 1023;
-    if (U10 < 0) U10 = 0; else if (U10 > 1023) U10 = 1023;
-    if (V10 < 0) V10 = 0; else if (V10 > 1023) V10 = 1023;
+    int yv = (int)rintf(Y01 * 879.f + 64.f);
+    int uv = (int)rintf(Cb * 899.5f + 512.f);
+    int vv = (int)rintf(Cr * 899.5f + 512.f);
+    if (yv < 0) yv = 0; else if (yv > 1023) yv = 1023;
+    if (uv < 0) uv = 0; else if (uv > 1023) uv = 1023;
+    if (vv < 0) vv = 0; else if (vv > 1023) vv = 1023;
+    *Y10 = yv;
+    *U10 = uv;
+    *V10 = vv;
+}
+
+extern "C" __global__
+void rgb01_to_yuv10(const float* __restrict__ rgb, unsigned short* __restrict__ y,
+                    unsigned short* __restrict__ u, unsigned short* __restrict__ v,
+                    int width, int height, int out_w, int out_h, int shift,
+                    int crop_x, int crop_y, int crop_w, int crop_h, int flip, int half) {
+    int x = blockIdx.x * blockDim.x + threadIdx.x;
+    int yy = blockIdx.y * blockDim.y + threadIdx.y;
+    if (x >= out_w || yy >= out_h) return;
+    int Y10, U10, V10;
+    sample10(rgb, width, height, out_w, out_h, x, yy,
+             crop_x, crop_y, crop_w, crop_h, flip, &Y10, &U10, &V10);
     int o = yy * out_w + x;
     y[o] = (unsigned short)(Y10 << shift);
-    u[o] = (unsigned short)(U10 << shift);
-    v[o] = (unsigned short)(V10 << shift);
+    if (half) {
+        if ((x & 1) == 0) {
+            int U2 = U10;
+            int V2 = V10;
+            int x2 = x + 1;
+            if (x2 < out_w) {
+                int Yb, Ub, Vb;
+                sample10(rgb, width, height, out_w, out_h, x2, yy,
+                         crop_x, crop_y, crop_w, crop_h, flip, &Yb, &Ub, &Vb);
+                U2 = Ub;
+                V2 = Vb;
+            }
+            int co = yy * (out_w >> 1) + (x >> 1);
+            u[co] = (unsigned short)((((U10 + U2 + 1) >> 1) << shift));
+            v[co] = (unsigned short)((((V10 + V2 + 1) >> 1) << shift));
+        }
+    } else {
+        u[o] = (unsigned short)(U10 << shift);
+        v[o] = (unsigned short)(V10 << shift);
+    }
 }
 """
 
@@ -397,10 +431,13 @@ def open_prores_nv(dst, out_w: int, out_h: int, fps: int, *, stderr=None, rate=N
         raise RuntimeError(f"No está el FFmpeg con prores_nv: {FFMPEG_NV}")
     cmd = [
         str(FFMPEG_NV), "-y", "-f", "rawvideo", "-vcodec", "rawvideo",
-        "-s", f"{out_w}x{out_h}", "-pix_fmt", "yuv444p10le",
+        "-s", f"{out_w}x{out_h}", "-pix_fmt", "yuv422p10le",
+        "-color_range", "tv", "-colorspace", "bt709",
+        "-color_primaries", "bt709", "-color_trc", "bt709",
         "-r", str(int(fps) if rate is None else rate), "-i", "pipe:0",
-        "-c:v", "prores_nv", "-profile:v", "4444", "-q:v", "5",
-        "-pix_fmt", "yuv444p10le",
+        "-c:v", "prores_nv", "-profile:v", "hq",
+        "-pix_fmt", "yuv422p10le",
+        "-colorspace", "bt709", "-color_primaries", "bt709", "-color_trc", "bt709",
         str(dst),
     ]
     env = os.environ.copy()
@@ -418,7 +455,7 @@ class GpuReveal:
 
     def __init__(self, settings: dict, width: int, height: int, mode: str = "COLOR",
                  shift: int = 0, out_w: int | None = None, out_h: int | None = None,
-                 finish=None):
+                 finish=None, chroma422: bool = False):
         cp = prepare()
         from cupyx.scipy.ndimage import gaussian_filter
 
@@ -433,6 +470,11 @@ class GpuReveal:
         self.out_w = int(out_w or self.width)
         self.out_h = int(out_h or self.height)
         self.shift = int(shift)
+        self.chroma422 = bool(chroma422)
+        if self.chroma422 and self.out_w % 2:
+            raise RuntimeError(
+                f"El 4:2:2 pide un ancho par. Esta salida es {self.out_w}x{self.out_h}."
+            )
         self.bw = mode == "BW"
         self.finish = finish
         self.amount = float(settings["midtone"])
@@ -462,10 +504,11 @@ class GpuReveal:
         self.fine = cp.empty((self.height, self.width), dtype=cp.float32)
         self.coarse = cp.empty((self.height, self.width), dtype=cp.float32)
         n = self.out_w * self.out_h
+        self._chroma_n = (self.out_w // 2) * self.out_h if self.chroma422 else n
         self.yp = cp.empty(n, dtype=cp.uint16)
-        self.up = cp.empty(n, dtype=cp.uint16)
-        self.vp = cp.empty(n, dtype=cp.uint16)
-        self.host = np.empty(n * 3, dtype=np.uint16)
+        self.up = cp.empty(self._chroma_n, dtype=cp.uint16)
+        self.vp = cp.empty(self._chroma_n, dtype=cp.uint16)
+        self.host = np.empty(n + 2 * self._chroma_n, dtype=np.uint16)
         self.pairs = self.width * self.height // 2
         self.n = self.width * self.height
         self.even = True
@@ -578,7 +621,9 @@ class GpuReveal:
         cp = self.cp
         src = self._finish_on_device(index)
         self._view = src
+        self._index = int(index)
         crop_x, crop_y, crop_w, crop_h = self._crop_args()
+        flipped = self.finish is not None and self.finish.flip_at(index)
         self.yuv(
             ((self.out_w + 15) // 16, (self.out_h + 15) // 16), (16, 16),
             (
@@ -586,13 +631,15 @@ class GpuReveal:
                 np.int32(self.width), np.int32(self.height),
                 np.int32(self.out_w), np.int32(self.out_h), np.int32(self.shift),
                 np.int32(crop_x), np.int32(crop_y), np.int32(crop_w), np.int32(crop_h),
-                np.int32(1 if self.finish is not None and self.finish.flip_h else 0),
+                np.int32(1 if flipped else 0),
+                np.int32(1 if self.chroma422 else 0),
             ),
         )
         n = self.out_w * self.out_h
+        c = self._chroma_n
         self.host[:n] = cp.asnumpy(self.yp)
-        self.host[n:n * 2] = cp.asnumpy(self.up)
-        self.host[n * 2:] = cp.asnumpy(self.vp)
+        self.host[n:n + c] = cp.asnumpy(self.up)
+        self.host[n + c:] = cp.asnumpy(self.vp)
         return self.host.tobytes()
 
     def preview_rgb(self) -> np.ndarray | None:
@@ -610,13 +657,13 @@ class GpuReveal:
         step = max(1, int(max(width, height) / 160))
         small = view[y:y + height:step, x:x + width:step]
         rgb = cp.asnumpy(cp.clip(small * cp.float32(255.0) + cp.float32(0.5), 0, 255).astype(cp.uint8))
-        if self.finish is not None and self.finish.flip_h:
+        if self.finish is not None and self.finish.flip_at(getattr(self, "_index", 0)):
             rgb = np.ascontiguousarray(rgb[:, ::-1])
         return rgb
 
     def _crop_args(self) -> tuple[int, int, int, int]:
         if self.finish is not None:
-            box = self.finish.crop_box(self.width, self.height)
+            box = self.finish.crop_box(self.width, self.height, getattr(self, "_index", 0))
             if box is not None:
                 return box
         return 0, 0, self.width, self.height

@@ -49,6 +49,7 @@ def _export_gpu(path, dst, codec, fps_text, info, finish, out_w, out_h, cancel, 
         gpu = GpuReveal(
             coerce_reveal({}), info.width, info.height, mode="COLOR",
             shift=shift, out_w=out_w, out_h=out_h, finish=finish,
+            chroma422=codec == "prores_4444",
         )
     except Exception as exc:
         raise VideoError(f"No pude usar la tarjeta. {exc}") from exc

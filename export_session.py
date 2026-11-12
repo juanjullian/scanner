@@ -32,7 +32,7 @@ BAYER_GROUPS = [
     ("RAW", [("dng", "DNG Raw Sequence (16-bit)")]),
     ("Secuencia de imágenes", [("exr", "EXR lineal (half)")]),
     ("Revelado Rec.709", [
-        ("prores_4444", "ProRes 4444"),
+        ("prores_4444", "ProRes 422 HQ"),
         ("hevc_nvenc", "HEVC 4:4:4 lossless NVENC"),
     ]),
     ("Video con gamma", [
@@ -81,11 +81,11 @@ _HINTS = {
     ),
     "tiff_seq": "TIFF de 8 bits, fiel al ISP de la cámara. Sin revelado ni gradación.",
     "prores_4444": (
-        "ProRes 4444 con el revelado Rec.709. "
+        "ProRes 422 HQ con el revelado Rec.709, 10 bits 4:2:2. "
         "Abre los ajustes en cada archivo antes de exportar."
     ),
     "hevc_nvenc": (
-        "HEVC 4:4:4 lossless por la GPU, con el mismo revelado del ProRes 4444. "
+        "HEVC 4:4:4 lossless por la GPU, con el mismo revelado. "
         "Abre los ajustes en cada archivo antes de exportar."
     ),
 }
@@ -154,6 +154,8 @@ def draft_for_file(filename: str, collection_meta: dict, fmt: str) -> dict:
             test_export = bool(entry["test_export"])
         if entry.get("sharp"):
             sharp = str(entry["sharp"])
+    if fmt == "prores_4444" and Path(output_name).name == f"{Path(filename).stem}_prores_4444.mov":
+        output_name = default_output_name(Path(filename).stem, fmt)
     return {
         "output_name": output_name,
         "grade": grade,
@@ -414,8 +416,8 @@ class ExportSessionDialog(QDialog):
         self.lbl_reveal.setWordWrap(True)
         reveal_lay.addWidget(self.lbl_reveal)
         reveal_note = QLabel(
-            "El revelado es uno para todos los archivos. "
-            "El color, la perforación y el recorte son de cada uno."
+            "Cada archivo guarda su propio revelado. "
+            "El color, la perforación y el recorte también."
         )
         reveal_note.setWordWrap(True)
         reveal_note.setStyleSheet("color: #999; font-size: 10pt;")
@@ -855,12 +857,12 @@ class ExportSessionDialog(QDialog):
         if not has_adjust(load(src)):
             QMessageBox.information(
                 self, "Sin ajustes",
-                "Este clip no tiene color, recorte ni zona de perforación para copiar.",
+                "Este clip no tiene revelado, color, recorte ni zona de perforación para copiar.",
             )
             return
         answer = QMessageBox.question(
             self, "Copiar ajustes",
-            f"Se copian el color, el recorte y la zona de perforación de {filename} "
+            f"Se copian el revelado, el color, el recorte y la zona de perforación de {filename} "
             f"a los otros {len(others)} clips. El desplazamiento ya medido de cada uno no se toca.",
         )
         if answer != QMessageBox.StandardButton.Yes:
@@ -882,20 +884,19 @@ class ExportSessionDialog(QDialog):
         self._refresh_finish_labels()
         if not accepted:
             return
-        self._reveal = dialog.settings()
         reference = dialog.reference_name()
         if reference:
             self._reveal_seen.add(reference)
-        host = self.parent()
-        if host is not None and hasattr(host, "_persist"):
-            host._persist["reveal"] = self._reveal
-            if hasattr(host, "save_config"):
-                host.save_config()
         self._refresh_reveal_label()
 
     def _refresh_reveal_label(self):
-        from reveal_pipeline import summary_line
-        self.lbl_reveal.setText(summary_line(self._reveal))
+        from reveal_pipeline import coerce_reveal
+        saved = coerce_reveal(self._reveal)
+        self.lbl_reveal.setText(
+            "Cada archivo guarda su revelado. Los que todavía no tienen usan el general: "
+            f"rojo {saved['gain_r']:.2f}, azul {saved['gain_b']:.2f}, "
+            f"EV {saved['ev']:+.2f}, gamma {saved['gamma']:.2f}."
+        )
 
     def _refresh_finish_labels(self):
         if not format_options(self._fmt, self.source_is_processed)["reveal"]:

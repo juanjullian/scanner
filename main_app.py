@@ -2361,7 +2361,7 @@ class MainWindow(QMainWindow):
                 ui_parent,
                 "Aviso de formato",
                 f"\"{nf.name}\" fue capturado en RGB ya revelado.\n"
-                "EXR lineal, ProRes 4444 y HEVC lossless solo salen de un RAW Bayer.",
+                "EXR lineal, ProRes 422 HQ y HEVC lossless solo salen de un RAW Bayer.",
             )
             if session is not None:
                 session.note_file_finished(nf.name, False, "Este archivo no es RAW Bayer.")
@@ -2414,8 +2414,8 @@ class MainWindow(QMainWindow):
         ):
             cmd.extend(["--grade", json.dumps(grade)])
         if effective_fmt in ("prores_4444", "hevc_nvenc"):
-            from reveal_pipeline import coerce_reveal
-            cmd.extend(["--reveal", json.dumps(coerce_reveal(self._persist.get("reveal")))])
+            from film_finish import file_reveal
+            cmd.extend(["--reveal", json.dumps(file_reveal(nf, self._persist.get("reveal")))])
 
         if settings and settings.get("test_export"):
             from export_grade import TEST_EXPORT_SKIP_FRAMES, TEST_EXPORT_FRAME_COUNT
@@ -2643,7 +2643,7 @@ class DngRevealDialog(QDialog):
         form = QHBoxLayout()
         form.addWidget(QLabel("Codec"))
         self.codec = QComboBox()
-        self.codec.addItem("ProRes 4444", "prores_4444")
+        self.codec.addItem("ProRes 422 HQ", "prores_4444")
         self.codec.addItem("HEVC 4:4:4 lossless NVENC", "hevc_nvenc")
         form.addWidget(self.codec, 1)
         form.addWidget(QLabel("FPS"))

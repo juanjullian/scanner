@@ -97,6 +97,8 @@ def default_output_name(stem: str, fmt: str) -> str:
         return f"{stem}_EXR_SEQ"
     if fmt == "tif":
         return stem
+    if fmt == "prores_4444":
+        return f"{stem}_prores_422hq.mov"
     ext = _EXT_MAP.get(fmt, ".mp4")
     return f"{stem}_{fmt}{ext}"
 
@@ -1227,14 +1229,13 @@ class ExportConfirmDialog(QDialog):
             )
         elif fmt == "prores_4444":
             info_text = (
-                "ProRes 4444 con el revelado guardado. La imagen ya queda en Rec.709. "
-                "Los cuadros rosados cortos se descartan. "
-                "Este FFmpeg escribe el perfil 4444 en 10 bits 4:4:4. "
+                "ProRes 422 HQ con el revelado guardado. La imagen ya queda en Rec.709, "
+                "10 bits 4:2:2. Los cuadros rosados cortos se descartan. "
                 "Marca Prueba para exportar solo un tramo."
             )
         elif fmt == "hevc_nvenc":
             info_text = (
-                "HEVC 4:4:4 lossless por la GPU, con el mismo revelado guardado del ProRes 4444. "
+                "HEVC 4:4:4 lossless por la GPU, con el mismo revelado guardado. "
                 "La imagen queda en Rec.709, 10 bits, sin pérdida en el codec. "
                 "Los cuadros rosados cortos se descartan. "
                 "Marca Prueba para exportar solo un tramo."

@@ -1,5 +1,21 @@
 # Bitácora — Lucid Scanner
 
+## 2026-11-12 — Revelado por archivo, tramos y ProRes 422 HQ
+
+### Por qué
+El revelado era uno para toda la colección: ajustar un rollo cambiaba la exportación de los demás. Un recorte y un color no alcanzan para un rollo largo. El master de visionado iba en ProRes 4444, pero el revelado ya queda horneado a 10 bits y el 4:4:4 no guardaba bits de más: el archivo pesaba más sin margen para volver a gradar. Al pasar a 422 HQ, el FFmpeg de la tarjeta no tiene el filtro `scale`. Convertir de 4:4:4 a 4:2:2 cortaba al tiro, y marcar Rec.709 solo en la salida hacía lo mismo aunque el formato ya coincidiera. Grob_007 a Grob_010 salieron en 0 bytes.
+
+### Cómo
+- El revelado de cada raw queda en su `adjust.json`. Si el archivo no tiene, se usa el revelado general. Copiar ajustes lleva el revelado solo cuando el origen lo tiene; si no, el destino conserva el suyo. El diálogo ya no lo escribe de vuelta al persist.
+- Color y recorte tienen una pista. El rollo parte cubierto por un tramo. La línea blanca es el cuadro. Partir corta donde está la línea y las dos partes salen iguales. Unir funde con el anterior, que conserva su ajuste. Se puede acercar, alejar y ver el rollo entero. El primer recorte fija la proporción y el tamaño del video. Los siguientes se mueven y escalan con esa proporción, y el volteo es de cada tramo. Un tramo viejo de un solo cuadro, al abrirlo, pasa a cubrir el rollo. Lo mismo en el acabado de videos ya revelados.
+- El revelado Rec.709 exporta ProRes 422 HQ, 10 bits 4:2:2. El id interno sigue siendo `prores_4444` para no romper lo ya guardado. El nombre nuevo es `*_prores_422hq.mov`. En CPU va `prores_ks`, perfil HQ. En GPU va `prores_nv`, perfil hq, etiqueta `apch`. El video con gamma sigue en 4444, aparte de este revelado.
+- La GPU escribe el 4:2:2: la luma de cada píxel y el color promediado de a pares horizontales. La tubería entra y sale en `yuv422p10le`, rango TV y Rec.709 ya en la entrada, así ese FFmpeg no inserta conversión.
+
+### Hecho
+- Cada archivo guarda su revelado.
+- El rollo se parte en tramos de color y de recorte, con la proporción trabada en el primero.
+- El master sale en ProRes 422 HQ. Un cuadro de 2720×1984, el tamaño de Grob_010, codificó `apch` sin el error de `scale`. Grob_007 a Grob_010 hay que exportarlos de nuevo: no se escribió nada.
+
 ## 2026-11-11 — Eje horizontal, videos ya revelados y demosaico del SDK
 
 ### Por qué

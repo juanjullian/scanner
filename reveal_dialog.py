@@ -11,9 +11,11 @@ import time
 from PyQt6.QtGui import QColor, QCursor, QImage, QPainter, QPainterPath, QPen, QPixmap
 from PyQt6.QtWidgets import (
     QCheckBox, QComboBox, QDialog, QFrame, QGraphicsOpacityEffect, QHBoxLayout,
-    QLabel, QPushButton, QScrollArea, QSizePolicy, QSlider, QStackedWidget,
-    QVBoxLayout, QWidget,
+    QLabel, QLineEdit, QPushButton, QScrollArea, QSizePolicy, QSlider, QSplitter,
+    QStackedWidget, QVBoxLayout, QWidget,
 )
+
+from timeline_bar import TimelineBar, _timeline_button
 
 import film_finish
 import gammac
@@ -182,6 +184,11 @@ class FrameView(QWidget):
         self._allow = False
         self._origin = None
         self._draft = None
+        self._aspect = None
+        self._mode = None
+        self._anchor = None
+        self._grab = None
+        self._grab_rect = None
         self._split = 0
         self._captions = ()
         self._empty = "Elige una película Bayer."
@@ -198,14 +205,16 @@ class FrameView(QWidget):
         self._play_fade = QPropertyAnimation(self._play_fx, b"opacity", self)
         self._play_fade.setDuration(180)
 
-    def set_view(self, rgb: np.ndarray, overlay=None, color="#ffcc00", side=None, allow_draw=False, captions=None):
+    def set_view(self, rgb: np.ndarray, overlay=None, color="#ffcc00", side=None, allow_draw=False, captions=None, aspect=None):
         self._pix = _rgb_pixmap(rgb)
         self._side = _rgb_pixmap(side) if side is not None else QPixmap()
         self._overlay = overlay
         self._color = QColor(color)
         self._allow = allow_draw
         self._captions = tuple(captions) if captions else ()
-        self._draft = None
+        self._aspect = float(aspect) if aspect else None
+        if self._mode is None:
+            self._draft = None
         self._place_play()
         self.update()
 
@@ -293,33 +302,163 @@ class FrameView(QWidget):
         rect = self._draft or self._overlay
         if rect and left.width() > 0:
             painter.setPen(QPen(self._color, 2))
-            painter.drawRect(self._map_out(rect, left, self._pix))
+            mapped = self._map_out(rect, left, self._pix)
+            painter.drawRect(mapped)
+            if self._aspect and self._allow:
+                painter.setBrush(self._color)
+                for corner in (mapped.topLeft(), mapped.topRight(), mapped.bottomLeft(), mapped.bottomRight()):
+                    painter.drawRect(corner.x() - 3, corner.y() - 3, 6, 6)
+                painter.setBrush(Qt.BrushStyle.NoBrush)
 
     def mousePressEvent(self, event):
-        if not self._allow or self._pix.isNull():
+        if not self._allow or self._pix.isNull() or event.button() != Qt.MouseButton.LeftButton:
             return
-        if event.button() == Qt.MouseButton.LeftButton:
-            self._drawing = True
-            self._origin = event.position().toPoint()
-            self._draft = None
+        point = event.position().toPoint()
+        hit = self._crop_hit(point) if self._overlay else None
+        if hit == "move":
+            self._mode = "move"
+            self._grab = point
+            self._grab_rect = tuple(self._overlay)
+            self._draft = tuple(self._overlay)
+            return
+        if hit and hit.startswith("scale"):
+            self._mode = "scale"
+            self._anchor = self._opposite(self._overlay, hit)
+            self._draft = tuple(self._overlay)
+            return
+        self._mode = "draw"
+        self._drawing = True
+        self._origin = point
+        self._draft = None
 
     def mouseMoveEvent(self, event):
-        if not self._drawing or self._origin is None:
+        point = event.position().toPoint()
+        if self._mode == "move" and self._grab is not None and self._grab_rect is not None:
+            left, _right = self._placed()
+            if left.width() < 2:
+                return
+            dx = self._axis(point.x(), left.left(), left.width(), self._pix.width())
+            dy = self._axis(point.y(), left.top(), left.height(), self._pix.height())
+            ox = self._axis(self._grab.x(), left.left(), left.width(), self._pix.width())
+            oy = self._axis(self._grab.y(), left.top(), left.height(), self._pix.height())
+            x, y, width, height = self._grab_rect
+            self._draft = self._clamp_rect((x + dx - ox, y + dy - oy, width, height))
+            self.update()
             return
-        self._draft = self._image_rect(self._origin, event.position().toPoint())
-        self.update()
+        if self._mode == "scale" and self._anchor is not None:
+            self._draft = self._scaled(point)
+            self.update()
+            return
+        if self._mode == "draw" and self._origin is not None:
+            draft = self._image_rect(self._origin, point)
+            if self._aspect and draft:
+                draft = film_finish.fit_aspect(
+                    draft, self._aspect, self._pix.width(), self._pix.height(), minimum=4,
+                )
+            self._draft = draft
+            self.update()
+            return
+        hit = self._crop_hit(point) if self._allow and self._overlay else None
+        if hit == "move":
+            self.setCursor(Qt.CursorShape.SizeAllCursor)
+        elif hit and hit.startswith("scale"):
+            self.setCursor(Qt.CursorShape.SizeFDiagCursor)
+        else:
+            self.setCursor(Qt.CursorShape.ArrowCursor)
 
     def mouseReleaseEvent(self, event):
-        if not self._drawing:
+        mode = self._mode
+        if mode is None:
             return
+        rect = self._draft
+        if mode == "draw":
+            rect = self._image_rect(self._origin, event.position().toPoint())
+            if self._aspect and rect:
+                rect = film_finish.fit_aspect(
+                    rect, self._aspect, self._pix.width(), self._pix.height(), minimum=4,
+                )
+        self._mode = None
         self._drawing = False
-        rect = self._image_rect(self._origin, event.position().toPoint())
         self._origin = None
+        self._anchor = None
+        self._grab = None
         self._draft = None
-        if rect and rect[2] >= 8 and rect[3] >= 8:
-            self.rect_ready.emit(rect)
+        limit = 8 if mode == "draw" else 4
+        if rect and rect[2] >= limit and rect[3] >= limit:
+            self.rect_ready.emit(tuple(int(v) for v in rect))
         else:
             self.update()
+
+    def _clamp_rect(self, rect):
+        x, y, width, height = (int(v) for v in rect)
+        limit_w = max(1, self._pix.width())
+        limit_h = max(1, self._pix.height())
+        width = min(max(1, width), limit_w)
+        height = min(max(1, height), limit_h)
+        x = min(max(0, x), limit_w - width)
+        y = min(max(0, y), limit_h - height)
+        return x, y, width, height
+
+    def _scaled(self, point: QPoint):
+        here = self._image_point(point)
+        if here is None or self._anchor is None or not self._aspect:
+            return self._draft
+        ax, ay = self._anchor
+        span_w = abs(here[0] - ax)
+        span_h = abs(here[1] - ay)
+        if span_w < 1 and span_h < 1:
+            return self._draft
+        if span_h < 1 or span_w / max(span_h, 1) > self._aspect:
+            span_h = span_w / self._aspect
+        else:
+            span_w = span_h * self._aspect
+        x = ax if here[0] >= ax else ax - span_w
+        y = ay if here[1] >= ay else ay - span_h
+        locked = film_finish.fit_aspect(
+            (x, y, span_w, span_h), self._aspect, self._pix.width(), self._pix.height(), minimum=4,
+        )
+        return locked or self._draft
+
+    def _image_point(self, point: QPoint):
+        left, _right = self._placed()
+        if left.width() < 2 or left.height() < 2:
+            return None
+        return (
+            self._axis(point.x(), left.left(), left.width(), self._pix.width()),
+            self._axis(point.y(), left.top(), left.height(), self._pix.height()),
+        )
+
+    def _crop_hit(self, point: QPoint):
+        if not self._overlay or self._pix.isNull():
+            return None
+        left, _right = self._placed()
+        if left.width() < 2:
+            return None
+        mapped = self._map_out(self._draft or self._overlay, left, self._pix)
+        if self._aspect:
+            corners = {
+                "scale-tl": mapped.topLeft(),
+                "scale-tr": mapped.topRight(),
+                "scale-bl": mapped.bottomLeft(),
+                "scale-br": mapped.bottomRight(),
+            }
+            for name, corner in corners.items():
+                if abs(point.x() - corner.x()) <= 8 and abs(point.y() - corner.y()) <= 8:
+                    return name
+        if mapped.adjusted(-2, -2, 2, 2).contains(point):
+            return "move"
+        return None
+
+    @staticmethod
+    def _opposite(rect, hit: str):
+        x, y, width, height = rect
+        if hit == "scale-br":
+            return x, y
+        if hit == "scale-bl":
+            return x + width, y
+        if hit == "scale-tr":
+            return x, y + height
+        return x + width, y + height
 
     def _placed(self):
         gap = 12 if not self._side.isNull() else 0
@@ -369,52 +508,139 @@ class FrameView(QWidget):
         )
 
 
-class RangeBar(QWidget):
-    picked = pyqtSignal(int)
+class _AngleEdit(QLineEdit):
+    escaped = pyqtSignal()
+
+    def keyPressEvent(self, event):
+        if event.key() == Qt.Key.Key_Escape:
+            self.escaped.emit()
+            return
+        super().keyPressEvent(event)
+
+
+class _AngleLabel(QLabel):
+    clicked = pyqtSignal()
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.clicked.emit()
+        super().mousePressEvent(event)
+
+
+class TurnControl(QWidget):
+    """Giro fino. La barra mueve 0,1° por paso, en un tramo de ±15°, y vuelve al centro."""
+
+    changed = pyqtSignal(float)
 
     def __init__(self):
         super().__init__()
-        self.setMinimumHeight(36)
-        self._count = 1
-        self._segments = []
-        self._selected = -1
-        self._head = 0
+        self._degrees = 0.0
+        self._origin = 0.0
+        self._lock = False
+        self._editing = False
+        tip = (
+            "El recorte no se mueve. Gira la imagen detrás, como en Photoshop. "
+            "A la derecha es positivo. Cada paso de la barra es 0,1°, "
+            "en un tramo de 15° a cada lado, y al soltar vuelve al centro. "
+            "Un clic en el número lo deja escribir, de -180 a 180."
+        )
+        title = QLabel("Giro")
+        title.setToolTip(tip)
+        self._label = _AngleLabel("0,0°")
+        self._label.setAlignment(Qt.AlignmentFlag.AlignRight)
+        self._label.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._label.setToolTip("Clic para escribir el ángulo.")
+        self._label.clicked.connect(self._start_edit)
+        self._edit = _AngleEdit()
+        self._edit.setAlignment(Qt.AlignmentFlag.AlignRight)
+        self._edit.setFixedWidth(76)
+        self._edit.setPlaceholderText("0,0")
+        self._edit.hide()
+        self._edit.returnPressed.connect(self._commit_edit)
+        self._edit.editingFinished.connect(self._commit_edit)
+        self._edit.escaped.connect(self._cancel_edit)
+        head = QHBoxLayout()
+        head.setContentsMargins(0, 0, 0, 0)
+        head.addWidget(title)
+        head.addStretch(1)
+        head.addWidget(self._label)
+        head.addWidget(self._edit)
+        self._slider = QSlider(Qt.Orientation.Horizontal)
+        self._slider.setRange(-150, 150)
+        self._slider.setSingleStep(1)
+        self._slider.setPageStep(10)
+        self._slider.setValue(0)
+        self._slider.setToolTip(tip)
+        self._slider.sliderPressed.connect(self._grab)
+        self._slider.valueChanged.connect(self._on_slider)
+        self._slider.sliderReleased.connect(self._recenter)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(2)
+        layout.addLayout(head)
+        layout.addWidget(self._slider)
 
-    def set_bar(self, count, segments, selected, head):
-        self._count = max(1, int(count))
-        self._segments = list(segments)
-        self._selected = selected
-        self._head = int(head)
-        self.update()
+    def degrees(self) -> float:
+        return self._degrees
 
-    def paintEvent(self, _event):
-        painter = QPainter(self)
-        painter.fillRect(self.rect(), QColor("#1c1c1c"))
-        width = max(1, self.width() - 8)
-        for index, segment in enumerate(self._segments):
-            x0 = 4 + int(width * segment["in"] / self._count)
-            x1 = 4 + int(width * (segment["out"] + 1) / self._count)
-            color = QColor("#0078d7") if index == self._selected else QColor("#3d6f99")
-            painter.fillRect(QRect(x0, 8, max(2, x1 - x0), 20), color)
-        hx = 4 + int(width * self._head / self._count)
-        painter.setPen(QPen(QColor("#f2f2f2"), 2))
-        painter.drawLine(hx, 4, hx, self.height() - 4)
+    def set_degrees(self, degrees: float, emit: bool = False):
+        self._degrees = max(-180.0, min(180.0, round(float(degrees), 1)))
+        self._origin = self._degrees
+        self._paint_label()
+        self._recenter()
+        if emit:
+            self.changed.emit(self._degrees)
 
-    def mousePressEvent(self, event):
-        if not self._segments:
+    def _grab(self):
+        self._origin = self._degrees
+
+    def _on_slider(self, value: int):
+        if self._lock:
             return
-        width = max(1, self.width() - 8)
-        best = 0
-        best_dist = 10 ** 9
-        click = event.position().x()
-        for index, segment in enumerate(self._segments):
-            x0 = 4 + width * segment["in"] / self._count
-            x1 = 4 + width * (segment["out"] + 1) / self._count
-            center = (x0 + x1) / 2
-            dist = abs(click - center)
-            if dist < best_dist:
-                best, best_dist = index, dist
-        self.picked.emit(best)
+        degrees = max(-180.0, min(180.0, round(self._origin + value / 10.0, 1)))
+        if degrees != self._degrees:
+            self._degrees = degrees
+            self._paint_label()
+            self.changed.emit(self._degrees)
+        if not self._slider.isSliderDown():
+            self._recenter()
+
+    def _recenter(self):
+        self._origin = self._degrees
+        self._lock = True
+        self._slider.setValue(0)
+        self._lock = False
+
+    def _paint_label(self):
+        self._label.setText(f"{self._degrees:.1f}°".replace(".", ","))
+
+    def _start_edit(self):
+        self._editing = True
+        self._edit.setText(f"{self._degrees:.1f}".replace(".", ","))
+        self._label.hide()
+        self._edit.show()
+        self._edit.setFocus()
+        self._edit.selectAll()
+
+    def _commit_edit(self):
+        if not self._editing:
+            return
+        self._editing = False
+        text = self._edit.text().replace("°", "").replace(",", ".").strip()
+        self._edit.hide()
+        self._label.show()
+        try:
+            value = float(text)
+        except ValueError:
+            self._paint_label()
+            return
+        self.set_degrees(value, emit=True)
+
+    def _cancel_edit(self):
+        self._editing = False
+        self._edit.hide()
+        self._label.show()
+        self._paint_label()
 
 
 class RevealDialog(QDialog):
@@ -425,6 +651,7 @@ class RevealDialog(QDialog):
         self._folder = Path(folder)
         self._filenames = list(filenames)
         self._meta = collection_meta or {}
+        self._reveal_fallback = reveal_pipeline.coerce_reveal(settings)
         self._settings = reveal_pipeline.coerce_reveal(settings)
         self._lin_prev = None
         self._sigma_scale = 1.0
@@ -448,7 +675,7 @@ class RevealDialog(QDialog):
         self._timer = QTimer(self)
         self._timer.setSingleShot(True)
         self._timer.setInterval(30)
-        self._timer.timeout.connect(self._paint_preview)
+        self._timer.timeout.connect(self._on_reveal_timer)
         self._frame_timer = QTimer(self)
         self._frame_timer.setSingleShot(True)
         self._frame_timer.setInterval(120)
@@ -458,11 +685,42 @@ class RevealDialog(QDialog):
         self._measure_timer.setInterval(200)
         self._measure_timer.timeout.connect(self._commit_slider_measure)
 
-        root = QHBoxLayout(self)
+        root = QVBoxLayout(self)
         self.view = FrameView()
         self.view.rect_ready.connect(self._on_rect)
         self.view.play_clicked.connect(self._toggle_play)
-        root.addWidget(self.view, 1)
+        preview_col = QWidget()
+        preview_lay = QVBoxLayout(preview_col)
+        preview_lay.setContentsMargins(0, 0, 0, 0)
+        preview_lay.addWidget(self.view, 1)
+        self._timeline_host = QWidget()
+        time_lay = QVBoxLayout(self._timeline_host)
+        time_lay.setContentsMargins(0, 2, 0, 0)
+        time_lay.setSpacing(2)
+        tools = QHBoxLayout()
+        tools.setContentsMargins(0, 0, 0, 0)
+        tools.setSpacing(4)
+        tools.addStretch(1)
+        self.bar = TimelineBar()
+        self.bar.head_moved.connect(self._on_timeline_head)
+        self.bar.picked.connect(self._on_timeline_pick)
+        self.bar.edited.connect(self._on_timeline_edit)
+        self.bar.setToolTip(
+            "La línea blanca es el cuadro. Arrastra sobre un tramo para partirlo "
+            "y arrastra el borde para correrlo cuadro a cuadro. "
+            "Ctrl y la rueda acercan. Shift y las flechas mueven el borde de a un cuadro."
+        )
+        self.btn_zoom_out = _timeline_button("−", "Alejar. También Ctrl y la rueda.", lambda: self.bar.zoom_by(1 / 1.4))
+        self.btn_zoom_in = _timeline_button("+", "Acercar. También Ctrl y la rueda.", lambda: self.bar.zoom_by(1.4))
+        self.btn_zoom_fit = _timeline_button("Todo", "Ver el rollo entero.", self.bar.fit_film)
+        self.btn_split = _timeline_button("Partir", "Corta el tramo donde está la línea. Las dos partes salen iguales.", self._split_at_head)
+        self.btn_merge = _timeline_button("Unir", "Funde el tramo con el anterior. El anterior conserva su ajuste.", self._merge_selected)
+        for button in (self.btn_zoom_out, self.btn_zoom_in, self.btn_zoom_fit, self.btn_split, self.btn_merge):
+            tools.addWidget(button)
+        time_lay.addLayout(tools)
+        time_lay.addWidget(self.bar, 1)
+        preview_lay.addWidget(self._timeline_host)
+        self._crop_i = 0
 
         side = QVBoxLayout()
         side.addWidget(QLabel("Película"))
@@ -520,8 +778,16 @@ class RevealDialog(QDialog):
 
         wrap = QWidget()
         wrap.setLayout(side)
-        wrap.setFixedWidth(420)
-        root.addWidget(wrap)
+        wrap.setMinimumWidth(320)
+        split = QSplitter(Qt.Orientation.Horizontal)
+        split.setHandleWidth(6)
+        split.setChildrenCollapsible(False)
+        split.addWidget(preview_col)
+        split.addWidget(wrap)
+        split.setStretchFactor(0, 1)
+        split.setStretchFactor(1, 0)
+        split.setSizes([980, 340])
+        root.addWidget(split, 1)
 
         self._load_sliders()
         self._set_task(0)
@@ -618,8 +884,8 @@ class RevealDialog(QDialog):
         layout = QVBoxLayout(page)
         note = QLabel(
             "El área tiene que dejar afuera el borde y las perforaciones. "
-            "El tramo nuevo cubre el rollo, así la gamma se mantiene al mover el cuadro. "
-            "Entrada y salida lo achican. La fuerza y la protección de sombras "
+            "Abajo, el rollo parte en un solo tramo. Partir lo corta en la línea "
+            "y el borde se corre cuadro a cuadro. La fuerza y la protección de sombras "
             "aflojan la corrección para que el negro no reviente."
         )
         note.setWordWrap(True)
@@ -646,19 +912,10 @@ class RevealDialog(QDialog):
         self.sld_sat.setToolTip(sat_title.toolTip())
         self.sld_sat.valueChanged.connect(self._on_sat)
         layout.addWidget(self.sld_sat)
-        self.bar = RangeBar()
-        self.bar.picked.connect(self._select_segment)
-        row = QHBoxLayout()
-        for title, slot in (
-            ("Entrada", self._mark_in),
-            ("Salida", self._mark_out),
-            ("Medir", self._measure_segment),
-            ("Borrar", self._delete_segment),
-        ):
-            button = QPushButton(title)
-            button.clicked.connect(slot)
-            row.addWidget(button)
-        self.lbl_color = QLabel("Dibuja el área. El tramo parte cubriendo todo el rollo.")
+        btn_measure = QPushButton("Medir")
+        btn_measure.clicked.connect(self._measure_segment)
+        layout.addWidget(btn_measure)
+        self.lbl_color = QLabel("Dibuja el área. El tramo de abajo parte cubriendo todo el rollo.")
         self.lbl_color.setWordWrap(True)
 
         form = QVBoxLayout()
@@ -743,8 +1000,6 @@ class RevealDialog(QDialog):
         self._gammac_box = QWidget()
         box = QVBoxLayout(self._gammac_box)
         box.setContentsMargins(0, 0, 0, 0)
-        box.addWidget(self.bar)
-        box.addLayout(row)
         box.addWidget(self.lbl_color)
         box.addWidget(scroll, 1)
         layout.addWidget(self._gammac_box, 1)
@@ -756,8 +1011,9 @@ class RevealDialog(QDialog):
         layout = QVBoxLayout(page)
         note = QLabel(
             "A la izquierda, el cuadro con el recorte. A la derecha, lo que se codifica. "
-            "El tamaño se ajusta solo: ancho múltiplo de 16 y alto múltiplo de 8, "
-            "que es lo que pide ProRes NV. El borde negro de la estabilización tiene que quedar fuera."
+            "El primer tramo fija la proporción y el tamaño del video. "
+            "Los siguientes se mueven y se agrandan o achican parejos, sin deformar. "
+            "El borde negro de la estabilización tiene que quedar fuera."
         )
         note.setWordWrap(True)
         layout.addWidget(note)
@@ -766,7 +1022,7 @@ class RevealDialog(QDialog):
         layout.addWidget(self.chk_crop)
         self.chk_flip = QCheckBox("Voltear horizontal")
         self.chk_flip.setToolTip(
-            "Primero marcas el recuadro en la imagen. El volteo se aplica después, "
+            "El volteo es de este tramo. Se aplica después del recorte, "
             "sobre lo que se exporta, y esta vista lo muestra."
         )
         self.chk_flip.toggled.connect(self._on_flip)
@@ -774,23 +1030,9 @@ class RevealDialog(QDialog):
         self.lbl_crop = QLabel("Sin recorte.")
         self.lbl_crop.setWordWrap(True)
         layout.addWidget(self.lbl_crop)
-        turn_head = QHBoxLayout()
-        turn_title = QLabel("Giro")
-        turn_title.setToolTip(
-            "El recorte no se mueve. Gira la imagen detrás, como en Photoshop. "
-            "A la derecha es positivo, de a 0,1°."
-        )
-        self.lbl_turn = QLabel("0,0°")
-        self.lbl_turn.setAlignment(Qt.AlignmentFlag.AlignRight)
-        turn_head.addWidget(turn_title)
-        turn_head.addWidget(self.lbl_turn)
-        layout.addLayout(turn_head)
-        self.sld_turn = QSlider(Qt.Orientation.Horizontal)
-        self.sld_turn.setRange(-1800, 1800)
-        self.sld_turn.setValue(0)
-        self.sld_turn.setToolTip(turn_title.toolTip())
-        self.sld_turn.valueChanged.connect(self._on_turn)
-        layout.addWidget(self.sld_turn)
+        self.turn = TurnControl()
+        self.turn.changed.connect(self._on_turn)
+        layout.addWidget(self.turn)
         layout.addStretch(1)
         return page
 
@@ -1024,6 +1266,7 @@ class RevealDialog(QDialog):
         self.stack.setCurrentIndex(index)
         for number, button in enumerate(self._task_btns):
             button.setChecked(number == index)
+        self._timeline_host.setVisible(index in (2, 3))
         self._paint_preview()
 
     def _add_slider(self, layout, key, title, lo, hi, scale, tip):
@@ -1056,6 +1299,7 @@ class RevealDialog(QDialog):
 
     def _on_engine(self, *_args):
         self._refresh_engine_note()
+        self._save_current()
         if self._lin_prev is not None:
             self._load_frame()
 
@@ -1096,12 +1340,17 @@ class RevealDialog(QDialog):
         self._mark_recipes_stale()
         self._timer.start()
 
+    def _on_reveal_timer(self):
+        self._save_current()
+        self._paint_preview()
+
     def _reset(self):
         engine = self._collect().get("engine", "cpu")
         self._settings = reveal_pipeline.default_reveal()
         self._settings["engine"] = engine
         self._load_sliders()
         self._mark_recipes_stale()
+        self._save_current()
         self._paint_preview()
 
     def _on_film(self, *_args):
@@ -1133,7 +1382,7 @@ class RevealDialog(QDialog):
         self.sld_frame.setRange(0, count - 1)
         self.sld_frame.setValue(min(100, count - 1))
         self.sld_frame.blockSignals(False)
-        note = "El revelado es uno para todos los archivos. El color, la perforación y el recorte son de este."
+        note = "El revelado, el color, la perforación y el recorte son de este archivo."
         if _is_bw(name, self._meta):
             note = "Esta película es blanco y negro. " + note
         self.lbl_note.setText(note)
@@ -1141,6 +1390,7 @@ class RevealDialog(QDialog):
 
     def _on_frame_label(self, value: int):
         self.lbl_frame.setText(f"Cuadro {value + 1}")
+        self._follow_span()
         self._refresh_bars()
         if not self.sld_frame.isSliderDown():
             self._frame_timer.start()
@@ -1204,6 +1454,7 @@ class RevealDialog(QDialog):
             side = None
             allow = not playing
         elif self._task == 3:
+            self._sync_crop_view()
             shown_img = self._warp_preview(graded)
             if playing and self.chk_crop.isChecked():
                 rect = self._preview_rect(self._crop)
@@ -1216,6 +1467,7 @@ class RevealDialog(QDialog):
                 overlay = None
                 side = None
                 allow = False
+                aspect = None
             else:
                 side = self._crop_side(shown_img)
                 overlay = self._preview_rect(self._shown_crop())
@@ -1223,6 +1475,7 @@ class RevealDialog(QDialog):
                     shown_img = _hflip(shown_img)
                 shown = self._to_u8(shown_img)
                 allow = True
+                aspect = self._crop_aspect()
             color = "#4cc9f0"
         else:
             shown = self._to_u8(base)
@@ -1230,7 +1483,10 @@ class RevealDialog(QDialog):
             color = "#ffffff"
             side = None
             allow = False
-        self.view.set_view(shown, overlay, color, side, allow)
+            aspect = None
+        if self._task != 3:
+            aspect = None
+        self.view.set_view(shown, overlay, color, side, allow, aspect=aspect)
         self._refresh_bars()
         self._refresh_crop_label()
 
@@ -1349,8 +1605,7 @@ class RevealDialog(QDialog):
         elif self._task == 3:
             if self._flip_on():
                 full = film_finish.mirror_x(full, FIXED_W)
-            self._crop = film_finish.snap_crop(full, FIXED_W, FIXED_H)
-            self.chk_crop.setChecked(self._crop is not None)
+            self._apply_crop_rect(full)
         elif self._task == 2:
             segment = self._ensure_segment()
             segment["rect"] = list(full)
@@ -1364,6 +1619,7 @@ class RevealDialog(QDialog):
     def _load_adjust(self):
         path = self._folder / (self._current or "")
         self._adjust = film_finish.load(path) if self._current else film_finish.empty()
+        self._apply_file_reveal()
         perfo = self._adjust.get("perfo") or {}
         self._roi = tuple(perfo["roi"]) if perfo.get("roi") else None
         self._roi_ref = film_finish.perfo_ref(perfo)
@@ -1373,15 +1629,12 @@ class RevealDialog(QDialog):
         self.chk_horizontal.blockSignals(True)
         self.chk_horizontal.setChecked(film_finish.perfo_horizontal(perfo))
         self.chk_horizontal.blockSignals(False)
-        crop = self._adjust.get("crop")
-        self._crop = film_finish.snap_crop(crop, FIXED_W, FIXED_H) if crop else None
+        self._crop_i = 0
+        self._segment = 0
+        self._sync_crop_view()
         self.chk_crop.blockSignals(True)
-        self.chk_crop.setChecked(self._crop is not None)
+        self.chk_crop.setChecked(bool(self._adjust.get("crop")))
         self.chk_crop.blockSignals(False)
-        self.chk_flip.blockSignals(True)
-        self.chk_flip.setChecked(bool(self._adjust.get("flip_h")))
-        self.chk_flip.blockSignals(False)
-        self._segment = 0 if self._adjust["segments"] else -1
         self._load_shifts()
         self._sync_segment_controls()
         self._sync_grade_controls()
@@ -1398,15 +1651,33 @@ class RevealDialog(QDialog):
             "ref": self._roi_ref,
             "horizontal": self.chk_horizontal.isChecked(),
         }
-        self._adjust["crop"] = list(self._crop) if self.chk_crop.isChecked() and self._crop else None
-        self._adjust["turn"] = round(self.sld_turn.value() / 10.0, 1)
-        self._adjust["flip_h"] = self.chk_flip.isChecked()
+        self._adjust["segments"] = self._segments_for_save()
+        if self._adjust.get("crop_spans"):
+            spans = self._crops_for_save()
+            self._adjust["crop_spans"] = spans
+            master = spans[0].get("crop") if spans else None
+            self._adjust["crop"] = list(master) if self.chk_crop.isChecked() and master else None
+            self._adjust["flip_h"] = bool(spans[0].get("flip_h")) if spans else False
+        elif not self.chk_crop.isChecked():
+            self._adjust["crop"] = None
+            self._adjust["flip_h"] = self.chk_flip.isChecked()
+        self._adjust["turn"] = self.turn.degrees()
+        if getattr(self, "_rows", None):
+            self._adjust["reveal"] = self._collect()
         film_finish.save(self._folder / self._current, self._adjust)
         self._refresh_review()
 
     def _on_horizontal(self, _on):
         self._save_current()
         self._paint_preview()
+
+    def _apply_file_reveal(self):
+        """Los sliders muestran el revelado guardado en este archivo."""
+        saved = self._adjust.get("reveal") if isinstance(self._adjust, dict) else None
+        source = saved if isinstance(saved, dict) else self._reveal_fallback
+        self._settings = reveal_pipeline.coerce_reveal(source)
+        if getattr(self, "_rows", None):
+            self._load_sliders()
 
     def _load_shifts(self):
         self._shifts = None
@@ -1552,44 +1823,17 @@ class RevealDialog(QDialog):
         return tuple(segment["rect"])
 
     def _ensure_segment(self):
-        segment = self._selected()
-        if segment is not None:
-            return segment
+        spans = self._covered_segments()
         frame = int(self.sld_frame.value())
-        for index, item in enumerate(self._adjust["segments"]):
+        for index, item in enumerate(spans):
             if int(item["in"]) <= frame <= int(item["out"]):
                 self._segment = index
-                self._sync_segment_controls()
-                return item
-        start, end = self._gap_around(frame)
-        previous = self._adjust["segments"][-1]["rect"] if self._adjust["segments"] else None
-        if not previous:
-            previous = self._preset().get("rect")
-        segment = {
-            "in": start,
-            "out": end,
-            "sample": frame,
-            "rect": list(previous) if previous else None,
-        }
-        self._write_knobs(segment)
-        self._adjust["segments"].append(segment)
-        self._segment = len(self._adjust["segments"]) - 1
+                break
+        else:
+            self._segment = 0
+        self._adjust["segments"] = spans
         self._sync_segment_controls()
-        return segment
-
-    def _gap_around(self, frame: int) -> tuple[int, int]:
-        """Hueco libre que contiene el cuadro. Sin otros tramos, es el rollo entero."""
-        last = max(0, self._count - 1)
-        start = 0
-        end = last
-        for item in self._adjust["segments"]:
-            if int(item["out"]) < frame:
-                start = max(start, int(item["out"]) + 1)
-            elif int(item["in"]) > frame:
-                end = min(end, int(item["in"]) - 1)
-        if start > end:
-            return frame, frame
-        return start, end
+        return spans[self._segment]
 
     def _expand_single_frame_segment(self):
         """Un tramo de un solo cuadro era el defecto anterior: al abrirlo, pasa a cubrir el rollo."""
@@ -1602,46 +1846,209 @@ class RevealDialog(QDialog):
         segment["in"] = 0
         segment["out"] = max(0, self._count - 1)
 
-    def _mark_in(self):
-        segment = self._ensure_segment()
-        segment["in"] = int(self.sld_frame.value())
-        if segment["in"] > segment["out"]:
-            segment["out"] = segment["in"]
-        self._normalize_segments()
+    def _blank_segment(self, start: int, end: int) -> dict:
+        preset = self._preset()
+        segment = {"in": int(start), "out": int(end), "sample": int(start)}
+        segment["rect"] = list(preset["rect"]) if preset.get("rect") else None
+        for key in _NEUTRAL:
+            segment[key] = preset.get(key, _GENTLE.get(key, _NEUTRAL[key]))
+        segment["lock"] = int(preset.get("lock", 1))
+        segment["scale"] = int(preset.get("scale", 2))
+        return segment
 
-    def _mark_out(self):
-        segment = self._ensure_segment()
-        segment["out"] = int(self.sld_frame.value())
-        if segment["out"] < segment["in"]:
-            segment["in"] = segment["out"]
-        self._normalize_segments()
+    def _covered_segments(self) -> list:
+        return film_finish.cover(self._adjust.get("segments") or [], self._count, self._blank_segment)
 
-    def _normalize_segments(self):
-        items = self._adjust["segments"]
-        for segment in items:
-            segment["in"] = max(0, min(int(segment["in"]), self._count - 1))
-            segment["out"] = max(segment["in"], min(int(segment["out"]), self._count - 1))
-        items.sort(key=lambda item: item["in"])
-        cleaned = []
-        cursor = -1
-        for segment in items:
-            if segment["in"] <= cursor:
-                self.lbl_color.setText("Ese tramo pisa otro. No se superponen.")
-                continue
-            cleaned.append(segment)
-            cursor = segment["out"]
-        self._adjust["segments"] = cleaned
-        self._segment = min(self._segment, len(cleaned) - 1)
+    def _blank_crop(self, start: int, end: int) -> dict:
+        stored = self._stored_crop_spans()
+        master = stored[0] if stored else None
+        crop = list(master["crop"]) if master and master.get("crop") else None
+        flip = bool(master.get("flip_h")) if master else False
+        return {"in": int(start), "out": int(end), "crop": crop, "flip_h": flip}
+
+    def _stored_crop_spans(self) -> list:
+        spans = [item for item in (self._adjust.get("crop_spans") or []) if isinstance(item, dict)]
+        if spans:
+            return spans
+        if self._adjust.get("crop") or self._adjust.get("flip_h"):
+            return [{
+                "in": 0,
+                "out": max(0, self._count - 1),
+                "crop": self._adjust.get("crop"),
+                "flip_h": bool(self._adjust.get("flip_h")),
+            }]
+        return []
+
+    def _covered_crops(self) -> list:
+        return film_finish.cover(self._stored_crop_spans(), self._count, self._blank_crop)
+
+    def _segments_for_save(self) -> list:
+        items = self._adjust.get("segments") or []
+        if len(items) == 1:
+            segment = items[0]
+            last = max(0, self._count - 1)
+            bare = int(segment.get("in", 0)) == 0 and int(segment.get("out", -1)) == last
+            if bare and not segment.get("rect") and not (segment.get("recipe") or {}).get("ok"):
+                return []
+        return items
+
+    def _crops_for_save(self) -> list:
+        spans = [item for item in (self._adjust.get("crop_spans") or []) if isinstance(item, dict)]
+        if not spans:
+            return []
+        if len(spans) == 1 and not spans[0].get("crop") and not spans[0].get("flip_h"):
+            return []
+        return spans
+
+    def _on_timeline_head(self, frame: int):
+        self._stop_play()
+        frame = int(frame)
+        if int(self.sld_frame.value()) != frame:
+            self.sld_frame.setValue(frame)
+        self._follow_span()
+        self._frame_timer.start()
+
+    def _on_timeline_pick(self, index: int):
+        if self._task == 3:
+            self._crop_i = int(index)
+            self._sync_crop_view()
+        else:
+            self._segment = int(index)
+            self._sync_segment_controls()
+        spans = self._covered_crops() if self._task == 3 else self._covered_segments()
+        if 0 <= index < len(spans):
+            start, end = int(spans[index]["in"]), int(spans[index]["out"])
+            frame = int(self.sld_frame.value())
+            if frame < start or frame > end:
+                self.sld_frame.setValue(start)
+                self._load_frame()
         self._refresh_bars()
+
+    def _on_timeline_edit(self, spans, selected: int):
+        if self._task == 3:
+            self._adjust["crop_spans"] = list(spans)
+            self._crop_i = int(selected)
+            self.chk_crop.setChecked(any(item.get("crop") for item in spans))
+            self._sync_crop_view()
+        else:
+            self._adjust["segments"] = list(spans)
+            self._segment = int(selected)
+            self._play_recipe = None
+            self._draft_id = None
+            self._sync_segment_controls()
+        self._save_current()
         self._paint_preview()
 
+    def _split_at_head(self):
+        if self._task == 3:
+            spans = self._covered_crops()
+            new, selected, changed = film_finish.split_at(spans, int(self.sld_frame.value()), self._count)
+            if not changed:
+                self.lbl_crop.setText("La línea está en el borde del tramo. Métela adentro para partir.")
+                return
+            self._adjust["crop_spans"] = new
+            self._crop_i = selected
+        else:
+            spans = self._covered_segments()
+            new, selected, changed = film_finish.split_at(spans, int(self.sld_frame.value()), self._count)
+            if not changed:
+                self.lbl_color.setText("La línea está en el borde del tramo. Métela adentro para partir.")
+                return
+            self._adjust["segments"] = new
+            self._segment = selected
+            self._sync_segment_controls()
+        self._save_current()
+        self._paint_preview()
+
+    def _merge_selected(self):
+        if self._task == 3:
+            spans = self._covered_crops()
+            new, selected, changed = film_finish.merge_span(spans, self._crop_i)
+            if not changed:
+                self.lbl_crop.setText("Hay un solo tramo: cubre el rollo entero.")
+                return
+            self._adjust["crop_spans"] = new
+            self._crop_i = selected
+        else:
+            spans = self._covered_segments()
+            new, selected, changed = film_finish.merge_span(spans, self._segment)
+            if not changed:
+                self.lbl_color.setText("Hay un solo tramo: cubre el rollo entero.")
+                return
+            self._adjust["segments"] = new
+            self._segment = selected
+            self._play_recipe = None
+            self._draft_id = None
+            self._sync_segment_controls()
+        self._save_current()
+        self._paint_preview()
+
+    def _follow_span(self):
+        frame = int(self.sld_frame.value())
+        if self._task == 3:
+            spans = self._covered_crops()
+            for index, span in enumerate(spans):
+                if int(span["in"]) <= frame <= int(span["out"]) and index != self._crop_i:
+                    self._crop_i = index
+                    self._sync_crop_view()
+                    return
+        elif self._task == 2:
+            spans = self._covered_segments()
+            for index, span in enumerate(spans):
+                if int(span["in"]) <= frame <= int(span["out"]) and index != self._segment:
+                    self._segment = index
+                    if self._adjust.get("segments"):
+                        self._sync_segment_controls()
+                    return
+
+    def _apply_crop_rect(self, full):
+        spans = self._covered_crops()
+        if not spans:
+            return
+        index = self._crop_i if 0 <= self._crop_i < len(spans) else 0
+        master = spans[0].get("crop")
+        if index == 0 or not master:
+            rect = film_finish.snap_crop(full, FIXED_W, FIXED_H)
+            if rect is None:
+                self.lbl_crop.setText("Ese recorte no entra. Márcalo de nuevo.")
+                return
+            film_finish.refit_crops(spans, master, rect, FIXED_W, FIXED_H)
+        else:
+            aspect = float(master[2]) / float(master[3])
+            rect = film_finish.fit_aspect(full, aspect, FIXED_W, FIXED_H)
+            if rect is None:
+                return
+            spans[index]["crop"] = list(rect)
+        self._adjust["crop_spans"] = spans
+        self._crop_i = index
+        self.chk_crop.setChecked(True)
+        self._sync_crop_view()
+        self._save_current()
+
+    def _crop_aspect(self):
+        spans = self._covered_crops()
+        if self._crop_i <= 0 or not spans or not spans[0].get("crop"):
+            return None
+        crop = spans[0]["crop"]
+        if crop[3] <= 0:
+            return None
+        return float(crop[2]) / float(crop[3])
+
+    def _sync_crop_view(self):
+        spans = self._covered_crops()
+        if not spans:
+            self._crop = None
+            return
+        index = self._crop_i if 0 <= self._crop_i < len(spans) else 0
+        self._crop_i = index
+        crop = spans[index].get("crop")
+        self._crop = tuple(crop) if crop else None
+        self.chk_flip.blockSignals(True)
+        self.chk_flip.setChecked(bool(spans[index].get("flip_h")))
+        self.chk_flip.blockSignals(False)
+
     def _select_segment(self, index: int):
-        self._segment = index
-        self._sync_segment_controls()
-        segment = self._selected()
-        if segment is not None:
-            self.sld_frame.setValue(int(segment.get("sample", segment["in"])))
-            self._load_frame()
+        self._on_timeline_pick(index)
 
     def _sync_segment_controls(self):
         segment = self._selected()
@@ -1752,25 +2159,33 @@ class RevealDialog(QDialog):
     def _refresh_bars(self):
         if not hasattr(self, "bar"):
             return
-        self.bar.set_bar(self._count, self._adjust["segments"], self._segment, int(self.sld_frame.value()))
+        if self._task == 3:
+            spans, selected = self._covered_crops(), self._crop_i
+        else:
+            spans, selected = self._covered_segments(), self._segment
+        self.bar.set_bar(self._count, spans, selected, int(self.sld_frame.value()))
 
     def _refresh_crop_label(self):
         if self._crop is None:
-            turn = self.sld_turn.value() / 10.0
-            text = "Dibuja el recorte sobre la imagen."
+            turn = self.turn.degrees()
+            text = "Dibuja el recorte sobre la imagen. El primer tramo fija la proporción."
             if abs(turn) >= 0.05:
                 text += " Giro " + f"{turn:.1f}°".replace(".", ",") + "."
             if self.chk_flip.isChecked():
                 text += " Volteado horizontal."
             self.lbl_crop.setText(text)
             return
+        if self._crop_i <= 0:
+            role = "Este tramo fija la proporción y el tamaño del video."
+        else:
+            role = "Misma proporción que el primero: se mueve y se escala parejo."
         text = (
             f"Recorte {self._crop[2]}×{self._crop[3]} desde {self._crop[0]}, {self._crop[1]}. "
-            "Ancho múltiplo de 16 y alto múltiplo de 8."
+            + role
         )
         if self._pad:
             text += f" La perforación deja {self._pad} px de negro."
-        turn = self.sld_turn.value() / 10.0
+        turn = self.turn.degrees()
         if abs(turn) >= 0.05:
             text += " Giro " + f"{turn:.1f}°".replace(".", ",") + "."
         if self.chk_flip.isChecked():
@@ -1786,6 +2201,11 @@ class RevealDialog(QDialog):
         return film_finish.mirror_x(self._crop, FIXED_W)
 
     def _on_flip(self, *_args):
+        spans = self._covered_crops()
+        if spans:
+            index = min(max(self._crop_i, 0), len(spans) - 1)
+            spans[index]["flip_h"] = self.chk_flip.isChecked()
+            self._adjust["crop_spans"] = spans
         self._save_current()
         self._paint_preview()
 
@@ -1794,13 +2214,9 @@ class RevealDialog(QDialog):
             degrees = float(self._adjust.get("turn") or 0.0)
         except (TypeError, ValueError):
             degrees = 0.0
-        self.sld_turn.blockSignals(True)
-        self.sld_turn.setValue(int(round(degrees * 10)))
-        self.sld_turn.blockSignals(False)
-        self.lbl_turn.setText(f"{self.sld_turn.value() / 10.0:.1f}°".replace(".", ","))
+        self.turn.set_degrees(degrees)
 
-    def _on_turn(self, *_args):
-        self._adjust["turn"] = round(self.sld_turn.value() / 10.0, 1)
-        self.lbl_turn.setText(f"{self._adjust['turn']:.1f}°".replace(".", ","))
+    def _on_turn(self, degrees: float):
+        self._adjust["turn"] = round(float(degrees), 1)
         self._save_current()
         self._paint_preview()

@@ -122,6 +122,34 @@ def test_crop_snaps_for_prores_nv():
     assert edge[0] + edge[2] <= 2840 and edge[1] + edge[3] <= 2200
 
 
+def test_reveal_belongs_to_one_file():
+    import tempfile
+    from pathlib import Path
+    import film_finish
+    with tempfile.TemporaryDirectory() as folder:
+        root = Path(folder)
+        one = root / "one.raw"
+        two = root / "two.raw"
+        one.write_bytes(b"")
+        two.write_bytes(b"")
+        own = film_finish.empty()
+        own["reveal"] = {"gamma": 1.5, "ev": 0.5, "engine": "cpu"}
+        film_finish.save(one, own)
+        film_finish.save(two, film_finish.empty())
+        assert film_finish.file_reveal(one, {"gamma": 2.4})["gamma"] == 1.5
+        assert film_finish.file_reveal(one, {"gamma": 2.4})["ev"] == 0.5
+        assert film_finish.file_reveal(two, {"gamma": 2.4})["gamma"] == 2.4
+        assert film_finish.load(two)["reveal"] is None
+        assert film_finish.copy_adjust(one, two)
+        assert film_finish.file_reveal(two, {"gamma": 2.4})["gamma"] == 1.5
+        bare = film_finish.empty()
+        bare["crop"] = [0, 0, 16, 8]
+        film_finish.save(one, bare)
+        kept = film_finish.file_reveal(two, {"gamma": 2.4})["gamma"]
+        assert film_finish.copy_adjust(one, two)
+        assert film_finish.file_reveal(two, {"gamma": 2.4})["gamma"] == kept
+
+
 def test_copy_adjust_skips_motion():
     import json
     from pathlib import Path
@@ -341,6 +369,57 @@ def test_perfo_follows_a_hole():
     assert abs(result["ty"][2] - 5) < 0.8
 
 
+def test_split_copies_the_crop_and_the_later_one_keeps_proportion():
+    import film_finish
+    spans = [{"in": 0, "out": 9, "crop": [0, 0, 32, 16], "flip_h": False}]
+    parted, selected, changed = film_finish.split_at(spans, 4, 10)
+    assert changed and selected == 1
+    assert parted[0]["crop"] == [0, 0, 32, 16]
+    assert parted[1]["crop"] == [0, 0, 32, 16]
+    assert parted[0]["out"] == 3 and parted[1]["in"] == 4
+    fitted = film_finish.fit_aspect((10, 4, 40, 40), 32 / 16, 80, 40)
+    assert fitted[2] / fitted[3] == 2 or abs(fitted[2] / fitted[3] - 2) < 0.05
+    moved, edge_changed = film_finish.move_edge(parted, 1, 6)
+    assert edge_changed
+    assert moved[0]["out"] == 5 and moved[1]["in"] == 6
+    assert moved[0]["crop"] == [0, 0, 32, 16]
+
+
+def test_later_crop_scales_to_the_first_and_flips_on_its_own():
+    import tempfile
+    from pathlib import Path
+    import film_finish
+    with tempfile.TemporaryDirectory() as folder:
+        raw = Path(folder) / "a.raw"
+        raw.write_bytes(b"")
+        film_finish.save(raw, {
+            "crop": [0, 0, 32, 16],
+            "flip_h": False,
+            "crop_spans": [
+                {"in": 0, "out": 4, "crop": [0, 0, 32, 16], "flip_h": False},
+                {"in": 5, "out": 9, "crop": [8, 4, 16, 8], "flip_h": True},
+            ],
+            "segments": [],
+            "perfo": {"enabled": False, "roi": None},
+            "grade": {"mode": "color", "sat": 1},
+        })
+        finish = film_finish.Finish(raw, gpu=False, codec="prores_4444")
+        assert finish.output_size(80, 40) == (32, 16)
+        image = np.zeros((40, 80, 3), np.float32)
+        image[0, 0, 0] = 1
+        image[0, 31, 2] = 1
+        image[4:12, 8:16, 0] = 1
+        image[4:12, 16:24, 2] = 1
+        first = finish.apply_float(image, 0, finish.output_size(80, 40))
+        assert first.shape[:2] == (16, 32)
+        assert first[0, 0, 0] > 0.5
+        assert first[0, 31, 2] > 0.5
+        second = finish.apply_float(image, 5, finish.output_size(80, 40))
+        assert second.shape[:2] == (16, 32)
+        assert second[8, 4, 2] > second[8, 4, 0]
+        assert second[8, 28, 0] > second[8, 28, 2]
+
+
 if __name__ == "__main__":
     test_gammac_locks_green()
     test_gammac_ignores_border()
@@ -348,6 +427,7 @@ if __name__ == "__main__":
     test_turn_spins_clockwise_inside_the_crop()
     test_flip_mirrors_after_the_crop()
     test_crop_snaps_for_prores_nv()
+    test_reveal_belongs_to_one_file()
     test_copy_adjust_skips_motion()
     test_perfo_skips_what_is_done_and_can_resume()
     test_review_badges()
@@ -356,4 +436,6 @@ if __name__ == "__main__":
     test_segment_lookup()
     test_horizontal_off_keeps_only_the_vertical()
     test_perfo_follows_a_hole()
+    test_split_copies_the_crop_and_the_later_one_keeps_proportion()
+    test_later_crop_scales_to_the_first_and_flips_on_its_own()
     print("ok")
