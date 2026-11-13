@@ -22,6 +22,7 @@ from PyQt6.QtCore import Qt, QTimer, QSize, QThread, pyqtSignal, QRect, QEvent
 from PyQt6.QtGui import QImage, QPixmap, QAction, QPainter, QColor, QFont, QIcon, QPen
 
 # Importamos el núcleo del scanner
+import film_finish
 import scanner_core
 from export_grade import ExportConfirmDialog, default_settings_for_file
 from export_session import ExportSessionDialog
@@ -1404,7 +1405,10 @@ class MainWindow(QMainWindow):
         self.file_list.clear()
         p = os.path.join(self.root_folder, coll_name)
         if os.path.exists(p):
-            files = sorted([f for f in os.listdir(p) if f.endswith(".raw")])
+            files = sorted(
+                (f for f in os.listdir(p) if f.endswith(".raw")),
+                key=film_finish.natural_key,
+            )
             self.file_list.addItems(files)
 
     def activate_collection(self, item):

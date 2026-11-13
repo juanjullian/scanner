@@ -451,9 +451,14 @@ class ExportSessionDialog(QDialog):
             "Avisa si alguno no tiene el recuadro."
         )
         self.btn_analyze.clicked.connect(self._analyze_selected)
+        self.btn_fps_all = QPushButton("FPS a todos")
+        self.btn_fps_all.setToolTip("Copia el FPS al resto de los archivos.")
+        self.btn_fps_all.clicked.connect(self._fps_to_all)
+        self._fps_anchor = None
         pick_row.addWidget(self.btn_all)
         pick_row.addWidget(self.btn_none)
         pick_row.addWidget(self.btn_analyze)
+        pick_row.addWidget(self.btn_fps_all)
         pick_row.addStretch()
         layout.addLayout(pick_row)
 
@@ -702,8 +707,22 @@ class ExportSessionDialog(QDialog):
     def _on_fps(self, filename: str):
         if self._applying:
             return
+        self._fps_anchor = filename
         self._draft(self._fmt, filename)["fps"] = int(self._fps[filename].value())
         self._mark(filename)
+
+    def _fps_to_all(self):
+        if not self.filenames:
+            return
+        anchor = self._fps_anchor if self._fps_anchor in self._fps else self.filenames[0]
+        value = int(self._fps[anchor].value())
+        for filename in self.filenames:
+            spin = self._fps[filename]
+            spin.blockSignals(True)
+            spin.setValue(value)
+            spin.blockSignals(False)
+            self._draft(self._fmt, filename)["fps"] = value
+            self._mark(filename)
 
     def _on_test(self, filename: str):
         if self._applying:
@@ -733,6 +752,7 @@ class ExportSessionDialog(QDialog):
         self.sharp_row.setVisible(opts["sharp"])
         self.reveal_row.setVisible(opts["reveal"])
         self.table.setColumnHidden(3, not opts["fps"])
+        self.btn_fps_all.setVisible(opts["fps"])
         self.table.setColumnHidden(4, not (opts["grade"] or opts["reveal"]))
         self.table.setColumnHidden(5, not opts["test"])
         self.chk_copy_grade.setVisible(opts["grade"])

@@ -5,14 +5,15 @@ from pathlib import Path
 
 import cv2
 import numpy as np
-from PyQt6.QtCore import QPoint, QPropertyAnimation, QRect, Qt, QTimer, pyqtSignal
+from PyQt6.QtCore import QEvent, QPoint, QPropertyAnimation, QRect, Qt, QTimer, pyqtSignal
 import time
 
 from PyQt6.QtGui import QColor, QCursor, QImage, QPainter, QPainterPath, QPen, QPixmap
 from PyQt6.QtWidgets import (
-    QCheckBox, QComboBox, QDialog, QFrame, QGraphicsOpacityEffect, QHBoxLayout,
-    QLabel, QLineEdit, QPushButton, QScrollArea, QSizePolicy, QSlider, QSplitter,
-    QStackedWidget, QVBoxLayout, QWidget,
+    QAbstractSpinBox, QApplication, QCheckBox, QComboBox, QDialog, QFrame,
+    QGraphicsOpacityEffect, QHBoxLayout, QLabel, QLineEdit, QMenu, QPlainTextEdit,
+    QPushButton, QScrollArea, QSizePolicy, QSlider, QSpinBox, QSplitter,
+    QStackedWidget, QTextEdit, QToolButton, QVBoxLayout, QWidget,
 )
 
 from timeline_bar import TimelineBar, _timeline_button
@@ -172,6 +173,8 @@ class FrameView(QWidget):
 
     play_clicked = pyqtSignal()
 
+    scale_picked = pyqtSignal(str)
+
     def __init__(self):
         super().__init__()
         self.setMinimumSize(640, 480)
@@ -204,6 +207,23 @@ class FrameView(QWidget):
         self._play.setGraphicsEffect(self._play_fx)
         self._play_fade = QPropertyAnimation(self._play_fx, b"opacity", self)
         self._play_fade.setDuration(180)
+        self._scale_btn = QToolButton(self)
+        self._scale_btn.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        self._scale_btn.setToolTip("Tamaño del visor")
+        self._scale_btn.setStyleSheet(
+            "QToolButton { background: rgba(0, 0, 0, 170); color: #f4f4f4;"
+            " border: none; padding: 4px 8px; }"
+            "QToolButton::menu-indicator { image: none; width: 0; }"
+        )
+        menu = QMenu(self._scale_btn)
+        self._scale_actions = {}
+        for key, label in (("quarter", "1/4"), ("half", "1/2"), ("full", "Completo")):
+            action = menu.addAction(label)
+            action.setCheckable(True)
+            action.triggered.connect(lambda _checked=False, mode=key: self._pick_scale(mode))
+            self._scale_actions[key] = action
+        self._scale_btn.setMenu(menu)
+        self.set_scale_choice(None)
 
     def set_view(self, rgb: np.ndarray, overlay=None, color="#ffcc00", side=None, allow_draw=False, captions=None, aspect=None):
         self._pix = _rgb_pixmap(rgb)
@@ -216,7 +236,18 @@ class FrameView(QWidget):
         if self._mode is None:
             self._draft = None
         self._place_play()
+        self._place_scale()
         self.update()
+
+    def set_scale_choice(self, mode: str | None):
+        labels = {"quarter": "1/4", "half": "1/2", "full": "Completo"}
+        self._scale_btn.setText(labels.get(mode, "·"))
+        for key, action in self._scale_actions.items():
+            action.setChecked(key == mode)
+        self._place_scale()
+
+    def _pick_scale(self, mode: str):
+        self.scale_picked.emit(mode)
 
     def set_empty(self, text: str):
         self._empty = text
@@ -250,6 +281,8 @@ class FrameView(QWidget):
         super().resizeEvent(event)
         if hasattr(self, "_play"):
             self._place_play()
+        if hasattr(self, "_scale_btn"):
+            self._place_scale()
 
     def _fade_play(self, target: float):
         self._play.setAttribute(
@@ -270,6 +303,11 @@ class FrameView(QWidget):
             y = left.center().y() - self._play.height() // 2
         self._play.move(x, y)
         self._play.raise_()
+
+    def _place_scale(self):
+        self._scale_btn.adjustSize()
+        self._scale_btn.move(max(0, self.width() - self._scale_btn.width() - 8), 8)
+        self._scale_btn.raise_()
 
     def _caption(self, painter: QPainter, placed: QRect, text: str):
         if not text or placed is None or placed.width() < 8:
@@ -528,7 +566,7 @@ class _AngleLabel(QLabel):
 
 
 class TurnControl(QWidget):
-    """Giro fino. La barra mueve 0,1° por paso, en un tramo de ±15°, y vuelve al centro."""
+    """Giro fino. La barra mueve 0,1° por paso, en un tramo de ±180°, y vuelve al centro."""
 
     changed = pyqtSignal(float)
 
@@ -541,7 +579,7 @@ class TurnControl(QWidget):
         tip = (
             "El recorte no se mueve. Gira la imagen detrás, como en Photoshop. "
             "A la derecha es positivo. Cada paso de la barra es 0,1°, "
-            "en un tramo de 15° a cada lado, y al soltar vuelve al centro. "
+            "en un tramo de 180° a cada lado, y al soltar vuelve al centro. "
             "Un clic en el número lo deja escribir, de -180 a 180."
         )
         title = QLabel("Giro")
@@ -566,7 +604,7 @@ class TurnControl(QWidget):
         head.addWidget(self._label)
         head.addWidget(self._edit)
         self._slider = QSlider(Qt.Orientation.Horizontal)
-        self._slider.setRange(-150, 150)
+        self._slider.setRange(-1800, 1800)
         self._slider.setSingleStep(1)
         self._slider.setPageStep(10)
         self._slider.setValue(0)
@@ -643,6 +681,76 @@ class TurnControl(QWidget):
         self._paint_label()
 
 
+class RollEnds(QWidget):
+    """Al revés, entrada y salida. Los números son cuadros de la pista, desde 1."""
+
+    changed = pyqtSignal()
+    grab = pyqtSignal(str)
+
+    def __init__(self):
+        super().__init__()
+        self._lock = False
+        self.chk_reverse = QCheckBox("Al revés")
+        self.chk_reverse.setToolTip(
+            "La cinta se escaneó de atrás para adelante. "
+            "La pista muestra el orden en que se va a ver. "
+            "El color, el recorte y la perforación se quedan en el cuadro en que se midieron."
+        )
+        self.spin_in = QSpinBox()
+        self.spin_out = QSpinBox()
+        for spin in (self.spin_in, self.spin_out):
+            spin.setRange(1, 1)
+        self.btn_in = QPushButton("Aquí")
+        self.btn_out = QPushButton("Aquí")
+        self.btn_in.setToolTip("La entrada queda en el cuadro de la línea.")
+        self.btn_out.setToolTip("La salida queda en el cuadro de la línea.")
+        self.chk_reverse.toggled.connect(self._emit)
+        self.spin_in.valueChanged.connect(self._emit)
+        self.spin_out.valueChanged.connect(self._emit)
+        self.btn_in.clicked.connect(lambda: self.grab.emit("in"))
+        self.btn_out.clicked.connect(lambda: self.grab.emit("out"))
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.addWidget(self.chk_reverse)
+        layout.addLayout(self._end_row("Entrada", self.spin_in, self.btn_in))
+        layout.addLayout(self._end_row("Salida", self.spin_out, self.btn_out))
+
+    @staticmethod
+    def _end_row(title: str, spin: QSpinBox, button: QPushButton) -> QHBoxLayout:
+        row = QHBoxLayout()
+        row.addWidget(QLabel(title))
+        row.addWidget(spin, 1)
+        row.addWidget(button)
+        return row
+
+    def _emit(self, *_args):
+        if not self._lock:
+            self.changed.emit()
+
+    def set_values(self, count: int, reverse: bool, view_in: int, view_out: int):
+        self._lock = True
+        last = max(1, int(count))
+        self.spin_in.setRange(1, last)
+        self.spin_out.setRange(1, last)
+        self.chk_reverse.setChecked(bool(reverse))
+        self.spin_in.setValue(max(1, min(last, int(view_in) + 1)))
+        self.spin_out.setValue(max(1, min(last, int(view_out) + 1)))
+        self._lock = False
+
+    def reverse(self) -> bool:
+        return self.chk_reverse.isChecked()
+
+    def view_in(self) -> int:
+        return int(self.spin_in.value()) - 1
+
+    def view_out(self) -> int:
+        return int(self.spin_out.value()) - 1
+
+    def put(self, which: str, frame: int):
+        spin = self.spin_in if which == "in" else self.spin_out
+        spin.setValue(int(frame) + 1)
+
+
 class RevealDialog(QDialog):
     def __init__(self, parent, folder: Path, filenames: list[str], collection_meta: dict, settings: dict, start_name: str | None):
         super().__init__(parent)
@@ -689,6 +797,8 @@ class RevealDialog(QDialog):
         self.view = FrameView()
         self.view.rect_ready.connect(self._on_rect)
         self.view.play_clicked.connect(self._toggle_play)
+        self.view.scale_picked.connect(self._on_scale)
+        self._scale = {}
         preview_col = QWidget()
         preview_lay = QVBoxLayout(preview_col)
         preview_lay.setContentsMargins(0, 0, 0, 0)
@@ -790,6 +900,9 @@ class RevealDialog(QDialog):
         root.addWidget(split, 1)
 
         self._load_sliders()
+        app = QApplication.instance()
+        if app is not None:
+            app.installEventFilter(self)
         self._set_task(0)
         if self._jobs is not None:
             self._jobs.progress.connect(self._on_job)
@@ -806,6 +919,9 @@ class RevealDialog(QDialog):
         return self.combo.currentText()
 
     def done(self, code: int):
+        app = QApplication.instance()
+        if app is not None:
+            app.removeEventFilter(self)
         self._stop_play()
         self._save_current()
         super().done(code)
@@ -1033,6 +1149,10 @@ class RevealDialog(QDialog):
         self.turn = TurnControl()
         self.turn.changed.connect(self._on_turn)
         layout.addWidget(self.turn)
+        self.roll = RollEnds()
+        self.roll.changed.connect(self._on_roll)
+        self.roll.grab.connect(self._grab_roll)
+        layout.addWidget(self.roll)
         layout.addStretch(1)
         return page
 
@@ -1233,6 +1353,10 @@ class RevealDialog(QDialog):
         self._playing = not self._playing
         self.view.set_playing(self._playing)
         if self._playing:
+            view = int(self.sld_frame.value())
+            lo, hi = self._trim_view()
+            if view < lo or view > hi:
+                self.sld_frame.setValue(lo)
             self._advance()
 
     def _stop_play(self, *_args):
@@ -1246,12 +1370,11 @@ class RevealDialog(QDialog):
         if not self._playing:
             return
         started = time.perf_counter()
-        nxt = int(self.sld_frame.value()) + 1
-        if nxt >= self._count:
-            nxt = 0
+        nxt = self._step_view(int(self.sld_frame.value()))
         self.sld_frame.blockSignals(True)
         self.sld_frame.setValue(nxt)
         self.sld_frame.blockSignals(False)
+        self._follow_span()
         self.lbl_frame.setText(f"Cuadro {nxt + 1}")
         self._refresh_bars()
         self._load_frame(fast=True)
@@ -1267,7 +1390,30 @@ class RevealDialog(QDialog):
         for number, button in enumerate(self._task_btns):
             button.setChecked(number == index)
         self._timeline_host.setVisible(index in (2, 3))
+        self.view.set_scale_choice(self._scale.get(index))
         self._paint_preview()
+
+    def _on_scale(self, mode: str):
+        self._scale[self._task] = mode
+        self.view.set_scale_choice(mode)
+        self._load_frame()
+
+    def eventFilter(self, obj, event):
+        if event.type() == QEvent.Type.KeyPress and event.key() == Qt.Key.Key_Space:
+            return self._space_play(event)
+        return super().eventFilter(obj, event)
+
+    def _space_play(self, event) -> bool:
+        if not self.isActiveWindow():
+            return False
+        focus = QApplication.focusWidget()
+        if focus is None or not self.isAncestorOf(focus):
+            return False
+        if isinstance(focus, (QLineEdit, QTextEdit, QPlainTextEdit, QAbstractSpinBox, QComboBox)):
+            return False
+        if not event.isAutoRepeat():
+            self._toggle_play()
+        return True
 
     def _add_slider(self, layout, key, title, lo, hi, scale, tip):
         title_lbl = QLabel(title)
@@ -1395,33 +1541,47 @@ class RevealDialog(QDialog):
         if not self.sld_frame.isSliderDown():
             self._frame_timer.start()
 
+    def _preview_bayer(self, packed: bytes, fast: bool):
+        """El debayer de esta pestaña. El segundo valor pide achicar a 1100, que es la vista de hoy."""
+        mode = getattr(self, "_scale", {}).get(self._task)
+        if mode == "quarter":
+            return reveal_pipeline.debayer_quarter(packed, FIXED_W, FIXED_H), False
+        if mode == "half":
+            return reveal_pipeline.debayer_half(packed, FIXED_W, FIXED_H), False
+        if mode == "full":
+            engine = self.combo_engine.currentData() or "cpu"
+            return reveal_pipeline.debayer_linear(packed, FIXED_W, FIXED_H, engine), False
+        if fast:
+            return reveal_pipeline.debayer_playback(packed, FIXED_W, FIXED_H), False
+        engine = self.combo_engine.currentData() or "cpu"
+        return reveal_pipeline.debayer_linear(packed, FIXED_W, FIXED_H, engine), True
+
     def _load_frame(self, fast: bool = False):
         name = self.combo.currentText()
         path = self._folder / name
         if not path.is_file() or not _is_bayer(name, self._meta):
             return
         frame_bytes = int(FIXED_W * FIXED_H * 1.5)
-        index = int(self.sld_frame.value())
-        self.lbl_frame.setText(f"Cuadro {index + 1}")
+        view = int(self.sld_frame.value())
+        index = self._source_index(view)
+        self.lbl_frame.setText(f"Cuadro {view + 1}")
         try:
             with open(path, "rb") as handle:
                 handle.seek(index * frame_bytes)
                 packed = handle.read(frame_bytes)
             if len(packed) < frame_bytes:
                 return
-            if fast:
-                lin = reveal_pipeline.debayer_playback(packed, FIXED_W, FIXED_H)
-                self._preview_wh = (int(lin.shape[1]), int(lin.shape[0]))
-                self._sigma_scale = self._preview_wh[0] / float(FIXED_W)
-                self._lin_prev = lin
-            else:
-                engine = self.combo_engine.currentData() or "cpu"
-                lin = reveal_pipeline.debayer_linear(packed, FIXED_W, FIXED_H, engine)
+            lin, shrink = self._preview_bayer(packed, fast)
+            if shrink:
                 preview_w = min(_PREVIEW_W, FIXED_W)
                 self._sigma_scale = preview_w / float(FIXED_W)
                 small_h = max(1, int(round(FIXED_H * self._sigma_scale)))
                 self._preview_wh = (preview_w, small_h)
                 self._lin_prev = cv2.resize(lin, (preview_w, small_h), interpolation=cv2.INTER_AREA)
+            else:
+                self._preview_wh = (int(lin.shape[1]), int(lin.shape[0]))
+                self._sigma_scale = self._preview_wh[0] / float(FIXED_W)
+                self._lin_prev = lin
         except Exception as exc:
             self._lin_prev = None
             self.lbl_note.setText(f"No se pudo leer el cuadro. {exc}")
@@ -1432,7 +1592,7 @@ class RevealDialog(QDialog):
         if self._lin_prev is None:
             return
         base = reveal_pipeline.apply_reveal(self._lin_prev, self._collect(), self._sigma_scale)
-        index = int(self.sld_frame.value())
+        index = self._source_index()
         mode, sat = self._grade_setting()
         recipe = self._recipe_for_preview(base, index) if mode == "color" and self._task in (2, 3) else None
         graded = gammac.apply(base, recipe) if recipe else base
@@ -1515,6 +1675,71 @@ class RevealDialog(QDialog):
             return self._play_recipe
         return None
 
+    def _reverse(self) -> bool:
+        return bool(self._adjust.get("reverse"))
+
+    def _source_index(self, view: int | None = None) -> int:
+        if view is None:
+            view = int(self.sld_frame.value())
+        return film_finish.view_to_source(view, self._count, self._reverse())
+
+    def _trim_view(self) -> tuple[int, int]:
+        return film_finish.trim_to_view(
+            self._count, self._reverse(),
+            self._adjust.get("trim_in"), self._adjust.get("trim_out"),
+        )
+
+    def _sync_roll(self):
+        if not hasattr(self, "roll"):
+            return
+        lo, hi = self._trim_view()
+        self.roll.set_values(self._count, self._reverse(), lo, hi)
+
+    def _on_roll(self):
+        old = self._reverse()
+        new = self.roll.reverse()
+        view = int(self.sld_frame.value())
+        if new != old:
+            source = film_finish.view_to_source(view, self._count, old)
+            view = film_finish.source_to_view(source, self._count, new)
+            self.sld_frame.blockSignals(True)
+            self.sld_frame.setValue(view)
+            self.sld_frame.blockSignals(False)
+        lo = min(self.roll.view_in(), self.roll.view_out())
+        hi = max(self.roll.view_in(), self.roll.view_out())
+        trim_in, trim_out = film_finish.trim_from_view(self._count, new, lo, hi)
+        self._adjust["reverse"] = new
+        self._adjust["trim_in"] = trim_in
+        self._adjust["trim_out"] = trim_out
+        self._sync_roll()
+        self._save_current()
+        self._load_frame()
+
+    def _grab_roll(self, which: str):
+        self.roll.put(which, int(self.sld_frame.value()))
+
+    def _step_view(self, view: int) -> int:
+        lo, hi = self._trim_view()
+        nxt = int(view) + 1
+        if nxt > hi or nxt < lo:
+            return lo
+        return nxt
+
+    def _view_spans(self, source_spans, selected: int):
+        view = film_finish.spans_to_view(source_spans, self._count, self._reverse())
+        chosen = None
+        if source_spans and 0 <= int(selected) < len(source_spans):
+            chosen = source_spans[int(selected)]
+        return view, film_finish.view_index_of(view, chosen, self._count, self._reverse())
+
+    def _store_view_spans(self, view_spans, view_selected: int):
+        source = film_finish.spans_to_source(view_spans, self._count, self._reverse())
+        picked = None
+        if view_spans and 0 <= int(view_selected) < len(view_spans):
+            picked = view_spans[int(view_selected)]
+        index = film_finish.source_index_of(source, picked, self._count, self._reverse())
+        return source, index
+
     def _turn_degrees(self) -> float:
         if self._task != 3:
             return 0.0
@@ -1534,7 +1759,7 @@ class RevealDialog(QDialog):
     def _warp_preview(self, image):
         tx, ty = 0.0, 0.0
         if self._shifts:
-            index = int(self.sld_frame.value())
+            index = self._source_index()
             if index < len(self._shifts[0]):
                 tx = self._shifts[0][index] * self._sigma_scale
                 ty = self._shifts[1][index] * self._sigma_scale
@@ -1595,11 +1820,11 @@ class RevealDialog(QDialog):
         full = self._full_rect(rect)
         if self._task == 1:
             self._roi = full
-            self._roi_ref = int(self.sld_frame.value())
+            self._roi_ref = self._source_index()
             self.chk_perfo.setChecked(True)
             self.lbl_perfo.setText(
                 f"Zona {full[2]}×{full[3]} en {full[0]}, {full[1]}."
-                f" Referencia: cuadro {self._roi_ref + 1}."
+                f" Referencia: cuadro {int(self.sld_frame.value()) + 1}."
             )
             self._save_current()
         elif self._task == 3:
@@ -1639,6 +1864,7 @@ class RevealDialog(QDialog):
         self._sync_segment_controls()
         self._sync_grade_controls()
         self._sync_turn()
+        self._sync_roll()
         self._refresh_bars()
         self._refresh_review()
 
@@ -1702,7 +1928,8 @@ class RevealDialog(QDialog):
         if self._roi is None:
             self.lbl_perfo.setText("Sin zona.")
             return
-        ref = f" Referencia: cuadro {self._roi_ref + 1}." if self._roi_ref is not None else ""
+        shown = film_finish.source_to_view(int(self._roi_ref), self._count, self._reverse()) + 1
+        ref = f" Referencia: cuadro {shown}." if self._roi_ref is not None else ""
         if status == "done":
             text = f"Lista. Margen negro de {self._pad} px.{ref}"
         elif status == "running":
@@ -1745,7 +1972,7 @@ class RevealDialog(QDialog):
     def _job_ref(self, name: str, data=None) -> int:
         ref = self._saved_ref(name, data)
         if ref is None and name == self._current:
-            return int(self.sld_frame.value())
+            return self._source_index()
         return 0 if ref is None else int(ref)
 
     def _enqueue(self, name, roi=None, force: bool = False):
@@ -1762,7 +1989,7 @@ class RevealDialog(QDialog):
             self._jobs.settled.connect(self._on_job_done)
         if name == self._current:
             if self._roi_ref is None:
-                self._roi_ref = int(self.sld_frame.value())
+                self._roi_ref = self._source_index()
             self.chk_perfo.setChecked(True)
             self._save_current()
         else:
@@ -1824,7 +2051,7 @@ class RevealDialog(QDialog):
 
     def _ensure_segment(self):
         spans = self._covered_segments()
-        frame = int(self.sld_frame.value())
+        frame = self._source_index()
         for index, item in enumerate(spans):
             if int(item["in"]) <= frame <= int(item["out"]):
                 self._segment = index
@@ -1909,30 +2136,35 @@ class RevealDialog(QDialog):
         self._frame_timer.start()
 
     def _on_timeline_pick(self, index: int):
-        if self._task == 3:
-            self._crop_i = int(index)
+        crop = self._task == 3
+        source_spans = self._covered_crops() if crop else self._covered_segments()
+        view, _view_i = self._view_spans(source_spans, 0)
+        if not (0 <= index < len(view)):
+            return
+        chosen = film_finish.source_index_of(source_spans, view[index], self._count, self._reverse())
+        if crop:
+            self._crop_i = chosen
             self._sync_crop_view()
         else:
-            self._segment = int(index)
+            self._segment = chosen
             self._sync_segment_controls()
-        spans = self._covered_crops() if self._task == 3 else self._covered_segments()
-        if 0 <= index < len(spans):
-            start, end = int(spans[index]["in"]), int(spans[index]["out"])
-            frame = int(self.sld_frame.value())
-            if frame < start or frame > end:
-                self.sld_frame.setValue(start)
-                self._load_frame()
+        start, end = int(view[index]["in"]), int(view[index]["out"])
+        frame = int(self.sld_frame.value())
+        if frame < start or frame > end:
+            self.sld_frame.setValue(start)
+            self._load_frame()
         self._refresh_bars()
 
     def _on_timeline_edit(self, spans, selected: int):
+        stored, index = self._store_view_spans(list(spans), int(selected))
         if self._task == 3:
-            self._adjust["crop_spans"] = list(spans)
-            self._crop_i = int(selected)
-            self.chk_crop.setChecked(any(item.get("crop") for item in spans))
+            self._adjust["crop_spans"] = stored
+            self._crop_i = index
+            self.chk_crop.setChecked(any(item.get("crop") for item in stored))
             self._sync_crop_view()
         else:
-            self._adjust["segments"] = list(spans)
-            self._segment = int(selected)
+            self._adjust["segments"] = stored
+            self._segment = index
             self._play_recipe = None
             self._draft_id = None
             self._sync_segment_controls()
@@ -1940,43 +2172,48 @@ class RevealDialog(QDialog):
         self._paint_preview()
 
     def _split_at_head(self):
-        if self._task == 3:
-            spans = self._covered_crops()
-            new, selected, changed = film_finish.split_at(spans, int(self.sld_frame.value()), self._count)
-            if not changed:
-                self.lbl_crop.setText("La línea está en el borde del tramo. Métela adentro para partir.")
-                return
-            self._adjust["crop_spans"] = new
-            self._crop_i = selected
+        crop = self._task == 3
+        source_spans = self._covered_crops() if crop else self._covered_segments()
+        view, _view_i = self._view_spans(source_spans, 0)
+        new, selected, changed = film_finish.split_at(view, int(self.sld_frame.value()), self._count)
+        if not changed:
+            text = "La línea está en el borde del tramo. Métela adentro para partir."
+            if crop:
+                self.lbl_crop.setText(text)
+            else:
+                self.lbl_color.setText(text)
+            return
+        stored, index = self._store_view_spans(new, selected)
+        if crop:
+            self._adjust["crop_spans"] = stored
+            self._crop_i = index
         else:
-            spans = self._covered_segments()
-            new, selected, changed = film_finish.split_at(spans, int(self.sld_frame.value()), self._count)
-            if not changed:
-                self.lbl_color.setText("La línea está en el borde del tramo. Métela adentro para partir.")
-                return
-            self._adjust["segments"] = new
-            self._segment = selected
+            self._adjust["segments"] = stored
+            self._segment = index
             self._sync_segment_controls()
         self._save_current()
         self._paint_preview()
 
     def _merge_selected(self):
-        if self._task == 3:
-            spans = self._covered_crops()
-            new, selected, changed = film_finish.merge_span(spans, self._crop_i)
-            if not changed:
-                self.lbl_crop.setText("Hay un solo tramo: cubre el rollo entero.")
-                return
-            self._adjust["crop_spans"] = new
-            self._crop_i = selected
+        crop = self._task == 3
+        source_spans = self._covered_crops() if crop else self._covered_segments()
+        selected = self._crop_i if crop else self._segment
+        view, view_i = self._view_spans(source_spans, selected)
+        new, selected_view, changed = film_finish.merge_span(view, view_i)
+        if not changed:
+            text = "Hay un solo tramo: cubre el rollo entero."
+            if crop:
+                self.lbl_crop.setText(text)
+            else:
+                self.lbl_color.setText(text)
+            return
+        stored, index = self._store_view_spans(new, selected_view)
+        if crop:
+            self._adjust["crop_spans"] = stored
+            self._crop_i = index
         else:
-            spans = self._covered_segments()
-            new, selected, changed = film_finish.merge_span(spans, self._segment)
-            if not changed:
-                self.lbl_color.setText("Hay un solo tramo: cubre el rollo entero.")
-                return
-            self._adjust["segments"] = new
-            self._segment = selected
+            self._adjust["segments"] = stored
+            self._segment = index
             self._play_recipe = None
             self._draft_id = None
             self._sync_segment_controls()
@@ -1984,7 +2221,7 @@ class RevealDialog(QDialog):
         self._paint_preview()
 
     def _follow_span(self):
-        frame = int(self.sld_frame.value())
+        frame = self._source_index()
         if self._task == 3:
             spans = self._covered_crops()
             for index, span in enumerate(spans):
@@ -2075,7 +2312,7 @@ class RevealDialog(QDialog):
             self._paint_preview()
             return
         self._write_knobs(segment)
-        frame = int(self.sld_frame.value())
+        frame = self._source_index()
         if int(segment["in"]) <= frame <= int(segment["out"]):
             segment["dirty"] = True
             self._play_recipe = None
@@ -2105,7 +2342,7 @@ class RevealDialog(QDialog):
         if segment is None or not segment.get("rect"):
             self.lbl_color.setText("Primero dibuja el área y marca el tramo.")
             return
-        frame = int(self.sld_frame.value())
+        frame = self._source_index()
         if not (int(segment["in"]) <= frame <= int(segment["out"])):
             sample = segment.get("sample")
             if allow_sample and sample is not None and int(segment["in"]) <= int(sample) <= int(segment["out"]):
@@ -2163,7 +2400,10 @@ class RevealDialog(QDialog):
             spans, selected = self._covered_crops(), self._crop_i
         else:
             spans, selected = self._covered_segments(), self._segment
-        self.bar.set_bar(self._count, spans, selected, int(self.sld_frame.value()))
+        view, view_i = self._view_spans(spans, selected)
+        lo, hi = self._trim_view()
+        keep = None if lo <= 0 and hi >= max(0, self._count - 1) else (lo, hi)
+        self.bar.set_bar(self._count, view, view_i, int(self.sld_frame.value()), keep)
 
     def _refresh_crop_label(self):
         if self._crop is None:

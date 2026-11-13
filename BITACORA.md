@@ -1,5 +1,24 @@
 # Bitácora — Lucid Scanner
 
+## 2026-11-13 — Orden del rollo, visor y análisis fuera de la carpeta
+
+### Por qué
+Con varios tramos, el gamma medido se veía en Color y al pasar a Recorte parecía que no se había aplicado. Un rollo escaneado de atrás para adelante no se podía invertir sin volver a medir. El pre y el post roll sobraban en la salida. El ángulo escrito llegaba a ±180°, pero la barra solo empujaba ±15°. Cambiar el FPS, al buscar un cuadro por tiempo, podía caer en otro. La lista ponía F8_0000148 antes que F8_0000100 cuando el número no traía ceros. El `perfo.json` quedaba al lado de cada video y no se sabía qué hacer con él después.
+
+### Cómo
+- Los tramos siguen guardados en el índice del archivo. La pista, la reproducción y la exportación usan el orden en que se ve el rollo. «Al revés» es del rollo entero: un tramo medido en los cuadros 100–200 de un rollo de 1000 se ve en 799–899, y no se vuelve a medir. Apagarlo deja los números donde estaban.
+- Entrada y salida cortan las puntas en ese orden. Esas puntas no se reproducen ni se exportan. La perforación se sigue midiendo sobre el archivo entero; a la salida entran solo los cuadros que quedan. Recorte, volteo, giro y desplazamiento viajan con el cuadro de origen. Estabilización sigue mostrando el par original / estabilizado, sin gamma.
+- Color y Recorte consultan la receta de ese cuadro de origen. Un tramo limitado sigue sin gamma. El video ya revelado y el raw recorren la misma lista. Sin reverse ni recorte de puntas, la lectura sigue siendo secuencial.
+- La barra de giro va de −180° a 180°, de a 0,1°, y al soltar vuelve al centro. Arriba a la derecha del visor hay 1/4, 1/2 y Completo, por pestaña. Hasta que se elige, cada pestaña queda como estaba. La barra espaciadora reproduce y pausa. Si el foco está en un campo de texto, el espacio se escribe ahí.
+- «Nombre», al lado de Subir y Bajar, ordena con los números en orden. Soltar una carpeta entra así. La lista de raw usa el mismo criterio. El FPS editado solo cambia la velocidad de reproducción y el `-r` del archivo de salida. «A todos» en el tratador, y «FPS a todos» en la tabla de exportación, copian ese valor.
+- El `perfo.json` va a la carpeta temporal del sistema, en `scanner-analisis`. En Windows es la de `%TEMP%`. El tratador y la exportación del raw usan el mismo lugar. Dos rollos con el mismo nombre, en carpetas distintas, no se pisan. Si todavía hay un análisis al lado del archivo, se mueve al abrir esa carpeta. El `adjust.json` sigue al lado: ahí están el color, el recorte, el reverse y el revelado.
+
+### Hecho
+- El gamma de cada tramo se ve en Color y en Recorte, y sale en el cuadro que le corresponde.
+- Se puede invertir el rollo y cortar las puntas sin reescribir lo medido.
+- El visor elige el tamaño y la barra espaciadora reproduce.
+- El análisis de perforación deja de llenar la carpeta del video.
+
 ## 2026-11-12 — Revelado por archivo, tramos y ProRes 422 HQ
 
 ### Por qué

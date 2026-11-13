@@ -8,18 +8,19 @@ from pathlib import Path
 
 import cv2
 import numpy as np
-from PyQt6.QtCore import Qt, QThread, QTimer, pyqtSignal
+from PyQt6.QtCore import QEvent, Qt, QThread, QTimer, pyqtSignal
 from PyQt6.QtWidgets import (
-    QAbstractItemView, QCheckBox, QComboBox, QDoubleSpinBox, QFileDialog, QFrame,
-    QHBoxLayout, QLabel, QListWidget, QListWidgetItem, QMainWindow, QMessageBox,
-    QProgressBar, QPushButton, QScrollArea, QSlider, QSplitter, QStackedWidget,
-    QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget,
+    QAbstractItemView, QAbstractSpinBox, QApplication, QCheckBox, QComboBox,
+    QDoubleSpinBox, QFileDialog, QFrame, QHBoxLayout, QLabel, QLineEdit, QListWidget,
+    QListWidgetItem, QMainWindow, QMessageBox, QPlainTextEdit, QProgressBar,
+    QPushButton, QScrollArea, QSlider, QSplitter, QStackedWidget, QTableWidget,
+    QTableWidgetItem, QTextEdit, QVBoxLayout, QWidget,
 )
 
 import film_finish
 import gammac
 from export_session import estimate_remaining_seconds, format_duration
-from reveal_dialog import FrameView, TurnControl, _GENTLE, _NEUTRAL, _paint_badges
+from reveal_dialog import FrameView, RollEnds, TurnControl, _GENTLE, _NEUTRAL, _paint_badges
 from timeline_bar import TimelineBar, _timeline_button
 from video_export import export_clip, output_path
 from video_session import (
@@ -41,6 +42,7 @@ class Clip:
     fps: float = 24.0
     fps_text: str = "24/1"
     fps_edited: bool = False
+    fps_file: float = 0.0
     width: int = 0
     height: int = 0
     frames: int = 0
@@ -50,7 +52,13 @@ class Clip:
     def info(self) -> VideoInfo | None:
         if not self.linked or self.width < 2 or self.frames < 1:
             return None
-        return VideoInfo(Path(self.path), self.width, self.height, self.fps, self.fps_text, self.frames)
+        return VideoInfo(Path(self.path), self.width, self.height, self.file_rate(), self.fps_text, self.frames)
+
+    def file_rate(self) -> float:
+        """FPS del archivo, para leer un cuadro. El editado solo cambia la salida."""
+        if self.fps_file > 0:
+            return self.fps_file
+        return self.fps if self.fps > 0 else 24.0
 
 
 class ClipList(QListWidget):
@@ -249,9 +257,13 @@ class VideoFinishWindow(QMainWindow):
         btn_up.clicked.connect(lambda: self._move(-1))
         btn_down = QPushButton("Bajar")
         btn_down.clicked.connect(lambda: self._move(1))
+        btn_name = QPushButton("Nombre")
+        btn_name.setToolTip("Ordena la lista por nombre, con los números en orden.")
+        btn_name.clicked.connect(self._sort_name)
         row.addWidget(btn_remove)
         row.addWidget(btn_up)
         row.addWidget(btn_down)
+        row.addWidget(btn_name)
         left.addLayout(row)
         left_wrap = QWidget()
         left_wrap.setLayout(left)
@@ -266,6 +278,8 @@ class VideoFinishWindow(QMainWindow):
         )
         self.view.rect_ready.connect(self._on_rect)
         self.view.play_clicked.connect(self._toggle_play)
+        self.view.scale_picked.connect(self._on_scale)
+        self._scale = {}
         preview_col = QWidget()
         preview_lay = QVBoxLayout(preview_col)
         preview_lay.setContentsMargins(0, 0, 0, 0)
@@ -362,6 +376,10 @@ class VideoFinishWindow(QMainWindow):
         self.spin_fps.setSingleStep(1)
         self.spin_fps.valueChanged.connect(self._on_fps)
         bar.addWidget(self.spin_fps)
+        btn_fps = QPushButton("A todos")
+        btn_fps.setToolTip("Copia este FPS a los demás videos de la lista.")
+        btn_fps.clicked.connect(self._fps_all)
+        bar.addWidget(btn_fps)
         self.btn_export = QPushButton("Exportar")
         self.btn_export.clicked.connect(self._export_clicked)
         bar.addWidget(self.btn_export)
@@ -397,11 +415,17 @@ class VideoFinishWindow(QMainWindow):
         self._session_timer.timeout.connect(self._write_session)
 
         self.setStyleSheet(_style())
+        app = QApplication.instance()
+        if app is not None:
+            app.installEventFilter(self)
         self._set_task(0)
         self._load_saved_list()
         QTimer.singleShot(0, self._offer_relink)
 
     def closeEvent(self, event):
+        app = QApplication.instance()
+        if app is not None:
+            app.removeEventFilter(self)
         self._stop_play()
         self._save_current()
         self._analyze_queue.clear()
@@ -563,6 +587,10 @@ class VideoFinishWindow(QMainWindow):
         self.turn = TurnControl()
         self.turn.changed.connect(self._on_turn)
         layout.addWidget(self.turn)
+        self.roll = RollEnds()
+        self.roll.changed.connect(self._on_roll)
+        self.roll.grab.connect(self._grab_roll)
+        layout.addWidget(self.roll)
         layout.addStretch(1)
         return page
 
@@ -581,6 +609,8 @@ class VideoFinishWindow(QMainWindow):
                     clip.linked = False
             self._clips[path] = clip
             order.append(path)
+        for parent in {Path(path).parent for path in order}:
+            film_finish.relocate_analysis(parent)
         self._fill_list(order, select=order[0] if order else None)
 
     def _offer_relink(self):
@@ -669,6 +699,7 @@ class VideoFinishWindow(QMainWindow):
             fps=clip.fps if clip.fps_edited else info.fps,
             fps_text=f"{clip.fps:.6f}" if clip.fps_edited else info.fps_text,
             fps_edited=clip.fps_edited,
+            fps_file=info.fps,
             width=info.width,
             height=info.height,
             frames=info.frames,
@@ -698,12 +729,20 @@ class VideoFinishWindow(QMainWindow):
         added = None
         skipped = []
         order = self._order()
+        swept = set()
         for raw in paths:
             path = Path(raw)
+            home = path if path.is_dir() else path.parent
+            if home not in swept:
+                swept.add(home)
+                film_finish.relocate_analysis(home)
             if path.is_dir():
-                for child in sorted(path.iterdir()):
-                    if is_video(child):
-                        added = self._add_one(child, order) or added
+                children = sorted(
+                    (child for child in path.iterdir() if is_video(child)),
+                    key=lambda child: film_finish.natural_key(child.name),
+                )
+                for child in children:
+                    added = self._add_one(child, order) or added
                 continue
             if not is_video(path):
                 skipped.append(path.name)
@@ -745,6 +784,13 @@ class VideoFinishWindow(QMainWindow):
                     self._current = None
         select = order[min(rows[-1], len(order) - 1)] if order else None
         self._fill_list(order, select=select)
+        self._save_session()
+
+    def _sort_name(self):
+        order = sorted(self._order(), key=lambda item: film_finish.natural_key(Path(item).name))
+        if order == self._order():
+            return
+        self._fill_list(order, select=self._current)
         self._save_session()
 
     def _move(self, delta: int):
@@ -860,6 +906,7 @@ class VideoFinishWindow(QMainWindow):
         self._sync_segment_controls()
         self._sync_grade_controls()
         self._sync_turn()
+        self._sync_roll()
         self._refresh_bars()
         self._refresh_review()
 
@@ -926,6 +973,40 @@ class VideoFinishWindow(QMainWindow):
         self._refresh_label(clip.path)
         self._save_session()
 
+    def _fps_all(self):
+        if not self._clips or self._filling:
+            return
+        value = float(self.spin_fps.value())
+        text = f"{value:.6f}"
+        for clip in self._clips.values():
+            clip.fps = value
+            clip.fps_edited = True
+            clip.fps_text = text
+            self._refresh_label(clip.path)
+        self._save_session()
+
+    def _on_scale(self, mode: str):
+        self._scale[self._task] = mode
+        self.view.set_scale_choice(mode)
+        self._load_frame()
+
+    def eventFilter(self, obj, event):
+        if event.type() == QEvent.Type.KeyPress and event.key() == Qt.Key.Key_Space:
+            return self._space_play(event)
+        return super().eventFilter(obj, event)
+
+    def _space_play(self, event) -> bool:
+        if not self.isActiveWindow():
+            return False
+        focus = QApplication.focusWidget()
+        if focus is None or not self.isAncestorOf(focus):
+            return False
+        if isinstance(focus, (QLineEdit, QTextEdit, QPlainTextEdit, QAbstractSpinBox, QComboBox)):
+            return False
+        if not event.isAutoRepeat():
+            self._toggle_play()
+        return True
+
     def _set_task(self, index: int):
         self._task = index
         self.stack.setCurrentIndex(index)
@@ -933,6 +1014,7 @@ class VideoFinishWindow(QMainWindow):
             button.setChecked(number == index)
         if hasattr(self, "_timeline_host"):
             self._timeline_host.setVisible(index in (1, 2))
+        self.view.set_scale_choice(self._scale.get(index))
         self._paint_preview()
 
     def _on_frame_label(self, value: int):
@@ -947,11 +1029,12 @@ class VideoFinishWindow(QMainWindow):
         info = clip.info() if clip else None
         if info is None:
             return
-        index = int(self.sld_frame.value())
+        view = int(self.sld_frame.value())
         if not self._playing:
-            self.lbl_frame.setText(f"Cuadro {index + 1}")
+            self.lbl_frame.setText(f"Cuadro {view + 1}")
+        index = self._source_index(view)
         try:
-            image = self._reader.frame(info, index, _PREVIEW_W)
+            image = self._reader.frame(info, index, self._preview_limit())
         except VideoError as exc:
             self.lbl_status.setText(str(exc))
             return
@@ -964,9 +1047,9 @@ class VideoFinishWindow(QMainWindow):
         if self._preview is None:
             return
         base = self._preview
-        index = int(self.sld_frame.value())
+        index = self._source_index()
         mode, sat = self._grade_setting()
-        recipe = self._recipe_for_preview(base, index) if mode == "color" and self._task == 1 else None
+        recipe = self._recipe_for_preview(base, index) if mode == "color" and self._task in (1, 2) else None
         graded = gammac.apply(base, recipe) if recipe else base
         graded = gammac.saturate(graded, sat)
         plain = gammac.saturate(base, sat)
@@ -1021,9 +1104,14 @@ class VideoFinishWindow(QMainWindow):
         if self._playing:
             self._stop_play()
             return
+        view = int(self.sld_frame.value())
+        lo, _hi = self._trim_view()
+        if view < lo or view > self._trim_view()[1]:
+            self.sld_frame.setValue(lo)
+            view = lo
         self._playing = True
         self.view.set_playing(True)
-        self._show_play_state(int(self.sld_frame.value()))
+        self._show_play_state(view)
         self._paint_preview()
         QTimer.singleShot(0, self._advance)
 
@@ -1049,12 +1137,11 @@ class VideoFinishWindow(QMainWindow):
         if not self._playing:
             return
         started = time.perf_counter()
-        nxt = int(self.sld_frame.value()) + 1
-        if nxt >= self._count:
-            nxt = 0
+        nxt = self._step_view(int(self.sld_frame.value()))
         self.sld_frame.blockSignals(True)
         self.sld_frame.setValue(nxt)
         self.sld_frame.blockSignals(False)
+        self._follow_span()
         self._show_play_state(nxt)
         self._load_frame()
         if not self._playing:
@@ -1071,11 +1158,11 @@ class VideoFinishWindow(QMainWindow):
             return
         if self._task == 0:
             self._roi = full
-            self._roi_ref = int(self.sld_frame.value())
+            self._roi_ref = self._source_index()
             self.chk_perfo.setChecked(True)
             self.lbl_perfo.setText(
                 f"Zona {full[2]}×{full[3]} en {full[0]}, {full[1]}."
-                f" Referencia: cuadro {self._roi_ref + 1}."
+                f" Referencia: cuadro {int(self.sld_frame.value()) + 1}."
             )
         elif self._task == 2:
             if self._flip_on():
@@ -1104,7 +1191,7 @@ class VideoFinishWindow(QMainWindow):
             self.lbl_perfo.setText("Dibuja primero la zona de la perforación.")
             return
         if self._roi_ref is None:
-            self._roi_ref = int(self.sld_frame.value())
+            self._roi_ref = self._source_index()
         self.chk_perfo.setChecked(True)
         self._save_current()
         self._enqueue(clip, self._roi, self._saved_ref(clip))
@@ -1146,7 +1233,7 @@ class VideoFinishWindow(QMainWindow):
         if clip.path == self._current:
             self._adjust["perfo"] = data["perfo"]
             self._roi_ref = int(ref)
-        job = (clip.path, tuple(zone), int(ref), clip.width, clip.height, clip.frames, clip.fps)
+        job = (clip.path, tuple(zone), int(ref), clip.width, clip.height, clip.frames, clip.file_rate())
         self._analyze_queue.append(job)
         if clip.path == self._current:
             self.lbl_perfo.setText("En la cola.")
@@ -1227,7 +1314,8 @@ class VideoFinishWindow(QMainWindow):
         if self._roi is None:
             self.lbl_perfo.setText("Sin zona.")
             return
-        ref = f" Referencia: cuadro {self._roi_ref + 1}." if self._roi_ref is not None else ""
+        shown = film_finish.source_to_view(int(self._roi_ref), self._count, self._reverse()) + 1
+        ref = f" Referencia: cuadro {shown}." if self._roi_ref is not None else ""
         if status == "done":
             text = f"Lista. Margen negro de {self._pad} px.{ref}"
             if message and message != "Lista":
@@ -1407,7 +1495,7 @@ class VideoFinishWindow(QMainWindow):
 
     def _ensure_segment(self):
         spans = self._covered_segments()
-        frame = int(self.sld_frame.value())
+        frame = self._source_index()
         self._segment = 0
         for index, item in enumerate(spans):
             if int(item["in"]) <= frame <= int(item["out"]):
@@ -1480,30 +1568,35 @@ class VideoFinishWindow(QMainWindow):
         self._frame_timer.start()
 
     def _on_timeline_pick(self, index: int):
-        if self._task == 2:
-            self._crop_i = int(index)
+        crop = self._task == 2
+        source_spans = self._covered_crops() if crop else self._covered_segments()
+        view, _view_i = self._view_spans(source_spans, 0)
+        if not (0 <= index < len(view)):
+            return
+        chosen = film_finish.source_index_of(source_spans, view[index], self._count, self._reverse())
+        if crop:
+            self._crop_i = chosen
             self._sync_crop_view()
         else:
-            self._segment = int(index)
+            self._segment = chosen
             self._sync_segment_controls()
-        spans = self._covered_crops() if self._task == 2 else self._covered_segments()
-        if 0 <= index < len(spans):
-            start, end = int(spans[index]["in"]), int(spans[index]["out"])
-            frame = int(self.sld_frame.value())
-            if frame < start or frame > end:
-                self.sld_frame.setValue(start)
-                self._load_frame()
+        start, end = int(view[index]["in"]), int(view[index]["out"])
+        frame = int(self.sld_frame.value())
+        if frame < start or frame > end:
+            self.sld_frame.setValue(start)
+            self._load_frame()
         self._refresh_bars()
 
     def _on_timeline_edit(self, spans, selected: int):
+        stored, index = self._store_view_spans(list(spans), int(selected))
         if self._task == 2:
-            self._adjust["crop_spans"] = list(spans)
-            self._crop_i = int(selected)
-            self.chk_crop.setChecked(any(item.get("crop") for item in spans))
+            self._adjust["crop_spans"] = stored
+            self._crop_i = index
+            self.chk_crop.setChecked(any(item.get("crop") for item in stored))
             self._sync_crop_view()
         else:
-            self._adjust["segments"] = list(spans)
-            self._segment = int(selected)
+            self._adjust["segments"] = stored
+            self._segment = index
             self._play_recipe = None
             self._draft_id = None
             self._sync_segment_controls()
@@ -1511,43 +1604,48 @@ class VideoFinishWindow(QMainWindow):
         self._paint_preview()
 
     def _split_at_head(self):
-        if self._task == 2:
-            spans = self._covered_crops()
-            new, selected, changed = film_finish.split_at(spans, int(self.sld_frame.value()), self._count)
-            if not changed:
-                self.lbl_crop.setText("La línea está en el borde del tramo. Métela adentro para partir.")
-                return
-            self._adjust["crop_spans"] = new
-            self._crop_i = selected
+        crop = self._task == 2
+        source_spans = self._covered_crops() if crop else self._covered_segments()
+        view, _view_i = self._view_spans(source_spans, 0)
+        new, selected, changed = film_finish.split_at(view, int(self.sld_frame.value()), self._count)
+        if not changed:
+            text = "La línea está en el borde del tramo. Métela adentro para partir."
+            if crop:
+                self.lbl_crop.setText(text)
+            else:
+                self.lbl_color.setText(text)
+            return
+        stored, index = self._store_view_spans(new, selected)
+        if crop:
+            self._adjust["crop_spans"] = stored
+            self._crop_i = index
         else:
-            spans = self._covered_segments()
-            new, selected, changed = film_finish.split_at(spans, int(self.sld_frame.value()), self._count)
-            if not changed:
-                self.lbl_color.setText("La línea está en el borde del tramo. Métela adentro para partir.")
-                return
-            self._adjust["segments"] = new
-            self._segment = selected
+            self._adjust["segments"] = stored
+            self._segment = index
             self._sync_segment_controls()
         self._save_current()
         self._paint_preview()
 
     def _merge_selected(self):
-        if self._task == 2:
-            spans = self._covered_crops()
-            new, selected, changed = film_finish.merge_span(spans, self._crop_i)
-            if not changed:
-                self.lbl_crop.setText("Hay un solo tramo: cubre el rollo entero.")
-                return
-            self._adjust["crop_spans"] = new
-            self._crop_i = selected
+        crop = self._task == 2
+        source_spans = self._covered_crops() if crop else self._covered_segments()
+        selected = self._crop_i if crop else self._segment
+        view, view_i = self._view_spans(source_spans, selected)
+        new, selected_view, changed = film_finish.merge_span(view, view_i)
+        if not changed:
+            text = "Hay un solo tramo: cubre el rollo entero."
+            if crop:
+                self.lbl_crop.setText(text)
+            else:
+                self.lbl_color.setText(text)
+            return
+        stored, index = self._store_view_spans(new, selected_view)
+        if crop:
+            self._adjust["crop_spans"] = stored
+            self._crop_i = index
         else:
-            spans = self._covered_segments()
-            new, selected, changed = film_finish.merge_span(spans, self._segment)
-            if not changed:
-                self.lbl_color.setText("Hay un solo tramo: cubre el rollo entero.")
-                return
-            self._adjust["segments"] = new
-            self._segment = selected
+            self._adjust["segments"] = stored
+            self._segment = index
             self._play_recipe = None
             self._draft_id = None
             self._sync_segment_controls()
@@ -1555,7 +1653,7 @@ class VideoFinishWindow(QMainWindow):
         self._paint_preview()
 
     def _follow_span(self):
-        frame = int(self.sld_frame.value())
+        frame = self._source_index()
         if self._task == 2:
             spans = self._covered_crops()
             for index, span in enumerate(spans):
@@ -1651,7 +1749,7 @@ class VideoFinishWindow(QMainWindow):
             self._paint_preview()
             return
         self._write_knobs(segment)
-        frame = int(self.sld_frame.value())
+        frame = self._source_index()
         if int(segment["in"]) <= frame <= int(segment["out"]):
             segment["dirty"] = True
             self._play_recipe = None
@@ -1674,7 +1772,7 @@ class VideoFinishWindow(QMainWindow):
         if segment is None or not segment.get("rect"):
             self.lbl_color.setText("Primero dibuja el área y marca el tramo.")
             return
-        frame = int(self.sld_frame.value())
+        frame = self._source_index()
         if not (int(segment["in"]) <= frame <= int(segment["out"])):
             sample = segment.get("sample")
             if allow_sample and sample is not None and int(segment["in"]) <= int(sample) <= int(segment["out"]):
@@ -1687,7 +1785,7 @@ class VideoFinishWindow(QMainWindow):
             return
         try:
             revealed = read_rgb(
-                Path(clip.path), frame, clip.fps, clip.width, clip.height, full=True,
+                Path(clip.path), frame, clip.file_rate(), clip.width, clip.height, full=True,
             )
         except VideoError as exc:
             self.lbl_color.setText(str(exc))
@@ -1729,6 +1827,84 @@ class VideoFinishWindow(QMainWindow):
             return self._play_recipe
         return None
 
+    def _preview_limit(self):
+        mode = getattr(self, "_scale", {}).get(self._task)
+        width = int(self._full_w or 0)
+        if mode == "quarter" and width > 4:
+            out = max(2, width // 4)
+            return out - (out % 2)
+        if mode == "half" and width > 4:
+            out = max(2, width // 2)
+            return out - (out % 2)
+        if mode == "full":
+            return None
+        return _PREVIEW_W
+
+    def _reverse(self) -> bool:
+        return bool(self._adjust.get("reverse"))
+
+    def _source_index(self, view: int | None = None) -> int:
+        if view is None:
+            view = int(self.sld_frame.value())
+        return film_finish.view_to_source(view, self._count, self._reverse())
+
+    def _trim_view(self) -> tuple[int, int]:
+        return film_finish.trim_to_view(
+            self._count, self._reverse(),
+            self._adjust.get("trim_in"), self._adjust.get("trim_out"),
+        )
+
+    def _sync_roll(self):
+        if not hasattr(self, "roll"):
+            return
+        lo, hi = self._trim_view()
+        self.roll.set_values(self._count, self._reverse(), lo, hi)
+
+    def _on_roll(self):
+        old = self._reverse()
+        new = self.roll.reverse()
+        view = int(self.sld_frame.value())
+        if new != old:
+            source = film_finish.view_to_source(view, self._count, old)
+            view = film_finish.source_to_view(source, self._count, new)
+            self.sld_frame.blockSignals(True)
+            self.sld_frame.setValue(view)
+            self.sld_frame.blockSignals(False)
+        lo = min(self.roll.view_in(), self.roll.view_out())
+        hi = max(self.roll.view_in(), self.roll.view_out())
+        trim_in, trim_out = film_finish.trim_from_view(self._count, new, lo, hi)
+        self._adjust["reverse"] = new
+        self._adjust["trim_in"] = trim_in
+        self._adjust["trim_out"] = trim_out
+        self._sync_roll()
+        self._save_current()
+        self._load_frame()
+
+    def _grab_roll(self, which: str):
+        self.roll.put(which, int(self.sld_frame.value()))
+
+    def _step_view(self, view: int) -> int:
+        lo, hi = self._trim_view()
+        nxt = int(view) + 1
+        if nxt > hi or nxt < lo:
+            return lo
+        return nxt
+
+    def _view_spans(self, source_spans, selected: int):
+        view = film_finish.spans_to_view(source_spans, self._count, self._reverse())
+        chosen = None
+        if source_spans and 0 <= int(selected) < len(source_spans):
+            chosen = source_spans[int(selected)]
+        return view, film_finish.view_index_of(view, chosen, self._count, self._reverse())
+
+    def _store_view_spans(self, view_spans, view_selected: int):
+        source = film_finish.spans_to_source(view_spans, self._count, self._reverse())
+        picked = None
+        if view_spans and 0 <= int(view_selected) < len(view_spans):
+            picked = view_spans[int(view_selected)]
+        index = film_finish.source_index_of(source, picked, self._count, self._reverse())
+        return source, index
+
     def _turn_degrees(self) -> float:
         if self._task != 2:
             return 0.0
@@ -1748,7 +1924,7 @@ class VideoFinishWindow(QMainWindow):
     def _warp_preview(self, image):
         tx, ty = 0.0, 0.0
         if self._shifts:
-            index = int(self.sld_frame.value())
+            index = self._source_index()
             if index < len(self._shifts[0]):
                 tx = self._shifts[0][index] * self._sigma
                 ty = self._shifts[1][index] * self._sigma
@@ -1827,7 +2003,10 @@ class VideoFinishWindow(QMainWindow):
             spans, selected = self._covered_crops(), self._crop_i
         else:
             spans, selected = self._covered_segments(), self._segment
-        self.bar.set_bar(self._count, spans, selected, int(self.sld_frame.value()))
+        view, view_i = self._view_spans(spans, selected)
+        lo, hi = self._trim_view()
+        keep = None if lo <= 0 and hi >= max(0, self._count - 1) else (lo, hi)
+        self.bar.set_bar(self._count, view, view_i, int(self.sld_frame.value()), keep)
 
     def _refresh_crop_label(self):
         if self._crop is None:
@@ -1979,7 +2158,7 @@ class VideoFinishWindow(QMainWindow):
         try:
             ref = int(raw)
         except (TypeError, ValueError):
-            ref = int(self.sld_frame.value()) if clip.path == self._current else 0
+            ref = self._source_index() if clip.path == self._current else 0
         last = max(0, int(clip.frames) - 1)
         return min(max(0, ref), last)
 
@@ -2155,6 +2334,7 @@ def _apply_probe(clip: Clip, info: VideoInfo) -> None:
     clip.height = info.height
     clip.frames = info.frames
     clip.linked = True
+    clip.fps_file = info.fps
     if not clip.fps_edited:
         clip.fps = info.fps
         clip.fps_text = info.fps_text

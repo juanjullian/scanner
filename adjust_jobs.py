@@ -103,13 +103,8 @@ class AdjustJobs(QObject):
         folder = Path(folder)
         if not folder.is_dir():
             return
-        for path in sorted(folder.glob("*.perfo.json")):
-            data = film_finish.read_perfo(folder / path.name[: -len(".perfo.json")])
-            if not data or data.get("status") != "running":
-                continue
-            raw = folder / path.name[: -len(".perfo.json")]
-            if not raw.is_file():
-                continue
+        film_finish.relocate_analysis(folder)
+        for raw, data in film_finish.running_analysis(folder):
             adjust = film_finish.load(raw)
             roi = (adjust.get("perfo") or {}).get("roi") or data.get("roi")
             if not roi:

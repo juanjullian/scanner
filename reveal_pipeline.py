@@ -118,6 +118,11 @@ def debayer_quarter(packed: bytes, width: int, height: int) -> np.ndarray:
     return _debayer_subsample(packed, width, height, 8)
 
 
+def debayer_half(packed: bytes, width: int, height: int) -> np.ndarray:
+    """RGB lineal a la mitad de lado. De cada 4×4 se queda el primer 2×2."""
+    return _debayer_subsample(packed, width, height, 4)
+
+
 def debayer_playback(packed: bytes, width: int, height: int) -> np.ndarray:
     """RGB lineal para reproducir: un tercio de lado, mosaico RGGB, bilineal."""
     return _debayer_subsample(packed, width, height, 6)

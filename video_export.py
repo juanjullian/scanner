@@ -1,7 +1,9 @@
 """Exporta un video ya revelado con el acabado guardado al lado."""
 from __future__ import annotations
 
+import os
 import subprocess
+import tempfile
 import threading
 import queue
 from pathlib import Path
@@ -25,6 +27,89 @@ def output_path(folder: Path, source: Path, codec: str, taken: set[str]) -> Path
         number += 1
     taken.add(candidate.name.lower())
     return candidate
+
+
+def _indexes(finish, frames: int, limit: int | None) -> list[int]:
+    indexes = finish.sources(int(frames))
+    if limit is not None:
+        return indexes[:int(limit)]
+    return indexes
+
+
+def _forward_span(indexes: list[int]) -> tuple[int, int] | None:
+    """Si la salida es un tramo seguido del archivo, el primero y el último. Si no, None."""
+    if not indexes:
+        return None
+    if indexes == list(range(indexes[0], indexes[-1] + 1)):
+        return indexes[0], indexes[-1]
+    return None
+
+
+def _pack(payload):
+    if isinstance(payload, (bytes, bytearray)):
+        return bytes(payload), ("bytes", None, None)
+    arr = np.ascontiguousarray(payload)
+    return arr.tobytes(), ("array", arr.shape, arr.dtype)
+
+
+def _unpack(blob: bytes, kind, shape, dtype):
+    if kind == "bytes":
+        return blob
+    return np.frombuffer(blob, dtype=dtype).reshape(shape).copy()
+
+
+def _select_ordered(items, indexes: list[int]):
+    """Entrega los cuadros en el orden pedido. Si van al revés, los deja en un archivo temporal."""
+    closer = getattr(items, "close", None)
+    try:
+        if not indexes:
+            return
+        span = _forward_span(indexes)
+        if span is not None:
+            start, end = span
+            for index, payload in enumerate(items):
+                if index < start:
+                    continue
+                if index > end:
+                    break
+                yield index, payload
+            return
+        needed = set(indexes)
+        last = max(needed)
+        spool = tempfile.NamedTemporaryFile(prefix="scanner-orden-", delete=False)
+        offsets: dict[int, int] = {}
+        size = None
+        kind = shape = dtype = None
+        try:
+            for index, payload in enumerate(items):
+                if index not in needed:
+                    if size is not None and index > last:
+                        break
+                    continue
+                raw, meta = _pack(payload)
+                if size is None:
+                    size = len(raw)
+                    kind, shape, dtype = meta
+                offsets[index] = spool.tell()
+                spool.write(raw)
+                if len(offsets) == len(needed):
+                    break
+            spool.flush()
+            for index in indexes:
+                if index not in offsets or size is None:
+                    continue
+                spool.seek(offsets[index])
+                yield index, _unpack(spool.read(size), kind, shape, dtype)
+        finally:
+            name = spool.name
+            spool.close()
+            try:
+                os.unlink(name)
+            except OSError:
+                pass
+    finally:
+        if closer is not None:
+            closer()
 
 
 def export_clip(path: Path, dst: Path, codec: str, fps_text: str, cancel, on_frame, limit: int | None = None) -> None:
@@ -62,14 +147,27 @@ def _export_gpu(path, dst, codec, fps_text, info, finish, out_w, out_h, cancel, 
         proc = _open_hevc(dst, out_w, out_h, fps_text)
     drain = threading.Thread(target=_collect_err, args=(proc.stderr, errors), daemon=True)
     drain.start()
+    indexes = _indexes(finish, info.frames, limit)
     _write_frames(
         path, info, proc, errors, drain, cancel, on_frame, dst,
-        None, limit, _yuv_packets(path, info, gpu, cancel, limit),
+        None, None, _yuv_packets(path, info, gpu, cancel, indexes), len(indexes),
     )
 
 
-def _yuv_packets(path, info, gpu, cancel, limit):
-    """La decodificación va un cuadro adelante. El acabado corre mientras llega el siguiente."""
+def _yuv_packets(path, info, gpu, cancel, indexes):
+    """La decodificación va un cuadro adelante. El acabado corre mientras llega el siguiente.
+
+    Si la salida no es un tramo seguido, los cuadros se reordenan desde un archivo temporal.
+    """
+    span = _forward_span(indexes)
+    if span is None:
+        stream = iter_yuv422(path, info.width, info.height, cancel)
+        for index, raw in _select_ordered(stream, indexes):
+            if cancel():
+                break
+            yield gpu.frame_yuv422(raw, index)
+        return
+    start, end = span
     stop = threading.Event()
     found: list = []
     pending: queue.Queue = queue.Queue(maxsize=2)
@@ -79,7 +177,7 @@ def _yuv_packets(path, info, gpu, cancel, limit):
             for index, raw in enumerate(iter_yuv422(path, info.width, info.height, cancel)):
                 if stop.is_set() or cancel():
                     break
-                if limit is not None and index >= limit:
+                if index > end:
                     break
                 while not stop.is_set():
                     try:
@@ -105,6 +203,10 @@ def _yuv_packets(path, info, gpu, cancel, limit):
             if item is None:
                 break
             index, raw = item
+            if index < start:
+                continue
+            if index > end:
+                break
             yield gpu.frame_yuv422(raw, index)
     finally:
         stop.set()
@@ -160,12 +262,24 @@ def _export_cpu(path, dst, codec, fps_text, info, finish, out_w, out_h, cancel, 
             return yuv10_from_rgb48(raw, out_w, out_h)
         return raw
 
-    _write_frames(path, info, proc, errors, drain, cancel, on_frame, dst, payload_of, limit)
+    indexes = _indexes(finish, info.frames, limit)
+
+    def packets():
+        stream = iter_rgb48(path, info.width, info.height, cancel)
+        for index, image in _select_ordered(stream, indexes):
+            if cancel():
+                raise Cancelled()
+            yield payload_of(image, index)
+
+    _write_frames(
+        path, info, proc, errors, drain, cancel, on_frame, dst, None, None, packets(), len(indexes),
+    )
 
 
-def _write_frames(path, info, proc, errors, drain, cancel, on_frame, dst, payload_of, limit=None, packets=None) -> None:
+def _write_frames(path, info, proc, errors, drain, cancel, on_frame, dst, payload_of, limit=None, packets=None, total=None) -> None:
     written = 0
     failed: Exception | None = None
+    total = info.frames if total is None else int(total)
     try:
         if packets is None:
             packets = (
@@ -181,8 +295,8 @@ def _write_frames(path, info, proc, errors, drain, cancel, on_frame, dst, payloa
                 raise VideoError("ffmpeg cerró la salida antes de tiempo.") from exc
             written += 1
             if on_frame:
-                on_frame(written, info.frames)
-            if written >= info.frames or (limit is not None and written >= limit):
+                on_frame(written, total)
+            if written >= total or (limit is not None and written >= limit):
                 break
         if written <= 0 and failed is None:
             failed = VideoError("No salió ningún cuadro.")

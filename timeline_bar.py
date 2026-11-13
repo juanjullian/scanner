@@ -46,13 +46,15 @@ class TimelineBar(QWidget):
         self._press_x = 0.0
         self._head_drag = 0
         self._armed_edge = 0
+        self._keep = None
         self._scroll = QScrollBar(Qt.Orientation.Horizontal, self)
         self._scroll.setRange(0, 0)
         self._scroll.valueChanged.connect(self._on_scroll)
 
-    def set_bar(self, count, spans, selected, head):
+    def set_bar(self, count, spans, selected, head, keep=None):
         if self._drag:
             self._head = int(head)
+            self._store_keep(keep, self._count)
             self.update()
             return
         count = max(1, int(count))
@@ -62,6 +64,7 @@ class TimelineBar(QWidget):
         self._spans = [copy.deepcopy(item) for item in (spans or [])]
         self._selected = int(selected)
         self._head = max(0, min(int(head), self._count - 1))
+        self._store_keep(keep, self._count)
         if not self._user_zoom:
             self._ppf = self._fit_ppf()
             self._origin = 0.0
@@ -89,6 +92,7 @@ class TimelineBar(QWidget):
         painter.fillRect(ruler, QColor("#2a2a2a"))
         painter.fillRect(lane, QColor("#141414"))
         if not self._spans:
+            self._paint_keep(painter, lane)
             self._paint_head(painter, lane, ruler)
             return
         for index, span in enumerate(self._spans):
@@ -106,7 +110,31 @@ class TimelineBar(QWidget):
             b = self._x_of(max(self._press_frame, self._head_drag) + 1)
             painter.setPen(QPen(QColor("#ffffff"), 1))
             painter.drawRect(int(min(a, b)), lane.top() + 4, max(1, int(abs(b - a))), lane.height() - 8)
+        self._paint_keep(painter, lane)
         self._paint_head(painter, lane, ruler)
+
+    def _store_keep(self, keep, count: int):
+        self._keep = None
+        if keep is None or int(count) <= 1:
+            return
+        lo = max(0, min(int(keep[0]), int(count) - 1))
+        hi = max(lo, min(int(keep[1]), int(count) - 1))
+        if lo > 0 or hi < int(count) - 1:
+            self._keep = (lo, hi)
+
+    def _paint_keep(self, painter: QPainter, lane):
+        if not self._keep:
+            return
+        lo, hi = self._keep
+        shade = QColor(0, 0, 0, 150)
+        if lo > 0:
+            x0 = self._x_of(0)
+            x1 = self._x_of(lo)
+            painter.fillRect(int(x0), lane.top(), max(0, int(x1 - x0)), lane.height(), shade)
+        if hi < self._count - 1:
+            x0 = self._x_of(hi + 1)
+            x1 = self._x_of(self._count)
+            painter.fillRect(int(x0), lane.top(), max(0, int(x1 - x0)), lane.height(), shade)
 
     def zoom_by(self, factor: float, anchor_x: float | None = None):
         """Acerca o aleja. Sin ancla, el centro de la pista se queda quieto."""

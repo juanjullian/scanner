@@ -420,6 +420,91 @@ def test_later_crop_scales_to_the_first_and_flips_on_its_own():
         assert second[8, 28, 0] > second[8, 28, 2]
 
 
+def _gamma_recipe(gamma: float) -> dict:
+    return {
+        "ok": True,
+        "limited": False,
+        "scale": 0,
+        "gammas": [gamma, gamma, gamma],
+        "strength": 1.0,
+        "omin": 0.0,
+        "omax": 1.0,
+    }
+
+
+def test_two_segments_keep_their_gamma_and_reverse_moves_the_range():
+    import tempfile
+    from pathlib import Path
+    import film_finish
+    count = 1000
+    assert film_finish.source_to_view(100, count, True) == 899
+    assert film_finish.source_to_view(200, count, True) == 799
+    spans = [{"in": 100, "out": 200, "recipe": _gamma_recipe(2.0)}]
+    view = film_finish.spans_to_view(spans, count, True)
+    assert (view[0]["in"], view[0]["out"]) == (799, 899)
+    back = film_finish.spans_to_source(view, count, True)
+    assert (back[0]["in"], back[0]["out"]) == (100, 200)
+    assert film_finish.output_sources(10, False, None, None) == list(range(10))
+    assert film_finish.output_sources(10, True, 2, 8) == [8, 7, 6, 5, 4, 3, 2]
+    assert film_finish.trim_from_view(10, False, 0, 9) == (None, None)
+    assert film_finish.natural_key("F8_0000100_01.mp4") < film_finish.natural_key("F8_0000148_01.mp4")
+    assert film_finish.natural_key("F8_2.mp4") < film_finish.natural_key("F8_10.mp4")
+    with tempfile.TemporaryDirectory() as folder:
+        raw = Path(folder) / "rollo.raw"
+        raw.write_bytes(b"")
+        film_finish.save(raw, {
+            "segments": [
+                {"in": 0, "out": 0, "recipe": _gamma_recipe(2.0)},
+                {"in": 1, "out": 1, "recipe": _gamma_recipe(1.0)},
+            ],
+            "grade": {"mode": "color", "sat": 1.0},
+            "reverse": True,
+            "trim_in": 0,
+            "trim_out": 1,
+        })
+        finish = film_finish.Finish(raw, gpu=False, codec="prores_4444")
+        assert finish.sources(4) == [1, 0]
+        image = np.full((8, 8, 3), 0.5, np.float32)
+        dark = finish.apply_float(image, 0, None)
+        flat = finish.apply_float(image, 1, None)
+        assert float(dark[0, 0, 0]) < 0.3
+        assert abs(float(flat[0, 0, 0]) - 0.5) < 1e-5
+        assert film_finish.load(raw)["reverse"] is True
+
+
+def test_perfo_analysis_leaves_the_video_folder():
+    import json
+    import tempfile
+    from pathlib import Path
+    import film_finish
+    with tempfile.TemporaryDirectory() as folder:
+        root = Path(folder)
+        left = root / "uno"
+        right = root / "dos"
+        left.mkdir()
+        right.mkdir()
+        raw = left / "rollo.mp4"
+        other = right / "rollo.mp4"
+        raw.write_bytes(b"")
+        other.write_bytes(b"")
+        legacy = left / "rollo.mp4.perfo.json"
+        legacy.write_text('{"status": "running", "message": "1/4", "ref": 3}', encoding="utf-8")
+        moved = film_finish.perfo_path(raw)
+        assert moved.parent == film_finish.analysis_dir()
+        assert not legacy.is_file()
+        assert json.loads(moved.read_text(encoding="utf-8"))["source"]
+        film_finish.write_perfo_status(other, "running", "2/4", roi=[1, 2, 3, 4], partial=[], ref=1)
+        assert film_finish.perfo_path(raw) != film_finish.perfo_path(other)
+        found = list(film_finish.running_analysis(right))
+        assert len(found) == 1 and found[0][0] == other
+        assert list(film_finish.running_analysis(left))[0][0] == raw
+        film_finish.write_perfo_status(raw, "done", "Lista", {"tx": [0.0], "ty": [0.0]})
+        assert film_finish.read_perfo(raw)["status"] == "done"
+        assert not any(left.glob("*.perfo.json"))
+        moved.unlink(missing_ok=True)
+        film_finish.perfo_path(other).unlink(missing_ok=True)
+
+
 if __name__ == "__main__":
     test_gammac_locks_green()
     test_gammac_ignores_border()
@@ -434,8 +519,10 @@ if __name__ == "__main__":
     test_saturation_goes_gray()
     test_quarter_preview_keeps_bayer_phase()
     test_segment_lookup()
+    test_two_segments_keep_their_gamma_and_reverse_moves_the_range()
     test_horizontal_off_keeps_only_the_vertical()
     test_perfo_follows_a_hole()
+    test_perfo_analysis_leaves_the_video_folder()
     test_split_copies_the_crop_and_the_later_one_keeps_proportion()
     test_later_crop_scales_to_the_first_and_flips_on_its_own()
     print("ok")

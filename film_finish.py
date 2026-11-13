@@ -6,7 +6,11 @@ el revelado general. Esto se guarda al lado del raw.
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
+import re
+import shutil
+import tempfile
 import time
 from pathlib import Path
 
@@ -23,8 +27,76 @@ def adjust_path(raw: Path) -> Path:
     return Path(raw).with_name(Path(raw).name + ".adjust.json")
 
 
+def analysis_dir() -> Path:
+    """Carpeta temporal del sistema. Ahí vive el análisis, no al lado del video."""
+    folder = Path(tempfile.gettempdir()) / "scanner-analisis"
+    folder.mkdir(parents=True, exist_ok=True)
+    return folder
+
+
+def _analysis_key(raw: Path) -> str:
+    try:
+        text = str(Path(raw).resolve())
+    except OSError:
+        text = str(Path(raw))
+    return hashlib.sha1(text.encode("utf-8")).hexdigest()[:16]
+
+
+def _legacy_perfo(raw: Path) -> Path:
+    raw = Path(raw)
+    return raw.with_name(raw.name + ".perfo.json")
+
+
 def perfo_path(raw: Path) -> Path:
-    return Path(raw).with_name(Path(raw).name + ".perfo.json")
+    """El desplazamiento medido. Si todavía está al lado del archivo, lo lleva a la carpeta temporal."""
+    raw = Path(raw)
+    dest = analysis_dir() / f"{raw.name}.{_analysis_key(raw)}.perfo.json"
+    legacy = _legacy_perfo(raw)
+    if legacy.is_file():
+        _adopt_legacy(legacy, dest, raw)
+    if not dest.is_file() and legacy.is_file():
+        return legacy
+    return dest
+
+
+def relocate_analysis(folder: Path) -> None:
+    """Saca los perfo.json que quedaron en la carpeta del rollo."""
+    folder = Path(folder)
+    if not folder.is_dir():
+        return
+    for path in list(folder.glob("*.perfo.json")):
+        name = path.name[: -len(".perfo.json")]
+        if name:
+            perfo_path(folder / name)
+
+
+def running_analysis(folder: Path):
+    """Análisis que quedaron a medias, de los archivos de esta carpeta."""
+    folder = Path(folder)
+    if not folder.is_dir():
+        return
+    try:
+        root = folder.resolve()
+    except OSError:
+        root = folder
+    base = analysis_dir()
+    if not base.is_dir():
+        return
+    for path in sorted(base.glob("*.perfo.json")):
+        data = _read_perfo(path)
+        if not data or data.get("status") != "running":
+            continue
+        source = data.get("source")
+        if not source:
+            continue
+        raw = Path(source)
+        try:
+            parent = raw.resolve().parent
+        except OSError:
+            parent = raw.parent
+        if parent != root or not raw.is_file():
+            continue
+        yield raw, data
 
 
 def empty() -> dict:
@@ -35,9 +107,167 @@ def empty() -> dict:
         "grade": {"mode": "color", "sat": 1.0},
         "turn": 0.0,
         "flip_h": False,
+        "reverse": False,
+        "trim_in": None,
+        "trim_out": None,
         "crop_spans": [],
         "reveal": None,
     }
+
+
+def natural_key(name: str) -> tuple:
+    """Orden de rollo: el número 100 queda antes que el 148, con o sin ceros."""
+    parts = re.split(r"(\d+)", Path(str(name)).name.lower())
+    key = []
+    for part in parts:
+        if part.isdigit():
+            key.append(int(part))
+        elif part:
+            key.append(part)
+    return tuple(key)
+
+
+def view_to_source(index: int, count: int, reverse: bool) -> int:
+    """El cuadro de la pista, en el índice del archivo."""
+    count = max(1, int(count))
+    index = max(0, min(int(index), count - 1))
+    if reverse:
+        return (count - 1) - index
+    return index
+
+
+def source_to_view(index: int, count: int, reverse: bool) -> int:
+    """El cuadro del archivo, en el índice de la pista."""
+    return view_to_source(index, count, reverse)
+
+
+def _span_bounds(span) -> tuple[int, int]:
+    start = int(span.get("in", 0))
+    end = int(span.get("out", start))
+    if end < start:
+        start, end = end, start
+    return start, end
+
+
+def spans_to_view(spans: list, count: int, reverse: bool) -> list:
+    """Los tramos guardados, en el orden en que se ven. No los reescribe."""
+    count = max(1, int(count))
+    out = []
+    for span in spans or []:
+        if not isinstance(span, dict):
+            continue
+        item = copy.deepcopy(span)
+        start, end = _span_bounds(span)
+        if reverse:
+            item["in"] = (count - 1) - end
+            item["out"] = (count - 1) - start
+        else:
+            item["in"] = start
+            item["out"] = end
+        out.append(item)
+    out.sort(key=lambda item: (int(item["in"]), int(item["out"])))
+    return out
+
+
+def spans_to_source(spans: list, count: int, reverse: bool) -> list:
+    """Lo que la pista editó, de vuelta a índices del archivo."""
+    return spans_to_view(spans, count, reverse)
+
+
+def view_index_of(view_spans: list, source_span, count: int, reverse: bool) -> int:
+    if not source_span:
+        return 0
+    mapped = spans_to_view([source_span], count, reverse)
+    if not mapped:
+        return 0
+    want_in, want_out = int(mapped[0]["in"]), int(mapped[0]["out"])
+    for index, item in enumerate(view_spans):
+        if int(item["in"]) == want_in and int(item["out"]) == want_out:
+            return index
+    return 0
+
+
+def source_index_of(source_spans: list, view_span, count: int, reverse: bool) -> int:
+    if not view_span:
+        return 0
+    mapped = spans_to_source([view_span], count, reverse)
+    if not mapped:
+        return 0
+    want_in, want_out = int(mapped[0]["in"]), int(mapped[0]["out"])
+    for index, item in enumerate(source_spans):
+        if int(item["in"]) == want_in and int(item["out"]) == want_out:
+            return index
+    return 0
+
+
+def _frame_or_none(value):
+    if value is None or value == "":
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _trim_pair(trim_in, trim_out, count: int) -> tuple[int, int]:
+    last = max(0, int(count) - 1)
+    lo = 0 if trim_in is None else int(trim_in)
+    hi = last if trim_out is None else int(trim_out)
+    lo = max(0, min(lo, last))
+    hi = max(lo, min(hi, last))
+    return lo, hi
+
+
+def trim_to_view(count: int, reverse: bool, trim_in, trim_out) -> tuple[int, int]:
+    """Entrada y salida como se ven en la pista. Los índices guardados son del archivo."""
+    lo, hi = _trim_pair(trim_in, trim_out, count)
+    if reverse and int(count) > 0:
+        return (int(count) - 1) - hi, (int(count) - 1) - lo
+    return lo, hi
+
+
+def trim_from_view(count: int, reverse: bool, view_in: int, view_out: int):
+    """La entrada y la salida de la pista, guardadas como cuadros del archivo.
+
+    El rollo entero vuelve como None, None.
+    """
+    if int(count) <= 0:
+        return None, None
+    start = min(int(view_in), int(view_out))
+    end = max(int(view_in), int(view_out))
+    left = view_to_source(start, count, reverse)
+    right = view_to_source(end, count, reverse)
+    lo, hi = min(left, right), max(left, right)
+    last = max(0, int(count) - 1)
+    if lo <= 0 and hi >= last:
+        return None, None
+    return lo, hi
+
+
+def output_sources(count: int, reverse: bool = False, trim_in=None, trim_out=None) -> list[int]:
+    """Cuadros del archivo, en el orden de la salida. Sin reverse ni recorte, es 0, 1, 2…"""
+    if int(count) <= 0:
+        return []
+    lo, hi = _trim_pair(trim_in, trim_out, count)
+    frames = list(range(lo, hi + 1))
+    if reverse:
+        frames.reverse()
+    return frames
+
+
+def playback_order(finish, file_count: int, skip: int = 0, export_count: int | None = None) -> list[int] | None:
+    """None si la salida es el archivo en orden, desde `skip`. Si no, los índices a leer."""
+    if finish is None or int(file_count) <= 0:
+        return None
+    plan = finish.sources(int(file_count))
+    skip = max(0, int(skip))
+    if export_count is None:
+        export_count = max(0, int(file_count) - skip)
+    window = plan[skip:skip + int(export_count)]
+    identity = list(range(skip, skip + len(window)))
+    if window == identity:
+        return None
+    return window
 
 
 def _turn(data) -> float:
@@ -103,6 +333,9 @@ def load(raw: Path) -> dict:
         base["grade"] = _grade(data)
         base["turn"] = _turn(data)
         base["flip_h"] = bool(data.get("flip_h"))
+        base["reverse"] = bool(data.get("reverse"))
+        base["trim_in"] = _frame_or_none(data.get("trim_in"))
+        base["trim_out"] = _frame_or_none(data.get("trim_out"))
         spans = data.get("crop_spans") or []
         base["crop_spans"] = [item for item in spans if isinstance(item, dict)]
         reveal = data.get("reveal")
@@ -124,6 +357,12 @@ def has_adjust(data: dict) -> bool:
     if abs(_turn(data)) >= 0.05:
         return True
     if data.get("flip_h"):
+        return True
+    if data.get("reverse"):
+        return True
+    if _frame_or_none(data.get("trim_in")) not in (None, 0):
+        return True
+    if _frame_or_none(data.get("trim_out")) is not None:
         return True
     for span in data.get("crop_spans") or []:
         if isinstance(span, dict) and (span.get("crop") or span.get("flip_h")):
@@ -325,7 +564,11 @@ def write_perfo_status(
 ) -> None:
     path = perfo_path(raw)
     existing = _read_perfo(path) or {}
-    payload = {"status": status, "message": message, "heartbeat": time.time()}
+    payload = {
+        "status": status,
+        "message": message,
+        "heartbeat": time.time(),
+    }
     if status == "done" and result:
         payload.update(result)
     elif status == "running":
@@ -342,6 +585,7 @@ def write_perfo_status(
         for key in ("roi", "ref", "partial"):
             if existing.get(key) is not None:
                 payload[key] = existing[key]
+    payload["source"] = str(Path(raw))
     tmp = path.with_suffix(path.suffix + ".tmp")
     tmp.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
     _replace_file(tmp, path)
@@ -361,6 +605,24 @@ def _replace_file(tmp: Path, path: Path) -> None:
             delay = min(0.25, delay * 1.5)
     if last is not None:
         raise last
+
+
+def _adopt_legacy(legacy: Path, dest: Path, raw: Path) -> None:
+    try:
+        if not dest.is_file():
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(legacy), str(dest))
+        if legacy.is_file() and legacy.resolve() != dest.resolve():
+            legacy.unlink()
+    except OSError:
+        return
+    data = _read_perfo(dest)
+    if isinstance(data, dict) and not data.get("source"):
+        data["source"] = str(Path(raw))
+        try:
+            dest.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+        except OSError:
+            pass
 
 
 def _read_perfo(path: Path) -> dict | None:
@@ -646,7 +908,14 @@ class Finish:
         self.grade_mode = grade["mode"]
         self.grade_sat = grade["sat"]
         self.turn = _turn(self.data)
+        self.reverse = bool(self.data.get("reverse"))
+        self.trim_in = self.data.get("trim_in")
+        self.trim_out = self.data.get("trim_out")
         self.horizontal = perfo_horizontal(self.data.get("perfo"))
+
+    def sources(self, count: int) -> list[int]:
+        """Cuadros del archivo en el orden en que se exportan."""
+        return output_sources(count, self.reverse, self.trim_in, self.trim_out)
 
     @property
     def active(self) -> bool:

@@ -638,6 +638,11 @@ def _detect_indexed(item, w, h):
     return index, raw_data, is_magenta
 
 
+def _read_raw_at(raw_file, index: int, frame_bytes: int) -> bytes:
+    raw_file.seek(int(index) * int(frame_bytes))
+    return raw_file.read(frame_bytes)
+
+
 def _export_video_ordered(
     raw_file,
     num_frames: int,
@@ -652,6 +657,7 @@ def _export_video_ordered(
     skip_frames: int = 0,
     frame_fn=None,
     workers: int | None = None,
+    sources: list[int] | None = None,
 ):
     """
     Pipeline video: detección glitch (paralela, Bayer) → procesado (pool) →
@@ -730,7 +736,28 @@ def _export_video_ordered(
             )
             read_count += 1
 
+    if sources is not None:
+        num_frames = len(sources)
     try:
+        if sources is not None:
+            for done, index in enumerate(sources, start=1):
+                raw_data = _read_raw_at(raw_file, index, frame_bytes)
+                if len(raw_data) < frame_bytes:
+                    break
+                if glitch_filter:
+                    index, raw_data, is_magenta = _detect_indexed((index, raw_data), w, h)
+                    for chunk in glitch_filter.feed((index, raw_data), is_magenta):
+                        submit_raw(chunk[1], chunk[0])
+                else:
+                    submit_raw(raw_data, index)
+                if done % 10 == 0 or done == num_frames:
+                    _log_export_progress(done, num_frames, start_time)
+            while future_map:
+                wait(list(future_map.values()), return_when=FIRST_COMPLETED)
+                drain_completed()
+            if glitch_filter:
+                glitch_filter.finalize()
+            return
         _skip_raw_frames(raw_file, skip_frames, frame_bytes, w, h, glitch_filter)
         if glitch_filter:
             fill_detect()
@@ -1220,7 +1247,7 @@ def _export_dng_frames_on_gpu(frames, w, h, out, fps, codec, mode):
 
 def _export_reveal_on_gpu(
     raw_file, num_frames, frame_bytes, w, h, mode, output_file, fps, codec,
-    glitch_filter, start_time, skip_frames, finish=None,
+    glitch_filter, start_time, skip_frames, finish=None, sources: list[int] | None = None,
 ):
     """Un proceso. El demosaico es NPP en la tarjeta, el promedio de vecinos del SDK. La curva y el YUV no bajan."""
     gpu, out_w, out_h = _start_gpu_reveal(codec, w, h, mode, finish)
@@ -1232,6 +1259,8 @@ def _export_reveal_on_gpu(
     detect_queue: deque = deque()
     read_count = 0
     thumb_state = {"pct": -1}
+    if sources is not None:
+        num_frames = len(sources)
 
     def log(done: int):
         thumb = None
@@ -1244,14 +1273,29 @@ def _export_reveal_on_gpu(
             _log_export_progress(done, num_frames, start_time, thumb)
 
     try:
-        _skip_raw_frames(raw_file, skip_frames, frame_bytes, w, h, glitch_filter)
-
         def emit(raw_data: bytes, index: int):
             try:
                 proc.stdin.write(gpu.frame_raw(raw_data, index))
             except OSError as exc:
                 raise RuntimeError("FFmpeg cerró la entrada antes de terminar el revelado.") from exc
 
+        if sources is not None:
+            for done, index in enumerate(sources, start=1):
+                raw_data = _read_raw_at(raw_file, index, frame_bytes)
+                if len(raw_data) < frame_bytes:
+                    break
+                if glitch_filter:
+                    index, raw_data, is_magenta = _detect_indexed((index, raw_data), w, h)
+                    for chunk in glitch_filter.feed((index, raw_data), is_magenta):
+                        emit(chunk[1], chunk[0])
+                else:
+                    emit(raw_data, index)
+                log(done)
+            if glitch_filter:
+                glitch_filter.finalize()
+            return
+
+        _skip_raw_frames(raw_file, skip_frames, frame_bytes, w, h, glitch_filter)
         if glitch_filter:
             def fill_detect():
                 nonlocal read_count
@@ -1584,7 +1628,17 @@ def main():
         }
 
     # --- BUCLE PRINCIPAL ---
-    print(f"START|{num_frames}")
+    order = None
+    export_total = num_frames
+    if is_reveal_mode and not is_dng_mode and not is_exr_mode and not is_tiff_seq_mode:
+        from film_finish import playback_order
+        held = getattr(process_prores_4444_frame, "finish", None)
+        order = playback_order(held, file_frame_count, skip_frames, num_frames)
+        if order is not None:
+            export_total = len(order)
+            note = " al revés" if held is not None and held.reverse else ""
+            print(f"INFO|Salida: {export_total} cuadros{note}.")
+    print(f"START|{export_total}")
     sys.stdout.flush()
     start_time = time.time()
     
@@ -1738,6 +1792,7 @@ def main():
                             video_ctx["output_file"], args.fps, codec,
                             glitch_filter, start_time, skip_frames,
                             getattr(process_prores_4444_frame, "finish", None),
+                            sources=order,
                         )
                 else:
                     writer = _create_video_frame_writer(video_ctx, args)
@@ -1749,6 +1804,7 @@ def main():
                                 glitch_filter, start_time, skip_frames,
                                 frame_fn=process_prores_4444_frame if is_reveal_mode else None,
                                 workers=hw_workers,
+                                sources=order,
                             )
                     finally:
                         writer.close()
