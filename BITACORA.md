@@ -1,5 +1,22 @@
 # Bitácora — Lucid Scanner
 
+## 2026-11-15 — Cola de estabilización, medición al dibujar y columna de estado
+
+### Por qué
+Abrir Ajustes en un rollo que ya tenía zona de perforación, pero no el cuadro de referencia, cerraba la ventana. «Encolar la lista», apretado en cada archivo mientras la primera pasada no terminaba, volvía a meter toda la lista: el worker no miraba si el rollo ya estaba medido y seguía aunque todos se vieran listos. En Color había que apretar Medir después de dibujar el área. Si los sliders se iban lejos, no había cómo volver ni cómo borrar solo la gamma. En la lista no se veía cuál se estaba midiendo.
+
+### Cómo
+- El texto de la zona ya no convierte en número un cuadro de referencia que no existe. Si no está, dice que falta analizar. Si está, muestra el número en el orden en que se ve el rollo. Lo mismo en el tratador y en los ajustes del raw.
+- «Encolar la lista» solo agrega los que todavía no están listos. Si ya está en la cola, no se agrega otra vez. Al llegar a un archivo ya medido, el worker lo salta y no pisa esa medición. El raw hace lo mismo antes de volver a escribir el análisis.
+- Dibujar el área en Color mide al tiro, igual que Medir. Un rectángulo nuevo vuelve a medir. «Quitar medición» borra la gamma de ese tramo y deja el área. «Volver al predeterminado» devuelve los controles al ajuste de partida y, si hay área, mide de nuevo.
+- A la derecha de cada archivo del tratador hay una columna: el porcentaje mientras se mide, `ok` si ya está lista, y `-` si todavía no. El porcentaje se mueve en el archivo que se está midiendo, aunque no sea el seleccionado.
+
+### Hecho
+- Ajustes abre con zonas viejas, sin cuadro de referencia.
+- Encolar la lista no vuelve a medir lo que ya está listo.
+- El área de color se mide al dibujarla, y se puede quitar o volver al predeterminado.
+- La lista muestra el avance de la estabilización.
+
 ## 2026-11-13 — Orden del rollo, visor y análisis fuera de la carpeta
 
 ### Por qué

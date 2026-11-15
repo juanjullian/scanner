@@ -988,6 +988,10 @@ class RevealDialog(QDialog):
         btn = QPushButton("Analizar este archivo")
         btn.clicked.connect(self._analyze_one)
         btn_all = QPushButton("Encolar la lista")
+        btn_all.setToolTip(
+            "Mide los de la lista que todavía no están listos. "
+            "Apretarlo de nuevo no vuelve a medir los que ya quedaron."
+        )
         btn_all.clicked.connect(self._analyze_all)
         row.addWidget(btn)
         row.addWidget(btn_all)
@@ -1028,9 +1032,19 @@ class RevealDialog(QDialog):
         self.sld_sat.setToolTip(sat_title.toolTip())
         self.sld_sat.valueChanged.connect(self._on_sat)
         layout.addWidget(self.sld_sat)
+        measure_row = QHBoxLayout()
         btn_measure = QPushButton("Medir")
         btn_measure.clicked.connect(self._measure_segment)
-        layout.addWidget(btn_measure)
+        btn_clear = QPushButton("Quitar medición")
+        btn_clear.setToolTip("Borra la gamma medida de este tramo. El área dibujada se queda.")
+        btn_clear.clicked.connect(self._clear_measure)
+        btn_restore = QPushButton("Volver al predeterminado")
+        btn_restore.setToolTip("Devuelve los controles al ajuste de partida y, si hay área, vuelve a medir.")
+        btn_restore.clicked.connect(self._restore_preset)
+        measure_row.addWidget(btn_measure)
+        measure_row.addWidget(btn_clear)
+        measure_row.addWidget(btn_restore)
+        layout.addLayout(measure_row)
         self.lbl_color = QLabel("Dibuja el área. El tramo de abajo parte cubriendo todo el rollo.")
         self.lbl_color.setWordWrap(True)
 
@@ -1838,7 +1852,9 @@ class RevealDialog(QDialog):
             segment.pop("recipe", None)
             self._play_recipe = None
             self._draft_id = None
-            self.lbl_color.setText("Vista previa del área. Medir la guarda para la exportación.")
+            self._save_current()
+            self._measure_segment()
+            return
         self._paint_preview()
 
     def _load_adjust(self):
@@ -1928,8 +1944,11 @@ class RevealDialog(QDialog):
         if self._roi is None:
             self.lbl_perfo.setText("Sin zona.")
             return
-        shown = film_finish.source_to_view(int(self._roi_ref), self._count, self._reverse()) + 1
-        ref = f" Referencia: cuadro {shown}." if self._roi_ref is not None else ""
+        if self._roi_ref is None:
+            ref = ""
+        else:
+            shown = film_finish.source_to_view(int(self._roi_ref), self._count, self._reverse()) + 1
+            ref = f" Referencia: cuadro {shown}."
         if status == "done":
             text = f"Lista. Margen negro de {self._pad} px.{ref}"
         elif status == "running":
@@ -1960,6 +1979,8 @@ class RevealDialog(QDialog):
                 queued += 1
         if queued == 0:
             self.lbl_perfo.setText("No queda nada por medir. Los que ya están listos se dejan.")
+        else:
+            self.lbl_perfo.setText(f"Encolé {queued}. Los que ya están listos no entran.")
 
     def _saved_ref(self, name: str, data=None):
         """Cuadro en el que se dibujó el rectángulo. None si ese archivo no lo tiene guardado."""
@@ -2331,6 +2352,38 @@ class RevealDialog(QDialog):
         self._play_recipe = None
         self._draft_id = None
         self._sync_segment_controls()
+        self._paint_preview()
+
+    def _clear_measure(self):
+        segment = self._selected()
+        if segment is None or not segment.get("recipe"):
+            self.lbl_color.setText("Este tramo no tiene una medición.")
+            return
+        segment.pop("recipe", None)
+        segment["dirty"] = True
+        self._play_recipe = None
+        self._draft_id = None
+        self.lbl_color.setText("Quité la medición de este tramo. El área sigue dibujada.")
+        self._save_current()
+        self._refresh_bars()
+        self._paint_preview()
+
+    def _restore_preset(self):
+        self._apply_preset_to_controls(self._preset())
+        segment = self._selected()
+        if segment is None:
+            self.lbl_color.setText("Volví a los controles predeterminados.")
+            return
+        self._write_knobs(segment)
+        if segment.get("rect"):
+            self._measure_segment()
+            return
+        segment.pop("recipe", None)
+        segment["dirty"] = True
+        self._play_recipe = None
+        self._draft_id = None
+        self.lbl_color.setText("Volví a los controles predeterminados.")
+        self._save_current()
         self._paint_preview()
 
     def _measure_segment(self):

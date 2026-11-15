@@ -8,13 +8,15 @@ from pathlib import Path
 
 import cv2
 import numpy as np
-from PyQt6.QtCore import QEvent, Qt, QThread, QTimer, pyqtSignal
+from PyQt6.QtCore import QEvent, QRect, Qt, QThread, QTimer, pyqtSignal
+from PyQt6.QtGui import QColor, QPainter, QPen
 from PyQt6.QtWidgets import (
     QAbstractItemView, QAbstractSpinBox, QApplication, QCheckBox, QComboBox,
     QDoubleSpinBox, QFileDialog, QFrame, QHBoxLayout, QLabel, QLineEdit, QListWidget,
     QListWidgetItem, QMainWindow, QMessageBox, QPlainTextEdit, QProgressBar,
-    QPushButton, QScrollArea, QSlider, QSplitter, QStackedWidget, QTableWidget,
-    QTableWidgetItem, QTextEdit, QVBoxLayout, QWidget,
+    QPushButton, QScrollArea, QSlider, QSplitter, QStackedWidget, QStyle,
+    QStyledItemDelegate, QStyleOptionViewItem, QTableWidget, QTableWidgetItem,
+    QTextEdit, QVBoxLayout, QWidget,
 )
 
 import film_finish
@@ -34,6 +36,9 @@ from video_source import (
 
 _PREVIEW_W = 1100
 _TASKS = ("Estabilización", "Color", "Recorte")
+_BADGE_TEXT = Qt.ItemDataRole.UserRole + 1
+_BADGE_KIND = Qt.ItemDataRole.UserRole + 2
+_BADGE_W = 46
 
 
 @dataclass
@@ -61,6 +66,41 @@ class Clip:
         return self.fps if self.fps > 0 else 24.0
 
 
+class _ClipDelegate(QStyledItemDelegate):
+    """Nombre a la izquierda y, en una columna aparte, el estado de la estabilización."""
+
+    def paint(self, painter: QPainter, option, index):
+        opt = QStyleOptionViewItem(option)
+        self.initStyleOption(opt, index)
+        label = opt.text
+        opt.text = ""
+        widget = option.widget
+        style = widget.style() if widget is not None else QApplication.style()
+        style.drawControl(QStyle.ControlElement.CE_ItemViewItem, opt, painter, widget)
+        text_rect = option.rect.adjusted(6, 0, -(_BADGE_W + 10), 0)
+        painter.save()
+        painter.setPen(opt.palette.highlightedText().color() if opt.state & QStyle.StateFlag.State_Selected else QColor("#f2f2f2"))
+        shown = painter.fontMetrics().elidedText(label, Qt.TextElideMode.ElideRight, text_rect.width())
+        painter.drawText(text_rect, int(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft), shown)
+        self._badge(painter, option.rect, index.data(_BADGE_TEXT) or "-", index.data(_BADGE_KIND) or "miss")
+        painter.restore()
+
+    def _badge(self, painter: QPainter, row: QRect, text: str, kind: str):
+        colors = {
+            "ok": (QColor("#b7d7b7"), QColor(129, 199, 132, 70), QColor(150, 190, 150)),
+            "run": (QColor("#b7cfe2"), QColor(120, 170, 210, 70), QColor(140, 180, 210)),
+            "miss": (QColor("#b0b0b0"), QColor(0, 0, 0, 0), QColor(255, 255, 255, 45)),
+        }
+        fg, bg, border = colors.get(kind, colors["miss"])
+        rect = QRect(row.right() - _BADGE_W - 4, row.center().y() - 8, _BADGE_W, 16)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.setPen(QPen(border))
+        painter.setBrush(bg)
+        painter.drawRoundedRect(rect, 8, 8)
+        painter.setPen(fg)
+        painter.drawText(rect, int(Qt.AlignmentFlag.AlignCenter), str(text))
+
+
 class ClipList(QListWidget):
     files_dropped = pyqtSignal(list)
     remove_pressed = pyqtSignal()
@@ -71,6 +111,7 @@ class ClipList(QListWidget):
         self.setDragDropMode(QAbstractItemView.DragDropMode.InternalMove)
         self.setDefaultDropAction(Qt.DropAction.MoveAction)
         self.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        self.setItemDelegate(_ClipDelegate(self))
 
     def dragEnterEvent(self, event):
         if event.mimeData().hasUrls():
@@ -119,6 +160,9 @@ class _AnalyzeThread(QThread):
             if self._cancel:
                 break
             target = Path(path)
+            if film_finish.perfo_is_done(target, rect, int(frames)):
+                self.finished_one.emit(str(target), True, "Ya estaba medido.", int(frames))
+                continue
             try:
                 ident = _clip_rect(rect, width, height)
                 search = _search_rect(ident, width, height)
@@ -267,7 +311,7 @@ class VideoFinishWindow(QMainWindow):
         left.addLayout(row)
         left_wrap = QWidget()
         left_wrap.setLayout(left)
-        left_wrap.setFixedWidth(280)
+        left_wrap.setFixedWidth(320)
         body.addWidget(left_wrap)
 
         self.view = FrameView()
@@ -467,6 +511,10 @@ class VideoFinishWindow(QMainWindow):
         btn = QPushButton("Analizar este archivo")
         btn.clicked.connect(self._analyze_one)
         btn_all = QPushButton("Encolar la lista")
+        btn_all.setToolTip(
+            "Mide los de la lista que todavía no están listos. "
+            "Apretarlo de nuevo no vuelve a medir los que ya quedaron."
+        )
         btn_all.clicked.connect(self._analyze_all)
         row.addWidget(btn)
         row.addWidget(btn_all)
@@ -501,9 +549,19 @@ class VideoFinishWindow(QMainWindow):
         self.sld_sat.setValue(100)
         self.sld_sat.valueChanged.connect(self._on_sat)
         layout.addWidget(self.sld_sat)
+        measure_row = QHBoxLayout()
         btn_measure = QPushButton("Medir")
         btn_measure.clicked.connect(self._measure_segment)
-        layout.addWidget(btn_measure)
+        btn_clear = QPushButton("Quitar medición")
+        btn_clear.setToolTip("Borra la gamma medida de este tramo. El área dibujada se queda.")
+        btn_clear.clicked.connect(self._clear_measure)
+        btn_restore = QPushButton("Volver al predeterminado")
+        btn_restore.setToolTip("Devuelve los controles al ajuste de partida y, si hay área, vuelve a medir.")
+        btn_restore.clicked.connect(self._restore_preset)
+        measure_row.addWidget(btn_measure)
+        measure_row.addWidget(btn_clear)
+        measure_row.addWidget(btn_restore)
+        layout.addLayout(measure_row)
         self.lbl_color = QLabel("Dibuja el área. El tramo de abajo parte cubriendo todo el rollo.")
         self.lbl_color.setWordWrap(True)
         form = QVBoxLayout()
@@ -821,6 +879,9 @@ class VideoFinishWindow(QMainWindow):
                 continue
             item = QListWidgetItem(_clip_label(clip))
             item.setData(Qt.ItemDataRole.UserRole, path)
+            text, kind = _stab_mark(path, clip.frames)
+            item.setData(_BADGE_TEXT, text)
+            item.setData(_BADGE_KIND, kind)
             item.setToolTip(path)
             self.list.addItem(item)
             if path == select:
@@ -953,6 +1014,17 @@ class VideoFinishWindow(QMainWindow):
         self._session["files"] = files
         self._session["version"] = 1
         save_session(self._session_file, self._session)
+
+    def _set_stab_badge(self, path: str, live: int | None = None):
+        clip = self._clips.get(path)
+        frames = clip.frames if clip is not None else None
+        text, kind = _stab_mark(path, frames, live)
+        for row in range(self.list.count()):
+            item = self.list.item(row)
+            if item is not None and item.data(Qt.ItemDataRole.UserRole) == path:
+                item.setData(_BADGE_TEXT, text)
+                item.setData(_BADGE_KIND, kind)
+                return
 
     def _refresh_label(self, path: str):
         clip = self._clips.get(path)
@@ -1175,7 +1247,9 @@ class VideoFinishWindow(QMainWindow):
             segment.pop("recipe", None)
             self._play_recipe = None
             self._draft_id = None
-            self.lbl_color.setText("Vista previa del área. Medir la guarda para la exportación.")
+            self._save_current()
+            self._measure_segment()
+            return
         self._save_current()
         self._paint_preview()
 
@@ -1215,11 +1289,17 @@ class VideoFinishWindow(QMainWindow):
                 queued += 1
         if queued == 0:
             self.lbl_perfo.setText("No queda nada por medir. Los que ya están listos se dejan.")
+        else:
+            self.lbl_perfo.setText(f"Encolé {queued}. Los que ya están listos no entran.")
 
     def _enqueue(self, clip: Clip, zone, ref: int) -> bool:
         if film_finish.perfo_is_done(Path(clip.path), zone, clip.frames):
             if clip.path == self._current:
                 self.lbl_perfo.setText("Este archivo ya está medido.")
+            return False
+        if self._analysis_queued(clip.path):
+            if clip.path == self._current:
+                self.lbl_perfo.setText("Ya está en la cola. No lo vuelvo a agregar.")
             return False
         data = film_finish.load(Path(clip.path))
         perfo = data.get("perfo") or {}
@@ -1248,8 +1328,20 @@ class VideoFinishWindow(QMainWindow):
             if (self._export is None or not self._export.isRunning()) and not self._export_after_analyze:
                 self.btn_cancel.setVisible(False)
             return
-        jobs = self._analyze_queue
+        jobs = []
+        for job in self._analyze_queue:
+            path, rect, _ref, _width, _height, frames, _fps = job
+            if film_finish.perfo_is_done(Path(path), rect, int(frames)):
+                continue
+            if any(item[0] == path for item in jobs):
+                continue
+            jobs.append(job)
         self._analyze_queue = []
+        if not jobs:
+            self._maybe_export_after_analyze()
+            if (self._export is None or not self._export.isRunning()) and not self._export_after_analyze:
+                self.btn_cancel.setVisible(False)
+            return
         self._analyze = _AnalyzeThread(jobs)
         self._analyze.progress.connect(self._on_analyze_progress)
         self._analyze.finished_one.connect(self._on_analyze_done)
@@ -1258,6 +1350,8 @@ class VideoFinishWindow(QMainWindow):
         self.btn_cancel.setVisible(True)
 
     def _on_analyze_progress(self, path: str, done: int, total: int):
+        if total:
+            self._set_stab_badge(path, int(round(100 * done / total)))
         if path == self._current and total:
             self.lbl_perfo.setText(f"En curso, {done} de {total}.")
             self._refresh_review(int(round(100 * done / total)))
@@ -1271,6 +1365,7 @@ class VideoFinishWindow(QMainWindow):
             )
 
     def _on_analyze_done(self, path: str, ok: bool, message: str, measured: int):
+        self._set_stab_badge(path)
         clip = self._clips.get(path)
         if ok and clip is not None and measured > 0 and measured != clip.frames:
             clip.frames = measured
@@ -1314,8 +1409,11 @@ class VideoFinishWindow(QMainWindow):
         if self._roi is None:
             self.lbl_perfo.setText("Sin zona.")
             return
-        shown = film_finish.source_to_view(int(self._roi_ref), self._count, self._reverse()) + 1
-        ref = f" Referencia: cuadro {shown}." if self._roi_ref is not None else ""
+        if self._roi_ref is None:
+            ref = ""
+        else:
+            shown = film_finish.source_to_view(int(self._roi_ref), self._count, self._reverse()) + 1
+            ref = f" Referencia: cuadro {shown}."
         if status == "done":
             text = f"Lista. Margen negro de {self._pad} px.{ref}"
             if message and message != "Lista":
@@ -1762,6 +1860,38 @@ class VideoFinishWindow(QMainWindow):
 
     def _commit_slider_measure(self):
         self._run_measure(allow_sample=True)
+
+    def _clear_measure(self):
+        segment = self._selected()
+        if segment is None or not segment.get("recipe"):
+            self.lbl_color.setText("Este tramo no tiene una medición.")
+            return
+        segment.pop("recipe", None)
+        segment["dirty"] = True
+        self._play_recipe = None
+        self._draft_id = None
+        self.lbl_color.setText("Quité la medición de este tramo. El área sigue dibujada.")
+        self._save_current()
+        self._refresh_bars()
+        self._paint_preview()
+
+    def _restore_preset(self):
+        self._apply_preset_to_controls(self._preset())
+        segment = self._selected()
+        if segment is None:
+            self.lbl_color.setText("Volví a los controles predeterminados.")
+            return
+        self._write_knobs(segment)
+        if segment.get("rect"):
+            self._measure_segment()
+            return
+        segment.pop("recipe", None)
+        segment["dirty"] = True
+        self._play_recipe = None
+        self._draft_id = None
+        self.lbl_color.setText("Volví a los controles predeterminados.")
+        self._save_current()
+        self._paint_preview()
 
     def _measure_segment(self):
         self._measure_timer.stop()
@@ -2338,6 +2468,21 @@ def _apply_probe(clip: Clip, info: VideoInfo) -> None:
     if not clip.fps_edited:
         clip.fps = info.fps
         clip.fps_text = info.fps_text
+
+
+def _stab_mark(path: str, frames: int | None, live: int | None = None) -> tuple[str, str]:
+    """Texto y tono de la columna: porcentaje, ok, o un guion."""
+    if live is not None:
+        return f"{int(live)}%", "run"
+    try:
+        state = film_finish.review_state(Path(path), frames)
+    except OSError:
+        return "-", "miss"
+    if state.get("stab") == "listo":
+        return "ok", "ok"
+    if state.get("stab") == "corriendo" and state.get("percent") is not None:
+        return f"{int(state['percent'])}%", "run"
+    return "-", "miss"
 
 
 def _clip_label(clip: Clip) -> str:

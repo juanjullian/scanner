@@ -29,6 +29,9 @@ class _Run(QThread):
             same_ref = same_zone and int(existing.get("ref")) == int(self.ref_frame)
         except (TypeError, ValueError):
             same_ref = False
+        if film_finish.perfo_is_done(self.raw, self.roi):
+            self.finished_run.emit(True, "Ya estaba medido.")
+            return
         film_finish.write_perfo_status(
             self.raw, "running", "Midiendo perforación",
             roi=self.roi,
