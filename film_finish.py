@@ -18,6 +18,7 @@ import cv2
 import numpy as np
 
 import gammac
+import tone
 
 FULL_W = 2840
 FULL_H = 2200
@@ -900,10 +901,8 @@ class Finish:
         self.crop_spans = _finish_spans(self.data, self.crop, self.flip_h)
         if self.crop is None and self.crop_spans:
             self.crop = _clip_crop(self.crop_spans[0].get("crop"))
-        self.segments = [
-            item for item in self.data["segments"]
-            if (item.get("recipe") or {}).get("ok") and not (item.get("recipe") or {}).get("limited")
-        ]
+        self.segments = [item for item in self.data["segments"] if _segment_exports(item)]
+        self._curve_luts: dict[tuple, np.ndarray] = {}
         grade = _grade(self.data)
         self.grade_mode = grade["mode"]
         self.grade_sat = grade["sat"]
@@ -975,6 +974,28 @@ class Finish:
     def recipe_at(self, index: int) -> dict | None:
         return gammac.recipe_at(self.segments, int(index))
 
+    def segment_at(self, index: int) -> dict | None:
+        for segment in self.segments:
+            if int(segment["in"]) <= int(index) <= int(segment["out"]):
+                return segment
+        return None
+
+    def curve_at(self, index: int):
+        segment = self.segment_at(index)
+        if segment is None:
+            return None
+        return segment.get("curve")
+
+    def curve_lut(self, index: int) -> np.ndarray | None:
+        key = tone.key_of(self.curve_at(index))
+        if key is None:
+            return None
+        cached = self._curve_luts.get(key)
+        if cached is None:
+            cached = tone.lut(key)
+            self._curve_luts[key] = cached
+        return cached
+
     def shift_at(self, index: int) -> tuple[float, float]:
         if not self.tx or index < 0 or index >= len(self.tx):
             return 0.0, 0.0
@@ -989,7 +1010,9 @@ class Finish:
         return np.clip(work * np.float32(65535.0) + np.float32(0.5), 0, 65535).astype(np.uint16)
 
     def apply_float(self, image: np.ndarray, index: int, out_wh: tuple[int, int] | None = None) -> np.ndarray:
-        work = image if self.grade_mode == "bw" else gammac.apply(image, self.recipe_at(index))
+        work = tone.apply(image, self.curve_at(index))
+        if self.grade_mode != "bw":
+            work = gammac.apply(work, self.recipe_at(index))
         work = gammac.saturate(work, self.grade_sat)
         height, width = work.shape[:2]
         matrix = self.sampling(index, width, height)
@@ -1017,6 +1040,13 @@ class Finish:
         if self.flip_at(index):
             cropped = np.ascontiguousarray(cropped[:, ::-1])
         return cropped
+
+
+def _segment_exports(item: dict) -> bool:
+    """Una gamma medida, o una curva que no está en el centro."""
+    recipe = item.get("recipe") or {}
+    graded = bool(recipe.get("ok")) and not bool(recipe.get("limited"))
+    return graded or tone.active(item.get("curve"))
 
 
 def _finish_spans(data: dict, crop, flip_h: bool) -> list:

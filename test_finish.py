@@ -432,6 +432,69 @@ def _gamma_recipe(gamma: float) -> dict:
     }
 
 
+def test_tone_curve_stays_increasing_and_lands_before_gamma():
+    import tempfile
+    from pathlib import Path
+    import film_finish
+    import tone
+    assert tone.key_of(None) is None
+    assert tone.key_of({"negros": 0, "sombras": 0, "medias": 0, "claros": 0, "altos": 0}) is None
+    same = np.full((2, 2, 3), 0.4, np.float32)
+    assert tone.apply(same, None) is same
+    ends = tone.control_points(None)
+    assert ends == [(0.0, 0.0), (1.0, 1.0)]
+    placed = tone.insert_point(ends, 0.30, 0.45)
+    assert len(placed) == 3
+    neighbor = tone.insert_point(placed, 0.62, 0.70)
+    held = tone.move_point(neighbor, 1, 0.30, 0.95)
+    assert held[1][1] == neighbor[2][1]
+    eased = tone.move_point(neighbor, 1, 0.30, 0.40)
+    assert tone.remove_point(placed, 1) == [(0.0, 0.0), (1.0, 1.0)]
+    table = tone.lut(tone.key_of(eased))
+    slope = np.diff(table) * (len(table) - 1)
+    assert np.all(slope >= -1e-4)
+    assert float(slope.max()) < 3
+    dark = np.full((2, 2, 3), 0.30, np.float32)
+    assert float(tone.apply(dark, eased)[0, 0, 0]) > 0.34
+    assert float(tone.apply(np.full((1, 1, 3), 0.95, np.float32), eased)[0, 0, 0]) > 0.9
+    old = tone.lut(tone.key_of({"sombras": 100}))
+    assert np.all(np.diff(old) >= -1e-4)
+    gentle = [[0.0, 0.0], [0.2, 0.30], [0.45, 0.48], [1.0, 1.0]]
+    with tempfile.TemporaryDirectory() as folder:
+        raw = Path(folder) / "rollo.raw"
+        raw.write_bytes(b"")
+        film_finish.save(raw, {
+            "segments": [{
+                "in": 0, "out": 1,
+                "curve": gentle,
+                "recipe": _gamma_recipe(2.0),
+            }],
+            "perfo": {"enabled": False, "roi": None},
+            "grade": {"mode": "color", "sat": 1},
+        })
+        finish = film_finish.Finish(raw, gpu=False, codec="prores_4444")
+        flat = np.full((4, 4, 3), 0.5, np.float32)
+        curved = tone.apply(flat, finish.curve_at(0))
+        both = finish.apply_float(flat, 0)
+        assert float(curved[0, 0, 0]) > 0.5
+        assert float(both[0, 0, 0]) < float(curved[0, 0, 0])
+        assert abs(float(both[0, 0, 0]) - float(curved[0, 0, 0]) ** 2) < 0.02
+        film_finish.save(raw, {
+            "segments": [
+                {"in": 0, "out": 0, "curve": [[0.0, 0.0], [1.0, 0.72]]},
+                {"in": 1, "out": 1, "curve": [[0.0, 0.12], [1.0, 1.0]]},
+            ],
+            "perfo": {"enabled": False, "roi": None},
+            "grade": {"mode": "bw", "sat": 0},
+        })
+        bw = film_finish.Finish(raw, gpu=False, codec="prores_4444")
+        assert len(bw.segments) == 2
+        high = np.full((2, 2, 3), 0.9, np.float32)
+        low = np.full((2, 2, 3), 0.02, np.float32)
+        assert float(bw.apply_float(high, 0)[0, 0, 0]) < 0.9
+        assert float(bw.apply_float(low, 1)[0, 0, 0]) > 0.02
+
+
 def test_two_segments_keep_their_gamma_and_reverse_moves_the_range():
     import tempfile
     from pathlib import Path
@@ -519,6 +582,7 @@ if __name__ == "__main__":
     test_saturation_goes_gray()
     test_quarter_preview_keeps_bayer_phase()
     test_segment_lookup()
+    test_tone_curve_stays_increasing_and_lands_before_gamma()
     test_two_segments_keep_their_gamma_and_reverse_moves_the_range()
     test_horizontal_off_keeps_only_the_vertical()
     test_perfo_follows_a_hole()

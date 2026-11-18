@@ -661,6 +661,28 @@ class GpuReveal:
             rgb = np.ascontiguousarray(rgb[:, ::-1])
         return rgb
 
+    def _apply_curve(self, index: int):
+        """La curva de luces, antes de la gamma. Sin movimiento, no toca el cuadro."""
+        if self.finish is None:
+            return
+        table = self.finish.curve_lut(index)
+        if table is None:
+            return
+        cp = self.cp
+        key = id(table)
+        cached = getattr(self, "_curve_cache", {}).get(key)
+        if cached is None:
+            if not hasattr(self, "_curve_cache"):
+                self._curve_cache = {}
+            cached = cp.asarray(table)
+            self._curve_cache[key] = cached
+        last = int(cached.shape[0]) - 1
+        pos = cp.clip(self.img, 0.0, 1.0) * np.float32(last)
+        low = pos.astype(cp.int32)
+        high = cp.minimum(low + 1, last)
+        frac = pos - low
+        self.img[...] = cached[low] * (np.float32(1.0) - frac) + cached[high] * frac
+
     def _crop_args(self) -> tuple[int, int, int, int]:
         if self.finish is not None:
             box = self.finish.crop_box(self.width, self.height, getattr(self, "_index", 0))
@@ -672,6 +694,7 @@ class GpuReveal:
         src = self.img
         if self.finish is None:
             return src
+        self._apply_curve(index)
         recipe = None if self.finish.grade_mode == "bw" else self.finish.recipe_at(index)
         if recipe:
             mins = recipe["mins"]

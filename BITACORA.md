@@ -1,5 +1,20 @@
 # Bitácora — Lucid Scanner
 
+## 2026-11-18 — Curva de luces por tramo, antes del GamMac
+
+### Por qué
+En Color hacía falta subir o bajar zonas del gris sin volver a medir la estabilización ni el recorte, y poder reexportar rollos que ya habían salido. Unos sliders por zona no alcanzan: el de sombras siempre tira del mismo gris y, para que se note, hay que subirlo tanto que el tramo de al lado se aplana y el siguiente pega un salto. Parece una solarización. En DaVinci el punto lo pones tú, y la transición queda entre ese punto y el vecino.
+
+### Cómo
+- En Color, para color y para blanco y negro, hay un gráfico. Parte en la recta, sin puntos. El clic izquierdo crea uno y se arrastra. El clic derecho lo borra. Enderezar vuelve a la recta. El recuadro usa todo el ancho del panel y crece de alto solo hasta quedar cuadrado.
+- Un punto no puede pasar al vecino. La tabla que sale de esos puntos siempre sube: un gris más oscuro sigue saliendo más oscuro. En color se aplica antes del GamMac. En blanco y negro es el ajuste de luces y después el cuadro pasa a gris. Estabilización sigue sin curva.
+- Cada tramo de la pista tiene la suya. Se guarda en el `adjust.json`, junto al color. La perforación, el recorte, el giro, el volteo, el revés y las puntas no se tocan. Un archivo sin curva sale igual que antes. El preview, la exportación en CPU y la de la tarjeta usan la misma tabla. Si quedó una curva hecha con los sliders de prueba, se sigue leyendo.
+
+### Hecho
+- La curva se ve al moverla, en Color y en Recorte, y entra al reexportar.
+- El gris no se da vuelta ni se aplasta por un slider fijo.
+- Lo ya medido de estabilización y recorte se conserva.
+
 ## 2026-11-15 — Cola de estabilización, medición al dibujar y columna de estado
 
 ### Por qué

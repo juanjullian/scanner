@@ -21,6 +21,8 @@ from PyQt6.QtWidgets import (
 
 import film_finish
 import gammac
+import tone
+from curve_graph import CurveGraph
 from export_session import estimate_remaining_seconds, format_duration
 from reveal_dialog import FrameView, RollEnds, TurnControl, _GENTLE, _NEUTRAL, _paint_badges
 from timeline_bar import TimelineBar, _timeline_button
@@ -549,6 +551,21 @@ class VideoFinishWindow(QMainWindow):
         self.sld_sat.setValue(100)
         self.sld_sat.valueChanged.connect(self._on_sat)
         layout.addWidget(self.sld_sat)
+        curve_note = QLabel(
+            "Curva de luces. Parte en la recta, sin puntos. "
+            "Clic crea uno y lo arrastras. Clic derecho lo borra. "
+            "No puede pasar al vecino: si se traba, mueve también el de al lado. "
+            "En color va antes del GamMac. Cada tramo tiene la suya."
+        )
+        curve_note.setWordWrap(True)
+        layout.addWidget(curve_note)
+        self.curve_graph = CurveGraph()
+        self.curve_graph.changed.connect(self._on_curve)
+        layout.addWidget(self.curve_graph, 1)
+        straighten = QPushButton("Enderezar")
+        straighten.setToolTip("Deja la curva en la recta. No toca el GamMac.")
+        straighten.clicked.connect(self._straighten_curve)
+        layout.addWidget(straighten)
         measure_row = QHBoxLayout()
         btn_measure = QPushButton("Medir")
         btn_measure.clicked.connect(self._measure_segment)
@@ -556,7 +573,9 @@ class VideoFinishWindow(QMainWindow):
         btn_clear.setToolTip("Borra la gamma medida de este tramo. El área dibujada se queda.")
         btn_clear.clicked.connect(self._clear_measure)
         btn_restore = QPushButton("Volver al predeterminado")
-        btn_restore.setToolTip("Devuelve los controles al ajuste de partida y, si hay área, vuelve a medir.")
+        btn_restore.setToolTip(
+            "Devuelve los controles al ajuste de partida, endereza la curva y, si hay área, vuelve a medir."
+        )
         btn_restore.clicked.connect(self._restore_preset)
         measure_row.addWidget(btn_measure)
         measure_row.addWidget(btn_clear)
@@ -1121,8 +1140,9 @@ class VideoFinishWindow(QMainWindow):
         base = self._preview
         index = self._source_index()
         mode, sat = self._grade_setting()
+        graded = tone.apply(base, self._curve_for(index)) if self._task in (1, 2) else base
         recipe = self._recipe_for_preview(base, index) if mode == "color" and self._task in (1, 2) else None
-        graded = gammac.apply(base, recipe) if recipe else base
+        graded = gammac.apply(graded, recipe) if recipe else graded
         graded = gammac.saturate(graded, sat)
         plain = gammac.saturate(base, sat)
         playing = self._playing
@@ -1645,7 +1665,8 @@ class VideoFinishWindow(QMainWindow):
             segment = items[0]
             last = max(0, self._count - 1)
             bare = int(segment.get("in", 0)) == 0 and int(segment.get("out", -1)) == last
-            if bare and not segment.get("rect") and not (segment.get("recipe") or {}).get("ok"):
+            has_curve = tone.active(segment.get("curve"))
+            if bare and not segment.get("rect") and not (segment.get("recipe") or {}).get("ok") and not has_curve:
                 return []
         return items
 
@@ -1828,6 +1849,7 @@ class VideoFinishWindow(QMainWindow):
         segment = self._selected()
         if segment is None:
             self._apply_preset_to_controls(self._preset())
+            self.curve_graph.set_curve(None)
             return
         values = dict(_NEUTRAL)
         values.update({key: segment[key] for key in _NEUTRAL if key in segment})
@@ -1838,6 +1860,34 @@ class VideoFinishWindow(QMainWindow):
         self.combo_lock.blockSignals(False)
         self.combo_scale.blockSignals(False)
         self._set_color_values(values)
+        self.curve_graph.set_curve(segment.get("curve"))
+
+    def _write_curve(self, segment: dict):
+        curve = self.curve_graph.curve()
+        if curve:
+            segment["curve"] = curve
+        else:
+            segment.pop("curve", None)
+
+    def _curve_for(self, index: int):
+        for segment in self._covered_segments():
+            if int(segment["in"]) <= int(index) <= int(segment["out"]):
+                return segment.get("curve")
+        return None
+
+    def _on_curve(self, *_args):
+        curve = self.curve_graph.curve()
+        segment = self._selected()
+        if segment is None:
+            segment = self._ensure_segment()
+            self.curve_graph.set_curve(curve)
+        self._write_curve(segment)
+        self._save_current()
+        self._paint_preview()
+
+    def _straighten_curve(self):
+        self.curve_graph.set_curve(None)
+        self._on_curve()
 
     def _touch_segment(self, *_args):
         self._refresh_color_labels()
@@ -1877,11 +1927,13 @@ class VideoFinishWindow(QMainWindow):
 
     def _restore_preset(self):
         self._apply_preset_to_controls(self._preset())
+        self.curve_graph.set_curve(None)
         segment = self._selected()
         if segment is None:
             self.lbl_color.setText("Volví a los controles predeterminados.")
             return
         self._write_knobs(segment)
+        self._write_curve(segment)
         if segment.get("rect"):
             self._measure_segment()
             return
