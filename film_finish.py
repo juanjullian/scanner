@@ -17,6 +17,7 @@ from pathlib import Path
 import cv2
 import numpy as np
 
+import balance
 import gammac
 import tone
 
@@ -113,6 +114,9 @@ def empty() -> dict:
         "trim_out": None,
         "crop_spans": [],
         "reveal": None,
+        "wb": None,
+        "curve_on": None,
+        "gammac_on": None,
     }
 
 
@@ -341,6 +345,9 @@ def load(raw: Path) -> dict:
         base["crop_spans"] = [item for item in spans if isinstance(item, dict)]
         reveal = data.get("reveal")
         base["reveal"] = dict(reveal) if isinstance(reveal, dict) else None
+        base["wb"] = data.get("wb") if isinstance(data.get("wb"), dict) else None
+        base["curve_on"] = data.get("curve_on") if "curve_on" in data else None
+        base["gammac_on"] = data.get("gammac_on") if "gammac_on" in data else None
     return base
 
 
@@ -369,6 +376,8 @@ def has_adjust(data: dict) -> bool:
         if isinstance(span, dict) and (span.get("crop") or span.get("flip_h")):
             return True
     if isinstance(data.get("reveal"), dict):
+        return True
+    if balance.gains_of(data.get("wb")) is not None:
         return True
     return bool(data.get("segments"))
 
@@ -911,6 +920,19 @@ class Finish:
         self.trim_in = self.data.get("trim_in")
         self.trim_out = self.data.get("trim_out")
         self.horizontal = perfo_horizontal(self.data.get("perfo"))
+        self.curve_on = curve_enabled(self.data)
+        self.gammac_on = gammac_enabled(self.data)
+        self.wb = balance.coerce(self.data.get("wb"))
+
+    def wb_gains(self):
+        return balance.gains_of(self.wb)
+
+    def kelvin_gains(self):
+        """Solo el revelador guarda kelvin. Un video ya revelado no lo vuelve a aplicar."""
+        reveal = self.data.get("reveal")
+        if not isinstance(reveal, dict) or "kelvin" not in reveal:
+            return None
+        return balance.kelvin_gains(reveal.get("kelvin"))
 
     def sources(self, count: int) -> list[int]:
         """Cuadros del archivo en el orden en que se exportan."""
@@ -921,7 +943,8 @@ class Finish:
         graded = self.grade_mode == "bw" or self.grade_sat < 0.999
         turned = abs(self.turn) >= 0.05
         flipped = self.flip_h or any(bool(span.get("flip_h")) for span in self.crop_spans)
-        return bool(self.segments or self.tx or self.crop or graded or turned or flipped)
+        tinted = self.wb_gains() is not None or self.kelvin_gains() is not None
+        return bool(self.segments or self.tx or self.crop or graded or turned or flipped or tinted)
 
     def sampling(self, index: int, width: int, height: int):
         tx, ty = self.shift_at(index)
@@ -1010,8 +1033,10 @@ class Finish:
         return np.clip(work * np.float32(65535.0) + np.float32(0.5), 0, 65535).astype(np.uint16)
 
     def apply_float(self, image: np.ndarray, index: int, out_wh: tuple[int, int] | None = None) -> np.ndarray:
-        work = tone.apply(image, self.curve_at(index))
-        if self.grade_mode != "bw":
+        work = balance.before_gammac(image, self.wb_gains(), self.kelvin_gains())
+        if self.curve_on:
+            work = tone.apply(work, self.curve_at(index))
+        if self.grade_mode != "bw" and self.gammac_on:
             work = gammac.apply(work, self.recipe_at(index))
         work = gammac.saturate(work, self.grade_sat)
         height, width = work.shape[:2]
@@ -1040,6 +1065,24 @@ class Finish:
         if self.flip_at(index):
             cropped = np.ascontiguousarray(cropped[:, ::-1])
         return cropped
+
+
+def curve_enabled(data) -> bool:
+    """Sin la clave, queda prendida si algún tramo ya tiene curva. Si no, apagada."""
+    if isinstance(data, dict) and data.get("curve_on") is not None:
+        return bool(data["curve_on"])
+    return any(tone.active((item or {}).get("curve")) for item in (data or {}).get("segments") or [])
+
+
+def gammac_enabled(data) -> bool:
+    """Sin la clave, queda prendido si algún tramo ya tiene gamma medida."""
+    if isinstance(data, dict) and data.get("gammac_on") is not None:
+        return bool(data["gammac_on"])
+    for item in (data or {}).get("segments") or []:
+        recipe = (item or {}).get("recipe") or {}
+        if recipe.get("ok") and not recipe.get("limited"):
+            return True
+    return False
 
 
 def _segment_exports(item: dict) -> bool:

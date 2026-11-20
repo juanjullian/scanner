@@ -661,9 +661,18 @@ class GpuReveal:
             rgb = np.ascontiguousarray(rgb[:, ::-1])
         return rgb
 
+    def _apply_gains(self, gains):
+        """Balance o temperatura, en el mismo orden que el CPU: antes de la curva."""
+        if not gains:
+            return
+        cp = self.cp
+        scale = cp.asarray(np.asarray(gains, dtype=np.float32)).reshape(1, 1, 3)
+        self.img *= scale
+        cp.clip(self.img, 0.0, 1.0, out=self.img)
+
     def _apply_curve(self, index: int):
         """La curva de luces, antes de la gamma. Sin movimiento, no toca el cuadro."""
-        if self.finish is None:
+        if self.finish is None or not self.finish.curve_on:
             return
         table = self.finish.curve_lut(index)
         if table is None:
@@ -694,8 +703,12 @@ class GpuReveal:
         src = self.img
         if self.finish is None:
             return src
+        self._apply_gains(self.finish.wb_gains())
+        self._apply_gains(self.finish.kelvin_gains())
         self._apply_curve(index)
-        recipe = None if self.finish.grade_mode == "bw" else self.finish.recipe_at(index)
+        recipe = None
+        if self.finish.gammac_on and self.finish.grade_mode != "bw":
+            recipe = self.finish.recipe_at(index)
         if recipe:
             mins = recipe["mins"]
             maxs = recipe["maxs"]

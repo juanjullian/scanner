@@ -1,5 +1,21 @@
 # Bitácora — Lucid Scanner
 
+## 2026-11-20 — Balance de blancos y temperatura, antes del GamMac
+
+### Por qué
+La luz de la lámpara se ve en la perforación, y ese es el blanco de verdad. Hacía falta medirlo sin pisar el área del GamMac, y en el revelador poder entibiar o enfriar en grados Kelvin. Un archivo que ya tenía curva y gamma no puede cambiar de aspecto solo porque aparezcan estos controles.
+
+### Cómo
+- El balance está en el revelador y en el tratador. Se dibuja un rectángulo sobre la luz blanca de la perforación. Las ganancias dejan esa zona en gris, con la misma luminancia. La temperatura es un slider de 2500 K a 10000 K, solo en el revelado. 6500 K no tiñe. Más bajo entibia y más alto enfría, después del blanco.
+- Los dos van antes de la curva y del GamMac. Si el `adjust.json` no trae balance ni kelvin, la imagen sale igual que antes. Una curva o una gamma ya medida siguen prendidas.
+- En Color, cada ajuste es una sección plegada: casilla para prenderla, flecha para abrirla y, si dibuja un rectángulo, el título para seleccionarla. Solo la sección seleccionada muestra su rectángulo y deja dibujarlo. Color o blanco y negro es otra sección: marcada habilita las de abajo; desmarcada pasa a blanco y negro y las apaga.
+- Las explicaciones largas quedaron en un signo de pregunta, dentro de un círculo. El texto aparece al pasar el mouse.
+
+### Hecho
+- El blanco de la perforación y la temperatura entran al preview y a la exportación, en CPU y en la tarjeta, antes del GamMac.
+- No se pueden dibujar a la vez el rectángulo del blanco y el del GamMac.
+- Un rollo ya graduado, sin estas claves, se ve como antes.
+
 ## 2026-11-18 — Curva de luces por tramo, antes del GamMac
 
 ### Por qué

@@ -35,6 +35,7 @@ def default_reveal() -> dict:
         "shadow_b": 0.0,
         "shadow_lift": 0.0,
         "midtone": 0.0,
+        "kelvin": 6500.0,
         "engine": "cpu",
     }
 
@@ -60,6 +61,7 @@ def coerce_reveal(data) -> dict:
     out["shadow_b"] = float(np.clip(out["shadow_b"], 0.0, 64.0))
     out["shadow_lift"] = float(np.clip(out["shadow_lift"], 0.0, 0.35))
     out["midtone"] = float(np.clip(out["midtone"], 0.0, 2.0))
+    out["kelvin"] = float(np.clip(out["kelvin"], 2000.0, 12000.0))
     return out
 
 
@@ -67,7 +69,8 @@ def summary_line(settings: dict) -> str:
     s = coerce_reveal(settings)
     return (
         f"Revelado guardado: rojo {s['gain_r']:.2f}, azul {s['gain_b']:.2f}, "
-        f"EV {s['ev']:+.2f}, gamma {s['gamma']:.2f}, sombras {s['shadow_b']:.0f}, detalle {s['midtone']:.2f}, "
+        f"EV {s['ev']:+.2f}, gamma {s['gamma']:.2f}, {s['kelvin']:.0f} K, "
+        f"sombras {s['shadow_b']:.0f}, detalle {s['midtone']:.2f}, "
         f"{'en la GPU' if s['engine'] == 'gpu' else 'en el CPU'}"
     )
 

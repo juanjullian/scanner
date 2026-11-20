@@ -19,11 +19,13 @@ from PyQt6.QtWidgets import (
     QTextEdit, QVBoxLayout, QWidget,
 )
 
+import balance
 import film_finish
+import fold_section
 import gammac
 import tone
 from curve_graph import CurveGraph
-from export_session import estimate_remaining_seconds, format_duration
+from export_session import ExportWatch, estimate_remaining_seconds, format_duration, set_execution_state
 from reveal_dialog import FrameView, RollEnds, TurnControl, _GENTLE, _NEUTRAL, _paint_badges
 from timeline_bar import TimelineBar, _timeline_button
 from video_export import export_clip, output_path
@@ -54,6 +56,7 @@ class Clip:
     height: int = 0
     frames: int = 0
     linked: bool = False
+    has_audio: bool = False
     adjust: dict = field(default_factory=film_finish.empty)
 
     def info(self) -> VideoInfo | None:
@@ -212,6 +215,7 @@ class _AnalyzeThread(QThread):
 
 class _ExportThread(QThread):
     frame = pyqtSignal(str, int, int)
+    thumb = pyqtSignal(bytes)
     file_done = pyqtSignal(str, bool, str)
 
     def __init__(self, jobs: list[tuple[str, str, str, str]]):
@@ -231,6 +235,7 @@ class _ExportThread(QThread):
                 export_clip(
                     Path(source), Path(dst), codec, fps_text, lambda: self._cancel,
                     lambda done, total, _source=source: self.frame.emit(_source, int(done), int(total)),
+                    on_thumb=self.thumb.emit,
                 )
                 self.file_done.emit(source, True, "")
             except Cancelled:
@@ -268,6 +273,7 @@ class VideoFinishWindow(QMainWindow):
         self._play_recipe = None
         self._draft_id = None
         self._csliders = {}
+        self._draw = None
         self._reader = PreviewReader()
         self._analyze: _AnalyzeThread | None = None
         self._analyze_queue: list[tuple] = []
@@ -360,9 +366,21 @@ class VideoFinishWindow(QMainWindow):
         self._crop_i = 0
 
         side = QVBoxLayout()
+        film_row = QHBoxLayout()
+        film_row.setSpacing(4)
+        self.btn_clip_prev = QPushButton("Atrás")
+        self.btn_clip_prev.setToolTip("Película anterior de la lista.")
+        self.btn_clip_prev.clicked.connect(lambda: self._step_clip(-1))
         self.lbl_name = QLabel("Ningún video")
-        self.lbl_name.setWordWrap(True)
-        side.addWidget(self.lbl_name)
+        self.lbl_name.setWordWrap(False)
+        self.btn_clip_next = QPushButton("Adelante")
+        self.btn_clip_next.setToolTip("Película siguiente de la lista.")
+        self.btn_clip_next.clicked.connect(lambda: self._step_clip(1))
+        film_row.addWidget(self.btn_clip_prev)
+        film_row.addWidget(self.lbl_name, 1)
+        film_row.addWidget(self.btn_clip_next)
+        side.addLayout(film_row)
+        self._sync_clip_buttons()
         self.lbl_frame = QLabel("Cuadro")
         side.addWidget(self.lbl_frame)
         self.sld_frame = QSlider(Qt.Orientation.Horizontal)
@@ -408,11 +426,13 @@ class VideoFinishWindow(QMainWindow):
         bar = QHBoxLayout()
         bar.addWidget(QLabel("Salida"))
         self.combo_fmt = QComboBox()
+        self.combo_fmt.addItem("HEVC 4:2:2 80 Mbps", "hevc_hq")
         self.combo_fmt.addItem("ProRes 422 HQ", "prores_4444")
         self.combo_fmt.addItem("HEVC 4:4:4 lossless", "hevc_nvenc")
         self.combo_fmt.setToolTip(
-            "ProRes 422 HQ se codifica en la tarjeta con ProRes NV, "
-            "igual que la exportación del raw. HEVC lossless usa NVENC."
+            "HEVC 4:2:2 a 80 Mbps es la salida por defecto: NVENC, pensado para el grano. "
+            "ProRes 422 HQ se codifica en la tarjeta con ProRes NV. "
+            "HEVC lossless es 4:4:4 sin pérdida."
         )
         bar.addWidget(self.combo_fmt, 1)
         bar.addWidget(QLabel("FPS"))
@@ -423,7 +443,10 @@ class VideoFinishWindow(QMainWindow):
         self.spin_fps.valueChanged.connect(self._on_fps)
         bar.addWidget(self.spin_fps)
         btn_fps = QPushButton("A todos")
-        btn_fps.setToolTip("Copia este FPS a los demás videos de la lista.")
+        btn_fps.setToolTip(
+            "Copia este FPS a los demás videos de la lista. "
+            "Los que tienen audio se quedan en el FPS del archivo."
+        )
         btn_fps.clicked.connect(self._fps_all)
         bar.addWidget(btn_fps)
         self.btn_export = QPushButton("Exportar")
@@ -434,6 +457,8 @@ class VideoFinishWindow(QMainWindow):
         self.btn_cancel.setVisible(False)
         bar.addWidget(self.btn_cancel)
         root.addLayout(bar)
+        self._watch = ExportWatch()
+        self._watch.cancelled.connect(self._cancel_work)
         self.lbl_status = QLabel("Los ajustes se guardan al lado de cada video.")
         self.lbl_status.setWordWrap(True)
         root.addWidget(self.lbl_status)
@@ -482,19 +507,21 @@ class VideoFinishWindow(QMainWindow):
         if self._export is not None and self._export.isRunning():
             self._export.cancel()
             self._export.wait(1500)
+        self._close_watch()
         self._reader.close()
         super().closeEvent(event)
 
     def _build_stab(self) -> QWidget:
         page = QWidget()
         layout = QVBoxLayout(page)
-        note = QLabel(
+        head = QHBoxLayout()
+        head.addStretch(1)
+        head.addWidget(fold_section.HelpMark(
             "Dibuja la zona alrededor de una perforación, sin meter el cuadro. "
             "El cuadro en el que dibujas queda como referencia de toda la estabilización. "
             "Al reproducir, la izquierda es el original y la derecha el estabilizado."
-        )
-        note.setWordWrap(True)
-        layout.addWidget(note)
+        ))
+        layout.addLayout(head)
         self.chk_perfo = QCheckBox("Aplicar estabilización al exportar")
         self.chk_perfo.toggled.connect(lambda _on: self._save_current())
         layout.addWidget(self.chk_perfo)
@@ -527,45 +554,58 @@ class VideoFinishWindow(QMainWindow):
     def _build_color(self) -> QWidget:
         page = QWidget()
         layout = QVBoxLayout(page)
-        note = QLabel(
-            "El área tiene que dejar afuera el borde y las perforaciones. "
-            "Abajo, el rollo parte en un solo tramo. Partir lo corta en la línea "
-            "y el borde se corre cuadro a cuadro."
+        self.fold_grade = fold_section.FoldSection(
+            "Color",
+            "Marcado queda en color y habilita las secciones de abajo. "
+            "Desmarcado pasa a blanco y negro, apaga esas secciones y deja la saturación en 0.",
         )
-        note.setWordWrap(True)
-        layout.addWidget(note)
-        self.combo_grade = QComboBox()
-        self.combo_grade.addItem("Color", "color")
-        self.combo_grade.addItem("Blanco y negro", "bw")
-        self.combo_grade.currentIndexChanged.connect(self._on_grade_mode)
-        layout.addWidget(self.combo_grade)
+        self.fold_grade.toggled.connect(self._on_grade_mode)
         sat_head = QHBoxLayout()
         sat_title = QLabel("Saturación")
         self.lbl_sat = QLabel("100")
         self.lbl_sat.setAlignment(Qt.AlignmentFlag.AlignRight)
         sat_head.addWidget(sat_title)
         sat_head.addWidget(self.lbl_sat)
-        layout.addLayout(sat_head)
+        sat_row = QWidget()
+        sat_row.setLayout(sat_head)
         self.sld_sat = QSlider(Qt.Orientation.Horizontal)
         self.sld_sat.setRange(0, 100)
         self.sld_sat.setValue(100)
         self.sld_sat.valueChanged.connect(self._on_sat)
-        layout.addWidget(self.sld_sat)
-        curve_note = QLabel(
-            "Curva de luces. Parte en la recta, sin puntos. "
-            "Clic crea uno y lo arrastras. Clic derecho lo borra. "
-            "No puede pasar al vecino: si se traba, mueve también el de al lado. "
-            "En color va antes del GamMac. Cada tramo tiene la suya."
+        self.fold_grade.add_widget(sat_row)
+        self.fold_grade.add_widget(self.sld_sat)
+        layout.addWidget(self.fold_grade)
+        self.fold_wb = fold_section.FoldSection(
+            "Balance de blancos",
+            "Selecciona el título para ver y dibujar el rectángulo sobre la luz blanca de la perforación. "
+            "Solo se muestra el rectángulo de la sección seleccionada. Va antes de la curva y del GamMac.",
+            selectable=True,
         )
-        curve_note.setWordWrap(True)
-        layout.addWidget(curve_note)
+        self.fold_wb.toggled.connect(self._on_wb_toggle)
+        self.fold_wb.picked.connect(lambda: self._select_draw("wb"))
+        self.lbl_wb = QLabel("Sin blanco medido.")
+        self.lbl_wb.setWordWrap(True)
+        btn_clear_wb = QPushButton("Quitar el blanco")
+        btn_clear_wb.clicked.connect(self._clear_wb)
+        self.fold_wb.add_widget(self.lbl_wb)
+        self.fold_wb.add_widget(btn_clear_wb)
+        layout.addWidget(self.fold_wb)
+        self.fold_curve = fold_section.FoldSection(
+            "Curva de luces",
+            "Parte en la recta, sin puntos. Clic crea uno y lo arrastras. Clic derecho lo borra. "
+            "No puede pasar al vecino: si se traba, mueve también el de al lado. "
+            "En color va antes del GamMac. Cada tramo tiene la suya. "
+            "La casilla la prende o la apaga sin borrarla.",
+        )
+        self.fold_curve.toggled.connect(self._on_curve_toggle)
         self.curve_graph = CurveGraph()
         self.curve_graph.changed.connect(self._on_curve)
-        layout.addWidget(self.curve_graph, 1)
         straighten = QPushButton("Enderezar")
         straighten.setToolTip("Deja la curva en la recta. No toca el GamMac.")
         straighten.clicked.connect(self._straighten_curve)
-        layout.addWidget(straighten)
+        self.fold_curve.add_widget(self.curve_graph, 1)
+        self.fold_curve.add_widget(straighten)
+        layout.addWidget(self.fold_curve, 1)
         measure_row = QHBoxLayout()
         btn_measure = QPushButton("Medir")
         btn_measure.clicked.connect(self._measure_segment)
@@ -580,8 +620,9 @@ class VideoFinishWindow(QMainWindow):
         measure_row.addWidget(btn_measure)
         measure_row.addWidget(btn_clear)
         measure_row.addWidget(btn_restore)
-        layout.addLayout(measure_row)
-        self.lbl_color = QLabel("Dibuja el área. El tramo de abajo parte cubriendo todo el rollo.")
+        measure_host = QWidget()
+        measure_host.setLayout(measure_row)
+        self.lbl_color = QLabel("Sin área en este tramo.")
         self.lbl_color.setWordWrap(True)
         form = QVBoxLayout()
         form.addWidget(QLabel("Anclaje"))
@@ -629,25 +670,34 @@ class VideoFinishWindow(QMainWindow):
         scroll.setFrameShape(QFrame.Shape.NoFrame)
         scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         scroll.setWidget(inner)
-        self._gammac_box = QWidget()
-        box = QVBoxLayout(self._gammac_box)
-        box.setContentsMargins(0, 0, 0, 0)
-        box.addWidget(self.lbl_color)
-        box.addWidget(scroll, 1)
-        layout.addWidget(self._gammac_box, 1)
+        scroll.setMinimumHeight(180)
+        self.fold_gammac = fold_section.FoldSection(
+            "GamMac",
+            "Selecciona el título para ver y dibujar el rectángulo. "
+            "El área deja afuera el borde y las perforaciones. "
+            "El rollo parte en un tramo. Partir lo corta en la línea y el borde se corre cuadro a cuadro.",
+            selectable=True,
+        )
+        self.fold_gammac.toggled.connect(self._on_gammac_toggle)
+        self.fold_gammac.picked.connect(lambda: self._select_draw("gammac"))
+        self.fold_gammac.add_widget(measure_host)
+        self.fold_gammac.add_widget(self.lbl_color)
+        self.fold_gammac.add_widget(scroll, 1)
+        layout.addWidget(self.fold_gammac, 1)
         self._apply_preset_to_controls(self._preset())
         return page
 
     def _build_crop(self) -> QWidget:
         page = QWidget()
         layout = QVBoxLayout(page)
-        note = QLabel(
+        head = QHBoxLayout()
+        head.addStretch(1)
+        head.addWidget(fold_section.HelpMark(
             "A la izquierda, el cuadro con el recorte. A la derecha, lo que se codifica. "
             "El primer tramo fija la proporción y el tamaño del video. "
             "Los siguientes se mueven y se agrandan o achican parejos, sin deformar."
-        )
-        note.setWordWrap(True)
-        layout.addWidget(note)
+        ))
+        layout.addLayout(head)
         self.chk_crop = QCheckBox("Aplicar este recorte al exportar")
         self.chk_crop.toggled.connect(self._on_crop_toggle)
         layout.addWidget(self.chk_crop)
@@ -773,10 +823,11 @@ class VideoFinishWindow(QMainWindow):
             kept = disk
         updated = Clip(
             path=str(new),
-            fps=clip.fps if clip.fps_edited else info.fps,
-            fps_text=f"{clip.fps:.6f}" if clip.fps_edited else info.fps_text,
-            fps_edited=clip.fps_edited,
+            fps=info.fps if info.audio else (clip.fps if clip.fps_edited else info.fps),
+            fps_text=info.fps_text if info.audio else (f"{clip.fps:.6f}" if clip.fps_edited else info.fps_text),
+            fps_edited=False if info.audio else clip.fps_edited,
             fps_file=info.fps,
+            has_audio=bool(info.audio),
             width=info.width,
             height=info.height,
             frames=info.frames,
@@ -913,6 +964,7 @@ class VideoFinishWindow(QMainWindow):
         else:
             self._current = None
             self._show_empty()
+        self._sync_clip_buttons()
 
     def _on_row(self, row: int):
         if self._filling:
@@ -922,14 +974,37 @@ class VideoFinishWindow(QMainWindow):
         if item is not None:
             path = str(item.data(Qt.ItemDataRole.UserRole))
         if path == self._current:
+            self._sync_clip_buttons()
             return
         self._save_current()
         self._stop_play()
         self._current = path
         self._load_current()
+        self._sync_clip_buttons()
+
+    def _step_clip(self, delta: int):
+        row = self.list.currentRow() + int(delta)
+        if row < 0 or row >= self.list.count():
+            return
+        self.list.setCurrentRow(row)
+
+    def _sync_clip_buttons(self):
+        row = self.list.currentRow()
+        count = self.list.count()
+        self.btn_clip_prev.setEnabled(row > 0)
+        self.btn_clip_next.setEnabled(0 <= row < count - 1)
+
+    def _set_clip_name(self, text: str):
+        width = max(120, self.lbl_name.width() - 8)
+        self.lbl_name.setText(self.lbl_name.fontMetrics().elidedText(
+            text, Qt.TextElideMode.ElideMiddle, width,
+        ))
+        self.lbl_name.setToolTip(text)
 
     def _show_empty(self):
         self.lbl_name.setText("Ningún video")
+        self.lbl_name.setToolTip("")
+        self._sync_clip_buttons()
         self.view.clear()
         self.stack.setEnabled(False)
         self.sld_frame.setEnabled(False)
@@ -942,9 +1017,10 @@ class VideoFinishWindow(QMainWindow):
         self._play_recipe = None
         self._draft_id = None
         if clip is None or not clip.linked:
+            self._sync_fps_lock(None)
             self._show_empty()
             if clip is not None:
-                self.lbl_name.setText(f"Sin enlace · {Path(clip.path).name}")
+                self._set_clip_name(f"Sin enlace · {Path(clip.path).name}")
                 self.lbl_status.setText("Este video no está. Vuelve a enlazarlo para verlo.")
             return
         self.stack.setEnabled(True)
@@ -952,10 +1028,11 @@ class VideoFinishWindow(QMainWindow):
         self._full_w = clip.width
         self._full_h = clip.height
         self._count = max(1, clip.frames)
-        self.lbl_name.setText(Path(clip.path).name)
+        self._set_clip_name(Path(clip.path).name)
         self.spin_fps.blockSignals(True)
         self.spin_fps.setValue(float(clip.fps))
         self.spin_fps.blockSignals(False)
+        self._sync_fps_lock(clip)
         self._adjust = film_finish.load(Path(clip.path))
         clip.adjust = json.loads(json.dumps(self._adjust))
         self._load_adjust()
@@ -984,6 +1061,7 @@ class VideoFinishWindow(QMainWindow):
         self._expand_single_frame_segment()
         self._load_shifts()
         self._sync_segment_controls()
+        self._sync_folds()
         self._sync_grade_controls()
         self._sync_turn()
         self._sync_roll()
@@ -1011,6 +1089,12 @@ class VideoFinishWindow(QMainWindow):
             self._adjust["crop"] = None
             self._adjust["flip_h"] = self.chk_flip.isChecked()
         self._adjust["turn"] = self.turn.degrees()
+        if getattr(self, "fold_wb", None):
+            wb = balance.coerce(self._adjust.get("wb"))
+            wb["on"] = self.fold_wb.is_checked()
+            self._adjust["wb"] = wb
+            self._adjust["curve_on"] = self.fold_curve.is_checked()
+            self._adjust["gammac_on"] = self.fold_gammac.is_checked()
         film_finish.save(Path(clip.path), self._adjust)
         clip.adjust = json.loads(json.dumps(self._adjust))
         self._session_timer.start()
@@ -1054,9 +1138,22 @@ class VideoFinishWindow(QMainWindow):
             if item is not None and item.data(Qt.ItemDataRole.UserRole) == path:
                 item.setText(_clip_label(clip))
 
+    def _sync_fps_lock(self, clip: Clip | None):
+        locked = bool(clip and clip.has_audio)
+        self.spin_fps.setEnabled(not locked)
+        if locked:
+            self.spin_fps.setToolTip(
+                "Este archivo tiene audio. El FPS queda en el del archivo para que el sonido no se desfase."
+            )
+        else:
+            self.spin_fps.setToolTip("FPS de la salida. No cambia el cuadro que se lee.")
+
     def _on_fps(self, value: float):
         clip = self._clips.get(self._current or "")
         if clip is None or self._filling:
+            return
+        if clip.has_audio:
+            self._sync_fps_lock(clip)
             return
         clip.fps = float(value)
         clip.fps_edited = True
@@ -1069,12 +1166,20 @@ class VideoFinishWindow(QMainWindow):
             return
         value = float(self.spin_fps.value())
         text = f"{value:.6f}"
+        kept = 0
         for clip in self._clips.values():
+            if clip.has_audio:
+                kept += 1
+                continue
             clip.fps = value
             clip.fps_edited = True
             clip.fps_text = text
             self._refresh_label(clip.path)
         self._save_session()
+        if kept:
+            self.lbl_status.setText(
+                f"Copié el FPS. {kept} con audio quedaron en el FPS del archivo."
+            )
 
     def _on_scale(self, mode: str):
         self._scale[self._task] = mode
@@ -1140,13 +1245,21 @@ class VideoFinishWindow(QMainWindow):
         base = self._preview
         index = self._source_index()
         mode, sat = self._grade_setting()
-        graded = tone.apply(base, self._curve_for(index)) if self._task in (1, 2) else base
-        recipe = self._recipe_for_preview(base, index) if mode == "color" and self._task in (1, 2) else None
+        grading = self._task in (1, 2)
+        if grading:
+            base = balance.apply(base, self._wb_gains())
+        graded = tone.apply(base, self._curve_for(index)) if grading else base
+        use_gamma = (
+            mode == "color" and grading
+            and self.fold_gammac.isEnabled() and self.fold_gammac.is_checked()
+        )
+        recipe = self._recipe_for_preview(base, index) if use_gamma else None
         graded = gammac.apply(graded, recipe) if recipe else graded
         graded = gammac.saturate(graded, sat)
         plain = gammac.saturate(base, sat)
         playing = self._playing
         captions = None
+        ghost = None
         if self._task == 0:
             original = _to_u8(plain)
             if self._shifts:
@@ -1161,8 +1274,8 @@ class VideoFinishWindow(QMainWindow):
         elif self._task == 1:
             shown_img = self._warp_preview(graded) if playing else graded
             shown = _to_u8(shown_img)
-            overlay = None if playing else self._preview_rect(self._segment_rect())
-            color, side, allow = "#ffcc00", None, not playing
+            overlay, color, allow = self._color_overlay(playing)
+            side = None
         else:
             self._sync_crop_view()
             shown_img = self._warp_preview(graded)
@@ -1186,7 +1299,7 @@ class VideoFinishWindow(QMainWindow):
             color = "#4cc9f0"
         if self._task != 2:
             aspect = None
-        self.view.set_view(shown, overlay, color, side, allow, captions, aspect=aspect)
+        self.view.set_view(shown, overlay, color, side, allow, captions, aspect=aspect, ghost=ghost)
         self._refresh_bars()
         self._refresh_crop_label()
 
@@ -1260,7 +1373,10 @@ class VideoFinishWindow(QMainWindow):
             if self._flip_on():
                 full = film_finish.mirror_x(full, self._full_w)
             self._apply_crop_rect(full)
-        else:
+        elif self._draw_target() == "wb":
+            self._take_wb(full)
+            return
+        elif self._draw_target() == "gammac":
             segment = self._ensure_segment()
             segment["rect"] = list(full)
             segment["dirty"] = True
@@ -1471,32 +1587,39 @@ class VideoFinishWindow(QMainWindow):
     def _sync_grade_controls(self):
         had = isinstance(self._adjust.get("grade"), dict) and self._adjust["grade"].get("mode") in ("color", "bw")
         mode, sat = self._grade_setting()
-        self.combo_grade.blockSignals(True)
         self.sld_sat.blockSignals(True)
-        self.combo_grade.setCurrentIndex(1 if mode == "bw" else 0)
+        self.fold_grade.set_checked(mode == "color")
+        self.fold_grade.set_title("Color" if mode == "color" else "Blanco y negro")
         self.sld_sat.setValue(int(round(sat * 100)))
-        self.combo_grade.blockSignals(False)
         self.sld_sat.blockSignals(False)
         self.lbl_sat.setText(str(self.sld_sat.value()))
-        self._gammac_box.setVisible(mode == "color")
+        self._gate_folds(mode == "color")
         if not had and self._current:
             self._adjust["grade"] = {"mode": mode, "sat": sat}
             self._save_current()
 
     def _store_grade(self):
-        mode = self.combo_grade.currentData() or "color"
+        mode = "color" if self.fold_grade.is_checked() else "bw"
+        self.fold_grade.set_title("Color" if mode == "color" else "Blanco y negro")
         self._adjust["grade"] = {"mode": mode, "sat": self.sld_sat.value() / 100.0}
         self.lbl_sat.setText(str(self.sld_sat.value()))
-        self._gammac_box.setVisible(mode == "color")
+        self._gate_folds(mode == "color")
         self._save_current()
         self._paint_preview()
 
-    def _on_grade_mode(self, *_args):
-        mode = self.combo_grade.currentData() or "color"
+    def _on_grade_mode(self, on: bool):
         self.sld_sat.blockSignals(True)
-        self.sld_sat.setValue(0 if mode == "bw" else 100)
+        self.sld_sat.setValue(100 if on else 0)
         self.sld_sat.blockSignals(False)
         self._store_grade()
+
+    def _gate_folds(self, color: bool):
+        for fold in (self.fold_wb, self.fold_curve, self.fold_gammac):
+            fold.setEnabled(color)
+        if not color:
+            self._draw = None
+            self.fold_wb.set_picked(False)
+            self.fold_gammac.set_picked(False)
 
     def _on_sat(self, *_args):
         self._store_grade()
@@ -1869,7 +1992,142 @@ class VideoFinishWindow(QMainWindow):
         else:
             segment.pop("curve", None)
 
+    def _wb_gains(self):
+        if not self.fold_wb.isEnabled():
+            return None
+        return balance.gains_of(self._adjust.get("wb"))
+
+    def _wb_rect(self):
+        wb = balance.coerce(self._adjust.get("wb"))
+        if not wb.get("rect"):
+            return None
+        return tuple(wb["rect"])
+
+    def _draw_target(self):
+        if not self.fold_grade.is_checked():
+            return None
+        if self._draw == "wb" and self.fold_wb.isEnabled():
+            return "wb"
+        if self._draw == "gammac" and self.fold_gammac.isEnabled():
+            return "gammac"
+        return None
+
+    def _select_draw(self, name: str):
+        fold = self.fold_wb if name == "wb" else self.fold_gammac
+        if not fold.isEnabled():
+            return
+        self._draw = name
+        self.fold_wb.set_picked(name == "wb")
+        self.fold_gammac.set_picked(name == "gammac")
+        self._paint_preview()
+
+    def _color_overlay(self, playing: bool):
+        if playing or self._draw_target() is None:
+            return None, "#ffcc00", False
+        if self._draw_target() == "wb":
+            return self._preview_rect(self._wb_rect()), "#f4f4f4", True
+        return self._preview_rect(self._segment_rect()), "#ffcc00", True
+
+    def _say_wb(self, wb=None):
+        wb = balance.coerce(self._adjust.get("wb") if wb is None else wb)
+        if not wb.get("rect"):
+            self.lbl_wb.setText("Sin blanco medido.")
+            return
+        x, y, width, height = wb["rect"]
+        gains = wb["gains"]
+        self.lbl_wb.setText(
+            f"Blanco {width}×{height} en {x}, {y}. "
+            f"Ganancias {gains[0]:.2f}, {gains[1]:.2f}, {gains[2]:.2f}."
+        )
+
+    def _sync_folds(self):
+        self.fold_curve.set_checked(film_finish.curve_enabled(self._adjust))
+        self.fold_gammac.set_checked(film_finish.gammac_enabled(self._adjust))
+        wb = balance.coerce(self._adjust.get("wb"))
+        self._adjust["wb"] = wb
+        self.fold_wb.set_checked(wb["on"])
+        self._say_wb(wb)
+
+    def _on_wb_toggle(self, on: bool):
+        wb = balance.coerce(self._adjust.get("wb"))
+        wb["on"] = bool(on)
+        self._adjust["wb"] = wb
+        segment = self._selected()
+        if segment and segment.get("rect"):
+            segment["dirty"] = True
+            self._play_recipe = None
+            self._draft_id = None
+        self._save_current()
+        if segment and segment.get("rect") and self.fold_gammac.is_checked():
+            self._run_measure(allow_sample=False)
+            return
+        self._paint_preview()
+
+    def _on_curve_toggle(self, _on: bool):
+        self._adjust["curve_on"] = self.fold_curve.is_checked()
+        self._save_current()
+        self._paint_preview()
+
+    def _on_gammac_toggle(self, _on: bool):
+        self._adjust["gammac_on"] = self.fold_gammac.is_checked()
+        self._save_current()
+        self._paint_preview()
+
+    def _clear_wb(self):
+        self._adjust["wb"] = {"on": False, "rect": None, "gains": [1.0, 1.0, 1.0]}
+        self.fold_wb.set_checked(False)
+        self._say_wb()
+        segment = self._selected()
+        if segment is not None:
+            segment["dirty"] = True
+            segment.pop("recipe", None)
+        self._play_recipe = None
+        self._draft_id = None
+        self._save_current()
+        if segment and segment.get("rect") and self.fold_gammac.is_checked():
+            self._run_measure(allow_sample=False)
+            return
+        self._paint_preview()
+
+    def _take_wb(self, full):
+        clip = self._clips.get(self._current or "")
+        if clip is None or not clip.linked:
+            return
+        frame = self._source_index()
+        try:
+            revealed = read_rgb(
+                Path(clip.path), frame, clip.file_rate(), clip.width, clip.height, full=True,
+            )
+        except VideoError as exc:
+            self.lbl_wb.setText(str(exc))
+            return
+        found = balance.measure(revealed, full)
+        if not found.get("ok"):
+            self.lbl_wb.setText(found.get("message") or "No pude medir ese blanco.")
+            self._paint_preview()
+            return
+        self._adjust["wb"] = {
+            "on": True,
+            "rect": found["rect"],
+            "gains": found["gains"],
+        }
+        self.fold_wb.set_checked(True)
+        self.lbl_wb.setText(found["message"])
+        segment = self._selected()
+        if segment is not None:
+            segment["dirty"] = True
+            segment.pop("recipe", None)
+        self._play_recipe = None
+        self._draft_id = None
+        self._save_current()
+        if segment and segment.get("rect") and self.fold_gammac.is_checked():
+            self._run_measure(allow_sample=False)
+            return
+        self._paint_preview()
+
     def _curve_for(self, index: int):
+        if not self.fold_curve.isEnabled() or not self.fold_curve.is_checked():
+            return None
         for segment in self._covered_segments():
             if int(segment["in"]) <= int(index) <= int(segment["out"]):
                 return segment.get("curve")
@@ -1877,6 +2135,9 @@ class VideoFinishWindow(QMainWindow):
 
     def _on_curve(self, *_args):
         curve = self.curve_graph.curve()
+        if curve and not self.fold_curve.is_checked():
+            self.fold_curve.set_checked(True)
+            self._adjust["curve_on"] = True
         segment = self._selected()
         if segment is None:
             segment = self._ensure_segment()
@@ -1947,6 +2208,9 @@ class VideoFinishWindow(QMainWindow):
 
     def _measure_segment(self):
         self._measure_timer.stop()
+        if not self.fold_gammac.is_checked():
+            self.fold_gammac.set_checked(True)
+            self._adjust["gammac_on"] = True
         self._run_measure(allow_sample=False)
 
     def _run_measure(self, allow_sample: bool):
@@ -1973,6 +2237,7 @@ class VideoFinishWindow(QMainWindow):
             self.lbl_color.setText(str(exc))
             return
         self._write_knobs(segment)
+        revealed = balance.apply(revealed, self._wb_gains())
         recipe = gammac.measure(revealed, segment["rect"], **self._measure_kwargs())
         segment["recipe"] = recipe
         segment["sample"] = frame
@@ -2420,8 +2685,13 @@ class VideoFinishWindow(QMainWindow):
         self.btn_cancel.setVisible(True)
         self._export = _ExportThread(jobs)
         self._export.frame.connect(self._on_export_frame)
+        self._export.thumb.connect(self._watch.set_thumb)
         self._export.file_done.connect(self._on_export_file)
         self._export.finished.connect(self._on_export_finished)
+        self._watch.set_file(Path(jobs[0][0]).name)
+        self._watch.set_times("—", "—")
+        self._watch.present()
+        set_execution_state(True, True)
         self._export.start()
         if not self.lbl_status.text().startswith("No pude medir"):
             self.lbl_status.setText("Exportando…")
@@ -2449,6 +2719,8 @@ class VideoFinishWindow(QMainWindow):
             f"{Path(path).name}: cuadro {done}/{total} ({pct:.1f}%) · {speed:.2f} fps · "
             f"{self._export_engine} · faltan {format_duration(total_eta)}"
         )
+        self._watch.set_file(Path(path).name)
+        self._watch.set_times(format_duration(_file_eta), format_duration(total_eta))
 
     def _on_export_file(self, path: str, ok: bool, message: str):
         row = self._export_rows.get(path)
@@ -2461,7 +2733,14 @@ class VideoFinishWindow(QMainWindow):
         if not ok and message:
             self.lbl_status.setText(f"{Path(path).name}: {message}")
 
+    def _close_watch(self):
+        if getattr(self, "_watch", None) is None:
+            return
+        self._watch.hide()
+        set_execution_state(False, False)
+
     def _on_export_finished(self):
+        self._close_watch()
         self.btn_export.setEnabled(True)
         if self._analyze is None or not self._analyze.isRunning():
             self.btn_cancel.setVisible(False)
@@ -2517,7 +2796,12 @@ def _apply_probe(clip: Clip, info: VideoInfo) -> None:
     clip.frames = info.frames
     clip.linked = True
     clip.fps_file = info.fps
-    if not clip.fps_edited:
+    clip.has_audio = bool(info.audio)
+    if clip.has_audio:
+        clip.fps_edited = False
+        clip.fps = info.fps
+        clip.fps_text = info.fps_text
+    elif not clip.fps_edited:
         clip.fps = info.fps
         clip.fps_text = info.fps_text
 
@@ -2546,7 +2830,8 @@ def _clip_label(clip: Clip) -> str:
     else:
         fps = f"{clip.fps:.3f}".replace(".", ",")
     seconds = clip.frames / clip.fps if clip.fps else 0
-    return f"{name}    {fps} fps    {format_duration(seconds)}"
+    sound = "    con audio" if clip.has_audio else ""
+    return f"{name}    {fps} fps    {format_duration(seconds)}{sound}"
 
 
 def _hflip(image: np.ndarray) -> np.ndarray:

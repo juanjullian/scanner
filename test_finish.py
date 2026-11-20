@@ -495,6 +495,60 @@ def test_tone_curve_stays_increasing_and_lands_before_gamma():
         assert float(bw.apply_float(low, 1)[0, 0, 0]) > 0.02
 
 
+def test_balance_and_kelvin_come_before_gammac_and_old_files_stay():
+    import tempfile
+    from pathlib import Path
+    import balance
+    import film_finish
+    neutral = np.full((4, 4, 3), 0.4, np.float32)
+    assert balance.kelvin_gains(6500) is None
+    assert balance.apply(neutral, None) is neutral
+    warm = balance.kelvin_gains(3200)
+    assert warm is not None and warm[0] > warm[2]
+    tinted = np.zeros((16, 16, 3), np.float32)
+    tinted[..., 0] = 0.80
+    tinted[..., 1] = 0.50
+    tinted[..., 2] = 0.30
+    found = balance.measure(tinted, (2, 2, 10, 10))
+    assert found["ok"]
+    fixed = balance.apply(tinted, found["gains"])
+    means = fixed[4:12, 4:12].mean(axis=(0, 1))
+    assert abs(float(means[0] - means[1])) < 0.02
+    assert abs(float(means[2] - means[1])) < 0.02
+    assert balance.gains_of({"on": False, "gains": found["gains"], "rect": found["rect"]}) is None
+    with tempfile.TemporaryDirectory() as folder:
+        raw = Path(folder) / "rollo.raw"
+        raw.write_bytes(b"")
+        film_finish.save(raw, {
+            "segments": [{"in": 0, "out": 1, "recipe": _gamma_recipe(2.0)}],
+            "perfo": {"enabled": False, "roi": None},
+            "grade": {"mode": "color", "sat": 1},
+        })
+        finish = film_finish.Finish(raw, gpu=False, codec="prores_4444")
+        assert finish.gammac_on and finish.wb_gains() is None and finish.kelvin_gains() is None
+        flat = np.full((4, 4, 3), 0.5, np.float32)
+        graded = gammac.apply(flat, _gamma_recipe(2.0))
+        assert np.allclose(finish.apply_float(flat, 0), graded, atol=0.002)
+        film_finish.save(raw, {
+            "segments": [{
+                "in": 0, "out": 1,
+                "curve": [[0.0, 0.0], [0.2, 0.55], [1.0, 1.0]],
+                "recipe": _gamma_recipe(2.0),
+            }],
+            "curve_on": False,
+            "gammac_on": False,
+            "wb": {"on": True, "rect": [0, 0, 8, 8], "gains": found["gains"]},
+            "reveal": {"kelvin": 3200},
+            "perfo": {"enabled": False, "roi": None},
+            "grade": {"mode": "color", "sat": 1},
+        })
+        tuned = film_finish.Finish(raw, gpu=False, codec="prores_4444")
+        assert tuned.curve_on is False and tuned.gammac_on is False
+        stacked = balance.before_gammac(flat, tuned.wb_gains(), tuned.kelvin_gains())
+        assert np.allclose(tuned.apply_float(flat, 0), stacked, atol=0.002)
+        assert float(tuned.apply_float(flat, 0)[0, 0, 0]) != float(graded[0, 0, 0])
+
+
 def test_two_segments_keep_their_gamma_and_reverse_moves_the_range():
     import tempfile
     from pathlib import Path
@@ -583,6 +637,7 @@ if __name__ == "__main__":
     test_quarter_preview_keeps_bayer_phase()
     test_segment_lookup()
     test_tone_curve_stays_increasing_and_lands_before_gamma()
+    test_balance_and_kelvin_come_before_gammac_and_old_files_stay()
     test_two_segments_keep_their_gamma_and_reverse_moves_the_range()
     test_horizontal_off_keeps_only_the_vertical()
     test_perfo_follows_a_hole()

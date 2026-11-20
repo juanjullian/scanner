@@ -18,7 +18,9 @@ from PyQt6.QtWidgets import (
 
 from timeline_bar import TimelineBar, _timeline_button
 
+import balance
 import film_finish
+import fold_section
 import gammac
 import reveal_pipeline
 
@@ -194,6 +196,7 @@ class FrameView(QWidget):
         self._grab_rect = None
         self._split = 0
         self._captions = ()
+        self._ghost = None
         self._empty = "Elige una película Bayer."
         self._play = _PlayButton(self)
         self._play.clicked.connect(self.play_clicked.emit)
@@ -225,10 +228,11 @@ class FrameView(QWidget):
         self._scale_btn.setMenu(menu)
         self.set_scale_choice(None)
 
-    def set_view(self, rgb: np.ndarray, overlay=None, color="#ffcc00", side=None, allow_draw=False, captions=None, aspect=None):
+    def set_view(self, rgb: np.ndarray, overlay=None, color="#ffcc00", side=None, allow_draw=False, captions=None, aspect=None, ghost=None):
         self._pix = _rgb_pixmap(rgb)
         self._side = _rgb_pixmap(side) if side is not None else QPixmap()
         self._overlay = overlay
+        self._ghost = ghost
         self._color = QColor(color)
         self._allow = allow_draw
         self._captions = tuple(captions) if captions else ()
@@ -257,6 +261,7 @@ class FrameView(QWidget):
         self._pix = QPixmap()
         self._side = QPixmap()
         self._overlay = None
+        self._ghost = None
         self._captions = ()
         self._allow = False
         self.update()
@@ -347,6 +352,9 @@ class FrameView(QWidget):
                 for corner in (mapped.topLeft(), mapped.topRight(), mapped.bottomLeft(), mapped.bottomRight()):
                     painter.drawRect(corner.x() - 3, corner.y() - 3, 6, 6)
                 painter.setBrush(Qt.BrushStyle.NoBrush)
+        if self._ghost and left.width() > 0:
+            painter.setPen(QPen(QColor("#d0d0d0"), 1, Qt.PenStyle.DashLine))
+            painter.drawRect(self._map_out(self._ghost, left, self._pix))
 
     def mousePressEvent(self, event):
         if not self._allow or self._pix.isNull() or event.button() != Qt.MouseButton.LeftButton:
@@ -779,6 +787,7 @@ class RevealDialog(QDialog):
         self._play_recipe = None
         self._draft_id = None
         self._csliders = {}
+        self._draw = None
 
         self._timer = QTimer(self)
         self._timer.setSingleShot(True)
@@ -834,11 +843,23 @@ class RevealDialog(QDialog):
 
         side = QVBoxLayout()
         side.addWidget(QLabel("Película"))
+        film_row = QHBoxLayout()
+        film_row.setSpacing(4)
+        self.btn_film_prev = QPushButton("Atrás")
+        self.btn_film_prev.setToolTip("Película anterior.")
+        self.btn_film_prev.clicked.connect(lambda: self._step_film(-1))
         self.combo = QComboBox()
         self.combo.addItems(self._filenames)
         if start_name in self._filenames:
             self.combo.setCurrentText(start_name)
-        side.addWidget(self.combo)
+        self.btn_film_next = QPushButton("Adelante")
+        self.btn_film_next.setToolTip("Película siguiente.")
+        self.btn_film_next.clicked.connect(lambda: self._step_film(1))
+        film_row.addWidget(self.btn_film_prev)
+        film_row.addWidget(self.combo, 1)
+        film_row.addWidget(self.btn_film_next)
+        side.addLayout(film_row)
+        self._sync_film_buttons()
 
         self.lbl_frame = QLabel("Cuadro")
         side.addWidget(self.lbl_frame)
@@ -951,6 +972,12 @@ class RevealDialog(QDialog):
         self._rows = {}
         self._add_slider(layout, "gain_r", "Ganancia rojo", 50, 250, 100, "1,00 deja el rojo del visor ISP. El verde queda en 1.")
         self._add_slider(layout, "gain_b", "Ganancia azul", 50, 250, 100, "1,00 deja el azul del visor ISP. El verde queda en 1.")
+        self._add_slider(
+            layout, "kelvin", "Temperatura", 2500, 10000, 1,
+            "Grados Kelvin. 6500 no mueve el color. Más bajo entibia, más alto enfría. Va antes del GamMac.",
+        )
+        self._rows["kelvin"][0].setSingleStep(50)
+        self._rows["kelvin"][0].setPageStep(100)
         self._add_slider(layout, "ev", "Exposición (EV)", -200, 200, 100, "Pasos de diafragma, antes de la gamma.")
         self._add_slider(layout, "gamma", "Gamma", 50, 300, 100, "2,00 es la del visor de captura. Siempre se aplica. Un número más alto aclara.")
         self._add_slider(layout, "shadow_b", "Sombras", 0, 400, 10, "0 deja solo la gamma. Un número más alto abre las sombras antes de esa gamma.")
@@ -962,14 +989,15 @@ class RevealDialog(QDialog):
     def _build_stab(self) -> QWidget:
         page = QWidget()
         layout = QVBoxLayout(page)
-        note = QLabel(
+        head = QHBoxLayout()
+        head.addStretch(1)
+        head.addWidget(fold_section.HelpMark(
             "Dibuja la zona alrededor de una perforación, sin el cuadro. "
             "El cuadro en el que dibujas queda como referencia de toda la estabilización. "
             "Reproducir muestra cómo quedó el desplazamiento. "
             "El análisis sigue si cierras esta ventana."
-        )
-        note.setWordWrap(True)
-        layout.addWidget(note)
+        ))
+        layout.addLayout(head)
         self.chk_perfo = QCheckBox("Aplicar estabilización al exportar")
         self.chk_perfo.toggled.connect(lambda _on: self._save_current())
         layout.addWidget(self.chk_perfo)
@@ -1002,36 +1030,44 @@ class RevealDialog(QDialog):
     def _build_color(self) -> QWidget:
         page = QWidget()
         layout = QVBoxLayout(page)
-        note = QLabel(
-            "El área tiene que dejar afuera el borde y las perforaciones. "
-            "Abajo, el rollo parte en un solo tramo. Partir lo corta en la línea "
-            "y el borde se corre cuadro a cuadro. La fuerza y la protección de sombras "
-            "aflojan la corrección para que el negro no reviente."
+        self.fold_grade = fold_section.FoldSection(
+            "Color",
+            "Marcado queda en color y habilita las secciones de abajo. "
+            "Desmarcado pasa a blanco y negro, apaga esas secciones y deja la saturación en 0. "
+            "0 en saturación es gris. 100 deja el color como está.",
         )
-        note.setWordWrap(True)
-        layout.addWidget(note)
-        self.combo_grade = QComboBox()
-        self.combo_grade.addItem("Color", "color")
-        self.combo_grade.addItem("Blanco y negro", "bw")
-        self.combo_grade.setToolTip(
-            "Blanco y negro deja solo la saturación. Color mide GamMac y, además, puede bajar la saturación."
-        )
-        self.combo_grade.currentIndexChanged.connect(self._on_grade_mode)
-        layout.addWidget(self.combo_grade)
+        self.fold_grade.toggled.connect(self._on_grade_mode)
         sat_head = QHBoxLayout()
         sat_title = QLabel("Saturación")
-        sat_title.setToolTip("0 es gris. 100 deja el color como está. En blanco y negro parte en 0.")
         self.lbl_sat = QLabel("100")
         self.lbl_sat.setAlignment(Qt.AlignmentFlag.AlignRight)
         sat_head.addWidget(sat_title)
         sat_head.addWidget(self.lbl_sat)
-        layout.addLayout(sat_head)
+        sat_row = QWidget()
+        sat_row.setLayout(sat_head)
         self.sld_sat = QSlider(Qt.Orientation.Horizontal)
         self.sld_sat.setRange(0, 100)
         self.sld_sat.setValue(100)
-        self.sld_sat.setToolTip(sat_title.toolTip())
         self.sld_sat.valueChanged.connect(self._on_sat)
-        layout.addWidget(self.sld_sat)
+        self.fold_grade.add_widget(sat_row)
+        self.fold_grade.add_widget(self.sld_sat)
+        layout.addWidget(self.fold_grade)
+        self.fold_wb = fold_section.FoldSection(
+            "Balance de blancos",
+            "Selecciona el título para ver y dibujar el rectángulo sobre la luz blanca de la perforación. "
+            "Solo se muestra el rectángulo de la sección seleccionada. "
+            "Va antes de la temperatura y del GamMac.",
+            selectable=True,
+        )
+        self.fold_wb.toggled.connect(self._on_wb_toggle)
+        self.fold_wb.picked.connect(lambda: self._select_draw("wb"))
+        self.lbl_wb = QLabel("Sin blanco medido.")
+        self.lbl_wb.setWordWrap(True)
+        btn_clear_wb = QPushButton("Quitar el blanco")
+        btn_clear_wb.clicked.connect(self._clear_wb)
+        self.fold_wb.add_widget(self.lbl_wb)
+        self.fold_wb.add_widget(btn_clear_wb)
+        layout.addWidget(self.fold_wb)
         measure_row = QHBoxLayout()
         btn_measure = QPushButton("Medir")
         btn_measure.clicked.connect(self._measure_segment)
@@ -1044,8 +1080,9 @@ class RevealDialog(QDialog):
         measure_row.addWidget(btn_measure)
         measure_row.addWidget(btn_clear)
         measure_row.addWidget(btn_restore)
-        layout.addLayout(measure_row)
-        self.lbl_color = QLabel("Dibuja el área. El tramo de abajo parte cubriendo todo el rollo.")
+        measure_host = QWidget()
+        measure_host.setLayout(measure_row)
+        self.lbl_color = QLabel("Sin área en este tramo.")
         self.lbl_color.setWordWrap(True)
 
         form = QVBoxLayout()
@@ -1127,26 +1164,35 @@ class RevealDialog(QDialog):
         scroll.setFrameShape(QFrame.Shape.NoFrame)
         scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         scroll.setWidget(inner)
-        self._gammac_box = QWidget()
-        box = QVBoxLayout(self._gammac_box)
-        box.setContentsMargins(0, 0, 0, 0)
-        box.addWidget(self.lbl_color)
-        box.addWidget(scroll, 1)
-        layout.addWidget(self._gammac_box, 1)
+        scroll.setMinimumHeight(180)
+        self.fold_gammac = fold_section.FoldSection(
+            "GamMac",
+            "Selecciona el título para ver y dibujar el rectángulo. "
+            "El área deja afuera el borde y las perforaciones. "
+            "La fuerza y la protección de sombras aflojan la corrección para que el negro no reviente. "
+            "El rollo parte en un tramo. Partir lo corta en la línea y el borde se corre cuadro a cuadro.",
+            selectable=True,
+        )
+        self.fold_gammac.picked.connect(lambda: self._select_draw("gammac"))
+        self.fold_gammac.add_widget(measure_host)
+        self.fold_gammac.add_widget(self.lbl_color)
+        self.fold_gammac.add_widget(scroll, 1)
+        layout.addWidget(self.fold_gammac, 1)
         self._apply_preset_to_controls(self._preset())
         return page
 
     def _build_crop(self) -> QWidget:
         page = QWidget()
         layout = QVBoxLayout(page)
-        note = QLabel(
+        head = QHBoxLayout()
+        head.addStretch(1)
+        head.addWidget(fold_section.HelpMark(
             "A la izquierda, el cuadro con el recorte. A la derecha, lo que se codifica. "
             "El primer tramo fija la proporción y el tamaño del video. "
             "Los siguientes se mueven y se agrandan o achican parejos, sin deformar. "
             "El borde negro de la estabilización tiene que quedar fuera."
-        )
-        note.setWordWrap(True)
-        layout.addWidget(note)
+        ))
+        layout.addLayout(head)
         self.chk_crop = QCheckBox("Aplicar este recorte al exportar")
         self.chk_crop.toggled.connect(self._paint_preview)
         layout.addWidget(self.chk_crop)
@@ -1298,33 +1344,40 @@ class RevealDialog(QDialog):
     def _sync_grade_controls(self):
         had = isinstance(self._adjust.get("grade"), dict) and self._adjust["grade"].get("mode") in ("color", "bw")
         mode, sat = self._grade_setting()
-        self.combo_grade.blockSignals(True)
         self.sld_sat.blockSignals(True)
-        self.combo_grade.setCurrentIndex(1 if mode == "bw" else 0)
+        self.fold_grade.set_checked(mode == "color")
+        self.fold_grade.set_title("Color" if mode == "color" else "Blanco y negro")
         self.sld_sat.setValue(int(round(sat * 100)))
-        self.combo_grade.blockSignals(False)
         self.sld_sat.blockSignals(False)
         self.lbl_sat.setText(str(self.sld_sat.value()))
-        self._gammac_box.setVisible(mode == "color")
+        self._gate_folds(mode == "color")
         if not had and self._current:
             self._adjust["grade"] = {"mode": mode, "sat": sat}
             self._save_current()
 
     def _store_grade(self):
-        mode = self.combo_grade.currentData() or "color"
+        mode = "color" if self.fold_grade.is_checked() else "bw"
+        self.fold_grade.set_title("Color" if mode == "color" else "Blanco y negro")
         sat = self.sld_sat.value() / 100.0
         self._adjust["grade"] = {"mode": mode, "sat": sat}
         self.lbl_sat.setText(str(self.sld_sat.value()))
-        self._gammac_box.setVisible(mode == "color")
+        self._gate_folds(mode == "color")
         self._save_current()
         self._paint_preview()
 
-    def _on_grade_mode(self, *_args):
-        mode = self.combo_grade.currentData() or "color"
+    def _on_grade_mode(self, on: bool):
         self.sld_sat.blockSignals(True)
-        self.sld_sat.setValue(0 if mode == "bw" else 100)
+        self.sld_sat.setValue(100 if on else 0)
         self.sld_sat.blockSignals(False)
         self._store_grade()
+
+    def _gate_folds(self, color: bool):
+        for fold in (self.fold_wb, self.fold_gammac):
+            fold.setEnabled(color)
+        if not color:
+            self._draw = None
+            self.fold_wb.set_picked(False)
+            self.fold_gammac.set_picked(False)
 
     def _on_sat(self, *_args):
         self._store_grade()
@@ -1483,6 +1536,8 @@ class RevealDialog(QDialog):
             number = values[key]
             if key == "ev":
                 lbl.setText(f"{number:+.2f}")
+            elif key == "kelvin":
+                lbl.setText(f"{int(round(number))} K")
             elif key == "shadow_b":
                 lbl.setText(f"{number:.0f}")
             else:
@@ -1513,7 +1568,20 @@ class RevealDialog(QDialog):
         self._save_current()
         self._paint_preview()
 
+    def _step_film(self, delta: int):
+        index = self.combo.currentIndex() + int(delta)
+        if index < 0 or index >= self.combo.count():
+            return
+        self.combo.setCurrentIndex(index)
+
+    def _sync_film_buttons(self):
+        index = self.combo.currentIndex()
+        count = self.combo.count()
+        self.btn_film_prev.setEnabled(index > 0)
+        self.btn_film_next.setEnabled(0 <= index < count - 1)
+
     def _on_film(self, *_args):
+        self._sync_film_buttons()
         self._measure_timer.stop()
         self._stop_play()
         name = self.combo.currentText()
@@ -1605,7 +1673,14 @@ class RevealDialog(QDialog):
     def _paint_preview(self, *_args):
         if self._lin_prev is None:
             return
-        base = reveal_pipeline.apply_reveal(self._lin_prev, self._collect(), self._sigma_scale)
+        plain = reveal_pipeline.apply_reveal(self._lin_prev, self._collect(), self._sigma_scale)
+        if self._task == 1:
+            base = plain
+        else:
+            white = self._wb_gains() if self._task in (2, 3) else None
+            base = balance.before_gammac(
+                plain, white, balance.kelvin_gains(self._collect()["kelvin"]),
+            )
         index = self._source_index()
         mode, sat = self._grade_setting()
         recipe = self._recipe_for_preview(base, index) if mode == "color" and self._task in (2, 3) else None
@@ -1613,6 +1688,7 @@ class RevealDialog(QDialog):
         graded = gammac.saturate(graded, sat)
         base = gammac.saturate(base, sat)
         playing = self._playing
+        ghost = None
         if self._task == 1:
             shown_img = self._warp_preview(base)
             shown = self._to_u8(shown_img)
@@ -1623,10 +1699,8 @@ class RevealDialog(QDialog):
         elif self._task == 2:
             shown_img = self._warp_preview(graded) if playing else graded
             shown = self._to_u8(shown_img)
-            overlay = None if playing else self._preview_rect(self._segment_rect())
-            color = "#ffcc00"
+            overlay, color, allow = self._color_overlay(playing)
             side = None
-            allow = not playing
         elif self._task == 3:
             self._sync_crop_view()
             shown_img = self._warp_preview(graded)
@@ -1660,7 +1734,7 @@ class RevealDialog(QDialog):
             aspect = None
         if self._task != 3:
             aspect = None
-        self.view.set_view(shown, overlay, color, side, allow, aspect=aspect)
+        self.view.set_view(shown, overlay, color, side, allow, aspect=aspect, ghost=ghost)
         self._refresh_bars()
         self._refresh_crop_label()
 
@@ -1845,7 +1919,10 @@ class RevealDialog(QDialog):
             if self._flip_on():
                 full = film_finish.mirror_x(full, FIXED_W)
             self._apply_crop_rect(full)
-        elif self._task == 2:
+        elif self._task == 2 and self._draw_target() == "wb":
+            self._take_wb(full)
+            return
+        elif self._task == 2 and self._draw_target() == "gammac":
             segment = self._ensure_segment()
             segment["rect"] = list(full)
             segment["dirty"] = True
@@ -1878,6 +1955,7 @@ class RevealDialog(QDialog):
         self.chk_crop.blockSignals(False)
         self._load_shifts()
         self._sync_segment_controls()
+        self._sync_wb_controls()
         self._sync_grade_controls()
         self._sync_turn()
         self._sync_roll()
@@ -1904,6 +1982,10 @@ class RevealDialog(QDialog):
             self._adjust["crop"] = None
             self._adjust["flip_h"] = self.chk_flip.isChecked()
         self._adjust["turn"] = self.turn.degrees()
+        if getattr(self, "fold_wb", None):
+            wb = balance.coerce(self._adjust.get("wb"))
+            wb["on"] = self.fold_wb.is_checked()
+            self._adjust["wb"] = wb
         if getattr(self, "_rows", None):
             self._adjust["reveal"] = self._collect()
         film_finish.save(self._folder / self._current, self._adjust)
@@ -2421,7 +2503,8 @@ class RevealDialog(QDialog):
         self._save_current()
         self._paint_preview()
 
-    def _reveal_full(self, index: int):
+    def _reveal_plain(self, index: int):
+        """Cuadro revelado, sin balance, sin temperatura y sin GamMac."""
         path = self._folder / self.combo.currentText()
         frame_bytes = int(FIXED_W * FIXED_H * 1.5)
         try:
@@ -2432,14 +2515,121 @@ class RevealDialog(QDialog):
                 return None
             engine = self.combo_engine.currentData() or "cpu"
             lin = reveal_pipeline.debayer_linear(packed, FIXED_W, FIXED_H, engine)
-            revealed = reveal_pipeline.apply_reveal(lin, self._collect(), 1.0)
-            mode, _sat = self._grade_setting()
-            if mode == "bw":
-                revealed = reveal_pipeline.to_bw(revealed)
-            return revealed
+            return reveal_pipeline.apply_reveal(lin, self._collect(), 1.0)
         except Exception as exc:
             self.lbl_color.setText(f"No se pudo medir. {exc}")
             return None
+
+    def _reveal_full(self, index: int):
+        revealed = self._reveal_plain(index)
+        if revealed is None:
+            return None
+        revealed = balance.before_gammac(
+            revealed, self._wb_gains(), balance.kelvin_gains(self._collect()["kelvin"]),
+        )
+        mode, _sat = self._grade_setting()
+        if mode == "bw":
+            revealed = reveal_pipeline.to_bw(revealed)
+        return revealed
+
+    def _wb_gains(self):
+        if not self.fold_wb.isEnabled():
+            return None
+        return balance.gains_of(self._adjust.get("wb"))
+
+    def _wb_rect(self):
+        wb = balance.coerce(self._adjust.get("wb"))
+        if not wb.get("rect"):
+            return None
+        return tuple(wb["rect"])
+
+    def _draw_target(self):
+        if not self.fold_grade.is_checked():
+            return None
+        if self._draw == "wb" and self.fold_wb.isEnabled():
+            return "wb"
+        if self._draw == "gammac" and self.fold_gammac.isEnabled():
+            return "gammac"
+        return None
+
+    def _select_draw(self, name: str):
+        fold = self.fold_wb if name == "wb" else self.fold_gammac
+        if not fold.isEnabled():
+            return
+        self._draw = name
+        self.fold_wb.set_picked(name == "wb")
+        self.fold_gammac.set_picked(name == "gammac")
+        self._paint_preview()
+
+    def _color_overlay(self, playing: bool):
+        if playing or self._draw_target() is None:
+            return None, "#ffcc00", False
+        if self._draw_target() == "wb":
+            return self._preview_rect(self._wb_rect()), "#f4f4f4", True
+        return self._preview_rect(self._segment_rect()), "#ffcc00", True
+
+    def _say_wb(self, wb=None):
+        wb = balance.coerce(self._adjust.get("wb") if wb is None else wb)
+        if not wb.get("rect"):
+            self.lbl_wb.setText("Sin blanco medido.")
+            return
+        x, y, width, height = wb["rect"]
+        gains = wb["gains"]
+        self.lbl_wb.setText(
+            f"Blanco {width}×{height} en {x}, {y}. "
+            f"Ganancias {gains[0]:.2f}, {gains[1]:.2f}, {gains[2]:.2f}."
+        )
+
+    def _sync_wb_controls(self):
+        wb = balance.coerce(self._adjust.get("wb"))
+        self._adjust["wb"] = wb
+        self.fold_wb.set_checked(wb["on"])
+        self._say_wb(wb)
+
+    def _on_wb_toggle(self, on: bool):
+        wb = balance.coerce(self._adjust.get("wb"))
+        wb["on"] = bool(on)
+        self._adjust["wb"] = wb
+        self._mark_recipes_stale()
+        self._save_current()
+        segment = self._selected()
+        if segment and segment.get("rect"):
+            self._measure_segment()
+            return
+        self._paint_preview()
+
+    def _clear_wb(self):
+        self._adjust["wb"] = {"on": False, "rect": None, "gains": [1.0, 1.0, 1.0]}
+        self.fold_wb.set_checked(False)
+        self._say_wb()
+        self._mark_recipes_stale()
+        self._save_current()
+        self._paint_preview()
+
+    def _take_wb(self, full):
+        plain = self._reveal_plain(self._source_index())
+        if plain is None:
+            self.lbl_wb.setText("No pude leer el cuadro para medir el blanco.")
+            return
+        found = balance.measure(plain, full)
+        if not found.get("ok"):
+            self.lbl_wb.setText(found.get("message") or "No pude medir ese blanco.")
+            self._paint_preview()
+            return
+        self._adjust["wb"] = {
+            "on": True,
+            "rect": found["rect"],
+            "gains": found["gains"],
+        }
+        self.fold_wb.set_checked(True)
+        self.lbl_wb.setText(found["message"])
+        self._mark_recipes_stale()
+        self._save_current()
+        segment = self._selected()
+        if segment and segment.get("rect"):
+            self._measure_segment()
+            return
+        self._paint_preview()
 
     def _mark_recipes_stale(self):
         for segment in self._adjust["segments"]:
